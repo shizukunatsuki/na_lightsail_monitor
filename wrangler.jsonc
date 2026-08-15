@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "na-lightsail-monitor",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-16",
+  "compatibility_date": "2026-08-15",
 
   // Exactly one cron trigger. The Workers Free plan allows 5 per account and
   // 3 are already in use, so the 1st-of-month restart branches inside the
