@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "na-lightsail-monitor",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-16",
+
+  // Exactly one cron trigger. The Workers Free plan allows 5 per account and
+  // 3 are already in use, so the 1st-of-month restart branches inside the
+  // handler rather than taking a second trigger.
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  },
+
+  "vars": {
+    // Lightsail region of the instance. Operator edits both of these.
+    "AWS_REGION": "ap-northeast-1",
+    "INSTANCE_NAME": "CHANGE_ME",
+
+    // Plan allowance in GB, counted as 10^9 bytes.
+    "QUOTA_GB": "1000",
+
+    // Fraction of the quota at which the instance is stopped. Must be in (0, 1].
+    "THRESHOLD": "0.8"
+
+    // Optional: uncomment to POST a JSON notification on every stop/start.
+    // "ALERT_WEBHOOK": "https://example.com/hooks/lightsail"
+  },
+
+  // AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are secrets, never vars.
+  // See README.md for the `wrangler secret put` steps.
+
+  "observability": {
+    "enabled": true
+  }
+}

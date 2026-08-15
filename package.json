@@ -1,0 +1,18 @@
+{
+  "name": "na-lightsail-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that stops a Lightsail instance before it burns through its monthly data transfer allowance.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "npx wrangler deploy",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "aws4fetch": "1.0.20"
+  },
+  "devDependencies": {
+    "wrangler": "^4.123.0"
+  }
+}
