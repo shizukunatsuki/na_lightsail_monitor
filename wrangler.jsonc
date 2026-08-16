@@ -20,8 +20,9 @@
     "AWS_REGION": "ap-northeast-1",
     "INSTANCE_NAME": "natsuki",
 
-    // 套餐额度，单位 GB，按 10^9 字节计。
-    "QUOTA_GB": "1000",
+    // 套餐额度，单位 GiB（2^30 字节）。直接填 Lightsail `GetBundles` 返回的
+    // `transferPerMonthInGb`：1 TB 套餐是 1024，2 TB 是 2048，以此类推。
+    "QUOTA_GIB": "1024",
 
     // 达到配额的这个比例时停机。必须落在 (0, 1] 区间内。
     "THRESHOLD": "0.8"

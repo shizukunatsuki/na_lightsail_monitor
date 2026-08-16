@@ -12,11 +12,17 @@ const baseEnv = {
   AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
   AWS_REGION: "ap-northeast-1",
   INSTANCE_NAME: "my-blog",
-  QUOTA_GB: "1000",
+  QUOTA_GIB: "1024",
   THRESHOLD: "0.8",
 };
 
-const GB = 1e9;
+const GIB = 1024 ** 3;
+
+/** 默认配置下的停机线：1024 GiB × 0.8。 */
+const STOP_LINE_GIB = 819.2;
+
+/** 用来在停机线两侧各取一点的偏移量，1 MiB —— 远大于浮点误差，也远小于任何真实用量。 */
+const MIB = 1024 ** 2;
 
 /**
  * 打桩 `globalThis.fetch`，记录每一次 Lightsail 操作。
@@ -84,8 +90,49 @@ async function run(iso, env, mock) {
 
 const opsOf = (calls) => calls.map((c) => c.operation);
 
+/** 收集一次运行里写出的所有日志行（log 与 error 合并），用来断言单位与数值。 */
+async function capturingLogs(fn) {
+  const lines = [];
+  const { log, error } = console;
+  console.log = (...args) => lines.push(args.join(" "));
+  console.error = (...args) => lines.push(args.join(" "));
+  try {
+    await fn();
+  } finally {
+    console.log = log;
+    console.error = error;
+  }
+  return lines;
+}
+
+test("bytes are converted on a 2^30 basis", async () => {
+  // 恰好 1 GiB 的字节数必须读作 1.000 GiB，而不是 1.074 —— 这是整套单位体系的锚点。
+  // 同一行里也确认停机线是 1024 × 0.8 = 819.2 GiB。
+  const mock = stubAws({ networkIn: GIB, networkOut: 0 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.deepEqual(lines, [
+    "my-blog: 1.000 GiB used month-to-date, under the 819.200 GiB stop threshold",
+  ]);
+});
+
+test("just under the 819.2 GiB stop line the instance is left running", async () => {
+  const mock = stubAws({ networkIn: STOP_LINE_GIB * GIB - MIB, networkOut: 0 });
+  await run("2026-08-15T12:00:00Z", baseEnv, mock);
+
+  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+});
+
+test("just over the 819.2 GiB stop line the instance is stopped", async () => {
+  const mock = stubAws({ networkIn: STOP_LINE_GIB * GIB + MIB, networkOut: 0 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"));
+  assert.match(lines.at(-1), /STOPPED at 819\.201 GiB month-to-date, over the 819\.200 GiB stop threshold \(1024 GiB quota x 0\.8\)/);
+});
+
 test("under the threshold it checks usage and does nothing else", async () => {
-  const mock = stubAws({ networkIn: 100 * GB, networkOut: 200 * GB });
+  const mock = stubAws({ networkIn: 100 * GIB, networkOut: 200 * GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
@@ -117,15 +164,15 @@ test("metric queries use the documented request shape", async () => {
 });
 
 test("both directions count toward the allowance", async () => {
-  // 入 500 + 出 400 = 900 GB，超过 800 GB 的阈值；但单看任何一个方向都没超。
-  const mock = stubAws({ networkIn: 500 * GB, networkOut: 400 * GB });
+  // 入 500 + 出 400 = 900 GiB，超过 819.2 GiB 的阈值；但单看任何一个方向都没超。
+  const mock = stubAws({ networkIn: 500 * GIB, networkOut: 400 * GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
 });
 
 test("over the threshold it stops a running instance exactly once", async () => {
-  const mock = stubAws({ networkIn: 400 * GB, networkOut: 450 * GB });
+  const mock = stubAws({ networkIn: 400 * GIB, networkOut: 450 * GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.deepEqual(opsOf(mock.calls), [
@@ -139,7 +186,7 @@ test("over the threshold it stops a running instance exactly once", async () => 
 });
 
 test("the stop path is idempotent when the instance is already stopped", async () => {
-  const mock = stubAws({ state: "stopped", networkIn: 900 * GB, networkOut: 0 });
+  const mock = stubAws({ state: "stopped", networkIn: 900 * GIB, networkOut: 0 });
 
   // 连续两次触发，用量仍然超额，但绝不能发出停机。
   await run("2026-08-15T12:00:00Z", baseEnv);
@@ -150,7 +197,7 @@ test("the stop path is idempotent when the instance is already stopped", async (
 });
 
 test("a stop is not repeated while the instance is still stopping", async () => {
-  const mock = stubAws({ state: ["running", "stopping"], networkIn: 900 * GB });
+  const mock = stubAws({ state: ["running", "stopping"], networkIn: 900 * GIB });
 
   await run("2026-08-15T12:00:00Z", baseEnv);
   await run("2026-08-15T12:10:00Z", baseEnv, mock);
@@ -188,7 +235,7 @@ test("the restart is retried on every later run, not just at the rollover", asyn
 test("a stopped instance is not started while the month's usage is still spent", async () => {
   // 与停机同一个月：额度没有重置，实例也就不该重启。正是这一点让用量触发等价于旧的
   // 「1 号」触发，而不是变成一个反复重启的死循环。
-  const mock = stubAws({ state: "stopped", networkIn: 900 * GB });
+  const mock = stubAws({ state: "stopped", networkIn: 900 * GIB });
   await run("2026-08-02T00:00:00Z", baseEnv, mock);
 
   assert.ok(!opsOf(mock.calls).includes("StartInstance"));
@@ -196,7 +243,7 @@ test("a stopped instance is not started while the month's usage is still spent",
 
 test("a stopped instance with traffic on the meter is left alone", async () => {
   // 低于阈值但不为零 —— 是操作者自己在月中把它停掉的。这里没有任何迹象表明额度重置了。
-  const mock = stubAws({ state: "stopped", networkIn: 120 * GB, networkOut: 80 * GB });
+  const mock = stubAws({ state: "stopped", networkIn: 120 * GIB, networkOut: 80 * GIB });
   await run("2026-08-20T09:00:00Z", baseEnv, mock);
 
   assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
@@ -223,7 +270,7 @@ test("MANUAL_HOLD suppresses the start without suppressing the stop", async () =
   assert.deepEqual(opsOf(start.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
 
   // 账单护栏照常生效 —— hold 的含义是「不要把我拉起来」，不是「允许我超额跑着」。
-  const stop = stubAws({ state: "running", networkIn: 900 * GB });
+  const stop = stubAws({ state: "running", networkIn: 900 * GIB });
   await run("2026-08-15T12:00:00Z", held, stop);
   assert.ok(opsOf(stop.calls).includes("StopInstance"));
 });
@@ -243,7 +290,7 @@ test("an AWS failure throws, with the access key id scrubbed", async () => {
 });
 
 test("a failure on the stop call itself is not swallowed", async () => {
-  const mock = stubAws({ fail: "StopInstance", networkIn: 900 * GB });
+  const mock = stubAws({ fail: "StopInstance", networkIn: 900 * GIB });
 
   await assert.rejects(
     () => run("2026-08-15T12:00:00Z", baseEnv, mock),
@@ -252,7 +299,7 @@ test("a failure on the stop call itself is not swallowed", async () => {
 });
 
 test("an unreadable instance state throws rather than skipping the stop", async () => {
-  const mock = stubAws({ networkIn: 900 * GB });
+  const mock = stubAws({ networkIn: 900 * GIB });
   const inner = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     const req = input instanceof Request ? input : new Request(input, init);

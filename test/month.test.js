@@ -87,7 +87,7 @@ const validEnv = {
   AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
   AWS_REGION: "ap-northeast-1",
   INSTANCE_NAME: "my-blog",
-  QUOTA_GB: "1000",
+  QUOTA_GIB: "1024",
   THRESHOLD: "0.8",
 };
 
@@ -95,7 +95,7 @@ test("readConfig parses the plain vars into numbers", () => {
   const config = readConfig(validEnv);
   assert.equal(config.region, "ap-northeast-1");
   assert.equal(config.instanceName, "my-blog");
-  assert.equal(config.quotaGb, 1000);
+  assert.equal(config.quotaGib, 1024);
   assert.equal(config.threshold, 0.8);
   assert.equal(config.manualHold, false);
 });
@@ -110,16 +110,23 @@ test("readConfig only honours MANUAL_HOLD spelled exactly \"true\"", () => {
   }
 });
 
-test("readConfig rejects a QUOTA_GB that would compare as NaN", () => {
-  // `usedGb < NaN` 恒为 false，这会被读作「已超额」并停掉实例。所以必须在这里大声
-  // 报错。
-  for (const QUOTA_GB of ["1,000", "1000 GB", "", undefined, "0", "-5"]) {
-    assert.throws(() => readConfig({ ...validEnv, QUOTA_GB }), /QUOTA_GB/);
+test("readConfig rejects a QUOTA_GIB that would compare as NaN", () => {
+  // `usedGib < NaN` 恒为 false，这会被读作「已超额」并停掉实例。所以必须在这里大声
+  // 报错。缺失（`undefined`）也在其中：旧部署里残留的 QUOTA_GB 不会被读取，此时
+  // 就该在第一次触发时响亮地失败，而不是套用某个静默的默认值继续跑。
+  for (const QUOTA_GIB of ["1,024", "1024 GiB", "", undefined, "0", "-5"]) {
+    assert.throws(() => readConfig({ ...validEnv, QUOTA_GIB }), /QUOTA_GIB/);
   }
 });
 
+test("readConfig ignores a stale QUOTA_GB binding entirely", () => {
+  // 没有向后兼容：只有 QUOTA_GB 的环境必须抛错，不能悄悄按 1000 跑下去。
+  const { QUOTA_GIB, ...withoutQuota } = validEnv;
+  assert.throws(() => readConfig({ ...withoutQuota, QUOTA_GB: "1000" }), /QUOTA_GIB/);
+});
+
 test("readConfig rejects a THRESHOLD written as a percentage", () => {
-  // 把 "80" 当成 80% 来写，得到的是 80,000 GB 的上限 —— 一个永远不会触发的看门狗。
+  // 把 "80" 当成 80% 来写，得到的是 81,920 GiB 的上限 —— 一个永远不会触发的看门狗。
   for (const THRESHOLD of ["80", "1.5", "0", "-0.5", "eighty", undefined]) {
     assert.throws(() => readConfig({ ...validEnv, THRESHOLD }), /THRESHOLD/);
   }

@@ -13,16 +13,22 @@ const METRIC_PERIOD_SECONDS = 86400;
 const PLACEHOLDER = "CHANGE_ME";
 
 /**
+ * 一个 GiB 的字节数（2^30）。整套单位体系都以它为基准，与 Lightsail `GetBundles` 返回的
+ * `transferPerMonthInGb` 对齐 —— 详见下面 `scheduled` 里的换算注释。
+ */
+const BYTES_PER_GIB = 1024 ** 3;
+
+/**
  * @typedef {object} Config
  * @property {string} region
  * @property {string} instanceName
- * @property {number} quotaGb
+ * @property {number} quotaGib
  * @property {number} threshold
  * @property {boolean} manualHold
  */
 
 /**
- * 前置校验配置，任何缺失或无法解析的值都直接报错退出。若不校验，QUOTA_GB 写错会让
+ * 前置校验配置，任何缺失或无法解析的值都直接报错退出。若不校验，QUOTA_GIB 写错会让
  * 后续所有比较都变成与 NaN 比较、结果恒为 false，这会被读作「已超额」从而停掉实例。
  *
  * 两个密钥只检查是否存在，其值不会离开此函数。
@@ -46,9 +52,9 @@ export function readConfig(env) {
     }
   }
 
-  const quotaGb = Number(env.QUOTA_GB);
-  if (!Number.isFinite(quotaGb) || quotaGb <= 0) {
-    throw new Error(`QUOTA_GB must be a positive number, got ${JSON.stringify(env.QUOTA_GB)}`);
+  const quotaGib = Number(env.QUOTA_GIB);
+  if (!Number.isFinite(quotaGib) || quotaGib <= 0) {
+    throw new Error(`QUOTA_GIB must be a positive number, got ${JSON.stringify(env.QUOTA_GIB)}`);
   }
 
   // 上界卡在 1，这样即使把 THRESHOLD 按百分比写成 "80"，也不会悄无声息地让看门狗
@@ -61,7 +67,7 @@ export function readConfig(env) {
   return {
     region: env.AWS_REGION,
     instanceName: env.INSTANCE_NAME,
-    quotaGb,
+    quotaGib,
     threshold,
     // 计划内停机的逃生阀。与字符串精确比较，这样打错字（"yes"、"1"、"True"）时
     // 重启逻辑仍然有效，而不是不声不响地把实例摁住一整个月。
@@ -217,30 +223,34 @@ export default {
       sumMetric(client, config, "NetworkOut", range),
     ]);
 
-    // 虽然只有出向超量才计费，但两个方向都在消耗额度。除以 10^9 而不是 2^30：多算一点
-    // 会让实例稍微提前停机，对一个账单护栏来说，这正是应该犯错的方向。
-    const usedGb = (inBytes + outBytes) / 1e9;
-    const limitGb = config.quotaGb * config.threshold;
+    // 虽然只有出向超量才计费，但两个方向都在消耗额度。
+    //
+    // 按 2^30 换算，使单位体系与 Lightsail `GetBundles` 的 `transferPerMonthInGb` 对齐：
+    // 该字段把「1 TB」记为 1024，同一响应里的 `ramSizeInGb: 0.5` 也只可能是 512 MiB，
+    // 两处一致地指向 GiB。于是 QUOTA_GIB 可以直接填那个数字，不需要任何换算。
+    // 安全裕度不再来自单位错配，改由 THRESHOLD 单独提供。
+    const usedGib = (inBytes + outBytes) / BYTES_PER_GIB;
+    const limitGib = config.quotaGib * config.threshold;
 
-    if (usedGb >= limitGb) {
+    if (usedGib >= limitGib) {
       // 越线了。先查状态，这样第二次触发绝不会对一个已停机的实例再发一次停机。
       const state = await getInstanceState(client, config);
       if (state !== "running") {
         console.log(
-          `${config.instanceName}: ${usedGb.toFixed(3)} GB used, over threshold but instance is "${state}"; nothing to do`,
+          `${config.instanceName}: ${usedGib.toFixed(3)} GiB used, over threshold but instance is "${state}"; nothing to do`,
         );
         return;
       }
 
       await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
       console.error(
-        `${config.instanceName}: STOPPED at ${usedGb.toFixed(3)} GB month-to-date, over the ${limitGb.toFixed(3)} GB stop threshold (${config.quotaGb} GB quota x ${config.threshold})`,
+        `${config.instanceName}: STOPPED at ${usedGib.toFixed(3)} GiB month-to-date, over the ${limitGib.toFixed(3)} GiB stop threshold (${config.quotaGib} GiB quota x ${config.threshold})`,
       );
       return;
     }
 
     console.log(
-      `${config.instanceName}: ${usedGb.toFixed(3)} GB used month-to-date, under the ${limitGb.toFixed(3)} GB stop threshold`,
+      `${config.instanceName}: ${usedGib.toFixed(3)} GiB used month-to-date, under the ${limitGib.toFixed(3)} GiB stop threshold`,
     );
 
     // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
