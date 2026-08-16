@@ -18,7 +18,7 @@
   "vars": {
     // 实例所在的 Lightsail 区域。这两项都需要操作者自行修改。
     "AWS_REGION": "ap-northeast-1",
-    "INSTANCE_NAME": "CHANGE_ME",
+    "INSTANCE_NAME": "natsuki",
 
     // 套餐额度，单位 GB，按 10^9 字节计。
     "QUOTA_GB": "1000",
