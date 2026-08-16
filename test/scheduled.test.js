@@ -19,7 +19,7 @@ const baseEnv = {
 const GB = 1e9;
 
 /**
- * 打桩 `globalThis.fetch`，记录每一次 Lightsail 操作和 webhook POST。
+ * 打桩 `globalThis.fetch`，记录每一次 Lightsail 操作。
  * `state` 可以传数组，每次 GetInstanceState 调用消费一项，用来模拟状态在两次调用之间
  * 发生变化的实例。
  */
@@ -31,12 +31,6 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
   globalThis.fetch = async (input, init) => {
     const req = input instanceof Request ? input : new Request(input, init);
     const target = req.headers.get("X-Amz-Target");
-
-    if (!target) {
-      calls.push({ operation: "webhook", url: req.url, body: await req.json() });
-      return new Response("ok");
-    }
-
     const operation = target.split(".")[1];
     const body = await req.json();
     calls.push({ operation, body, url: req.url, headers: req.headers });
@@ -167,105 +161,18 @@ test("a stop is not repeated while the instance is still stopping", async () => 
   assert.equal(opsOf(mock.calls).filter((op) => op === "StopInstance").length, 1);
 });
 
-test("stopping posts an alert when a webhook is configured", async () => {
-  const mock = stubAws({ networkIn: 900 * GB });
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await run("2026-08-15T12:00:00Z", env, mock);
-
-  const alert = mock.calls.find((c) => c.operation === "webhook");
-  assert.ok(alert, "expected a webhook POST");
-  assert.equal(alert.url, "https://example.com/hooks/lightsail");
-  assert.equal(alert.body.event, "stopped");
-  assert.equal(alert.body.instanceName, "my-blog");
-  assert.equal(alert.body.usedGb, 900);
-  assert.equal(alert.body.thresholdGb, 800);
-});
-
-test("a failing webhook does not mask a successful stop", async () => {
-  const mock = stubAws({ networkIn: 900 * GB });
-  const inner = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const req = input instanceof Request ? input : new Request(input, init);
-    if (!req.headers.get("X-Amz-Target")) throw new Error("webhook unreachable");
-    return inner(input, init);
-  };
-
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await run("2026-08-15T12:00:00Z", env, mock);
-
-  assert.ok(opsOf(mock.calls).includes("StopInstance"));
-});
-
-/**
- * 在 AWS 打桩之外再包一层，把 webhook 的 POST —— 唯一一个用裸 URL 而不是已签名
- * Request 发出的 fetch —— 转交给 `onWebhook` 处理。
- */
-function interceptWebhook(onWebhook) {
-  const inner = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    if (input instanceof Request) return inner(input, init);
-    return onWebhook(init);
-  };
-}
-
-test("the alert POST is bounded by a timeout", async () => {
-  const mock = stubAws({ networkIn: 900 * GB });
-  let signal;
-  interceptWebhook((init) => {
-    signal = init?.signal;
-    return new Response("ok");
-  });
-
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await run("2026-08-15T12:00:00Z", env, mock);
-
-  // 一个接受连接却从不回应的 webhook 会把整次调用挂住；而错误路径是 await 完告警才
-  // rethrow 的，于是一个坏掉的端点就变成了一个坏掉的看门狗。
-  assert.ok(signal instanceof AbortSignal, "the webhook POST must carry an abort signal");
-  assert.equal(signal.aborted, false, "and it must still be live at send time");
-});
-
-test("a webhook that times out does not mask a successful stop", async () => {
-  const mock = stubAws({ networkIn: 900 * GB });
-  interceptWebhook(() => {
-    // 端点没了动静之后，AbortSignal.timeout 抛出的正是这个。
-    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-  });
-
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await run("2026-08-15T12:00:00Z", env, mock);
-
-  assert.ok(opsOf(mock.calls).includes("StopInstance"), "the stop already succeeded");
-});
-
-test("a webhook that times out does not replace the original exception", async () => {
-  const mock = stubAws({ fail: "GetInstanceMetricData" });
-  interceptWebhook(() => {
-    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-  });
-
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await assert.rejects(
-    () => run("2026-08-15T12:00:00Z", env, mock),
-    /GetInstanceMetricData failed: HTTP 403/,
-  );
-});
-
 test("a reset allowance starts a stopped instance", async () => {
   // 新的计费月：月初至今归零，而实例还停在上个月那次停机的状态里。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await run("2026-09-01T00:00:00Z", env, mock);
+  await run("2026-09-01T00:00:00Z", baseEnv, mock);
 
   assert.deepEqual(opsOf(mock.calls), [
     "GetInstanceMetricData",
     "GetInstanceMetricData",
     "GetInstanceState",
     "StartInstance",
-    "webhook",
   ]);
   assert.deepEqual(mock.calls[3].body, { instanceName: "my-blog" });
-  assert.equal(mock.calls[4].body.event, "started");
   // 窗口取的是新月份，而不是那个用量导致停机的月份。
   assert.equal(mock.calls[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });
@@ -372,65 +279,4 @@ test("misconfiguration throws before any AWS call is made", async () => {
     /THRESHOLD/,
   );
   assert.deepEqual(mock.calls, []);
-});
-
-test("a failing run alerts and still throws", async () => {
-  const mock = stubAws({ fail: "GetInstanceMetricData" });
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-
-  await assert.rejects(() => run("2026-08-15T12:00:00Z", env, mock), /HTTP 403/);
-
-  const alert = mock.calls.find((c) => c.operation === "webhook");
-  assert.ok(alert, "a watchdog that breaks silently is the failure mode this guards");
-  assert.equal(alert.body.event, "error");
-  assert.equal(alert.body.instanceName, "my-blog");
-  assert.match(alert.body.message, /GetInstanceMetricData failed: HTTP 403/);
-  assert.equal(alert.body.timestamp, "2026-08-15T12:00:00.000Z");
-});
-
-test("the error alert carries no credential material", async () => {
-  const mock = stubAws({ fail: "GetInstanceMetricData" });
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-
-  await assert.rejects(() => run("2026-08-15T12:00:00Z", env, mock));
-
-  const alert = mock.calls.find((c) => c.operation === "webhook");
-  const serialised = JSON.stringify(alert.body);
-  assert.match(serialised, /\[redacted\]/);
-  assert.ok(!serialised.includes(ACCESS_KEY_ID), "access key id must not reach the webhook");
-  assert.ok(!serialised.includes(baseEnv.AWS_SECRET_ACCESS_KEY), "secret key must not reach the webhook");
-});
-
-test("a misconfigured watchdog alerts even though no config was parsed", async () => {
-  // 最难缠的情形：INSTANCE_NAME 填错了，或者某个绑定压根没配，于是 readConfig 在
-  // 还没有 Config 可供读取 webhook 地址之前就抛了异常。
-  const mock = stubAws();
-  const env = {
-    ...baseEnv,
-    INSTANCE_NAME: undefined,
-    ALERT_WEBHOOK: "https://example.com/hooks/lightsail",
-  };
-
-  await assert.rejects(() => run("2026-08-15T12:00:00Z", env, mock), /INSTANCE_NAME/);
-
-  const alert = mock.calls.find((c) => c.operation === "webhook");
-  assert.ok(alert, "expected an error alert");
-  assert.equal(alert.body.event, "error");
-  assert.match(alert.body.message, /Missing required binding INSTANCE_NAME/);
-});
-
-test("an unreachable webhook does not replace the original exception", async () => {
-  const mock = stubAws({ fail: "GetInstanceMetricData" });
-  const inner = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const req = input instanceof Request ? input : new Request(input, init);
-    if (!req.headers.get("X-Amz-Target")) throw new Error("webhook unreachable");
-    return inner(input, init);
-  };
-
-  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
-  await assert.rejects(
-    () => run("2026-08-15T12:00:00Z", env, mock),
-    /GetInstanceMetricData failed: HTTP 403/,
-  );
 });

@@ -97,7 +97,6 @@ test("readConfig parses the plain vars into numbers", () => {
   assert.equal(config.instanceName, "my-blog");
   assert.equal(config.quotaGb, 1000);
   assert.equal(config.threshold, 0.8);
-  assert.equal(config.alertWebhook, undefined);
   assert.equal(config.manualHold, false);
 });
 

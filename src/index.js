@@ -18,7 +18,6 @@ const PLACEHOLDER = "CHANGE_ME";
  * @property {string} instanceName
  * @property {number} quotaGb
  * @property {number} threshold
- * @property {string} [alertWebhook]
  * @property {boolean} manualHold
  */
 
@@ -37,8 +36,8 @@ export function readConfig(env) {
   }
 
   // 仓库自带的占位值是非空的，所以上面那道检查会放行它，之后每次触发都会在
-  // Lightsail 侧失败。配上错误告警后，就是每天 144 条 webhook、内容只有一个干巴巴的
-  // 404，很难让人立刻意识到「你压根没填实例名」。所以在这里直接把话说清楚。
+  // Lightsail 侧失败。留在日志里的就是每天 144 条干巴巴的 404，很难让人立刻意识到
+  //「你压根没填实例名」。所以在这里直接把话说清楚。
   //
   // 刻意使用精确比较：真有实例就叫 `change_me_later`，那是别人正经的实例名，不能拦。
   for (const name of ["AWS_REGION", "INSTANCE_NAME"]) {
@@ -64,7 +63,6 @@ export function readConfig(env) {
     instanceName: env.INSTANCE_NAME,
     quotaGb,
     threshold,
-    alertWebhook: env.ALERT_WEBHOOK,
     // 计划内停机的逃生阀。与字符串精确比较，这样打错字（"yes"、"1"、"True"）时
     // 重启逻辑仍然有效，而不是不声不响地把实例摁住一整个月。
     manualHold: env.MANUAL_HOLD === "true",
@@ -185,57 +183,7 @@ async function sumMetric(client, config, metricName, range) {
 }
 
 /**
- * 在消息离开 Worker 之前抹掉其中的凭据内容。
- *
- * `lightsail()` 已经把 access key id 从 AWS 的错误响应体里清掉了。这里是对其余所有
- * 抛错位置的兜底 —— 因为 handler 的总 catch 会把任意错误文本转发给站外的 webhook。
- *
- * @param {string} text
- * @param {Record<string, string | undefined>} env
- * @returns {string}
- */
-function redactSecrets(text, env) {
-  let out = text;
-  for (const secret of [env.AWS_ACCESS_KEY_ID, env.AWS_SECRET_ACCESS_KEY]) {
-    if (secret) out = out.replaceAll(secret, "[redacted]");
-  }
-  return out;
-}
-
-/**
- * 尽力而为的操作者通知。
- *
- * 刻意不抛异常：执行到这里时实例操作已经成功了，webhook 挂掉不该让一次成功的停机
- * 看起来像失败的运行。错误路径同样依赖这个性质 —— 一个死掉的 webhook 不能用它自己的
- * 异常顶替掉原始异常。
- *
- * @param {{ alertWebhook?: string }} config
- * @param {object} payload
- */
-async function notify(config, payload) {
-  if (!config.alertWebhook) return;
-  try {
-    const res = await fetch(config.alertWebhook, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      // 如果一个端点接受了连接却始终不回应，这里就会一直挂着，直到整个调用被平台强制
-      // 终止 —— 而错误路径是 await 完这次通知才 rethrow 的，所以一个卡死的 webhook
-      // 会把看门狗一起拖垮。这个方向完全反了：告警只是附加品，绝不能压过产生它的那次
-      // 运行。超时抛出的 TimeoutError 会落进下面的 catch，与其它投递失败一样记一行日志。
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) console.error(`ALERT_WEBHOOK returned HTTP ${res.status}`);
-  } catch (err) {
-    console.error(`ALERT_WEBHOOK POST failed: ${err instanceof Error ? err.message : err}`);
-  }
-}
-
-/**
  * 一轮看门狗：先测量，再由数字决定是停机还是启动。
- *
- * 从 `scheduled` 里拆出来，好让 handler 用一个 try/catch 把整段逻辑包住，而不必为此
- * 把逻辑整体缩进一层。
  *
  * @param {ScheduledController} controller
  * @param {Record<string, string | undefined>} env
@@ -283,16 +231,6 @@ async function runWatchdog(controller, env, ctx) {
     console.error(
       `${config.instanceName}: STOPPED at ${usedGb.toFixed(3)} GB month-to-date, over the ${limitGb.toFixed(3)} GB stop threshold (${config.quotaGb} GB quota x ${config.threshold})`,
     );
-    ctx.waitUntil(
-      notify(config, {
-        event: "stopped",
-        instanceName: config.instanceName,
-        usedGb: Number(usedGb.toFixed(3)),
-        thresholdGb: Number(limitGb.toFixed(3)),
-        quotaGb: config.quotaGb,
-        timestamp: now.toISOString(),
-      }),
-    );
     return;
   }
 
@@ -327,14 +265,6 @@ async function runWatchdog(controller, env, ctx) {
 
   await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
   console.log(`${config.instanceName}: transfer allowance has reset, instance started`);
-  ctx.waitUntil(
-    notify(config, {
-      event: "started",
-      instanceName: config.instanceName,
-      reason: "Month-to-date transfer is back under the threshold; the allowance has reset.",
-      timestamp: now.toISOString(),
-    }),
-  );
 }
 
 export default {
@@ -344,24 +274,6 @@ export default {
    * @param {ExecutionContext} ctx
    */
   async scheduled(controller, env, ctx) {
-    try {
-      await runWatchdog(controller, env, ctx);
-    } catch (err) {
-      // 没有这一段，一个坏掉的看门狗 —— 过期的凭据、打错的 INSTANCE_NAME、AWS 故障 ——
-      // 留下的唯一痕迹就是某个没人盯着的面板里一次失败的调用。这里用 await 而不是
-      // waitUntil，是为了让告警在异常向上展开之前就已经发出去了。
-      await notify(
-        { alertWebhook: env.ALERT_WEBHOOK },
-        {
-          event: "error",
-          instanceName: env.INSTANCE_NAME,
-          message: redactSecrets(err instanceof Error ? err.message : String(err), env),
-          timestamp: new Date(controller.scheduledTime ?? Date.now()).toISOString(),
-        },
-      );
-      // 重新抛出，保证这次调用在 Workers 日志里仍然记为失败。webhook 是对这个信号的
-      // 补充，不是替代。
-      throw err;
-    }
+    await runWatchdog(controller, env, ctx);
   },
 };
