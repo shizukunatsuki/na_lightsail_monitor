@@ -182,98 +182,93 @@ async function sumMetric(client, config, metricName, range) {
   return total;
 }
 
-/**
- * 一轮看门狗：先测量，再由数字决定是停机还是启动。
- *
- * @param {ScheduledController} controller
- * @param {Record<string, string | undefined>} env
- * @param {ExecutionContext} ctx
- */
-async function runWatchdog(controller, env, ctx) {
-  const config = readConfig(env);
+export default {
+  /**
+   * 一轮看门狗：先测量，再由数字决定是停机还是启动。
+   *
+   * 运行时还会传入第三个参数 `ExecutionContext`，这里没有声明它 —— 已经没有需要挂到
+   * `waitUntil` 上的后台任务了，handler 返回时该做的事都已经做完。
+   *
+   * 任何位置抛出的异常都直接向上抛，由 Workers 把这次调用记为失败。那是唯一的错误信号。
+   *
+   * @param {ScheduledController} controller
+   * @param {Record<string, string | undefined>} env
+   */
+  async scheduled(controller, env) {
+    const config = readConfig(env);
 
-  const client = new AwsClient({
-    accessKeyId: env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-    service: "lightsail",
-    region: config.region,
-    // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在十分钟后，这个次数足够了，
-    // 同时也能让故障及时暴露出来。
-    retries: 2,
-  });
+    const client = new AwsClient({
+      accessKeyId: env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      service: "lightsail",
+      region: config.region,
+      // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在十分钟后，这个次数足够了，
+      // 同时也能让故障及时暴露出来。
+      retries: 2,
+    });
 
-  // 用调度时间而非墙上时钟：它精确落在 cron 的时间格上，所以即便调用被延迟或重试，
-  // 评估的仍然是它当初被触发的那一格。
-  const now = new Date(controller.scheduledTime ?? Date.now());
+    // 用调度时间而非墙上时钟：它精确落在 cron 的时间格上，所以即便调用被延迟或重试，
+    // 评估的仍然是它当初被触发的那一格。
+    const now = new Date(controller.scheduledTime ?? Date.now());
 
-  const range = usageWindow(now);
-  const [inBytes, outBytes] = await Promise.all([
-    sumMetric(client, config, "NetworkIn", range),
-    sumMetric(client, config, "NetworkOut", range),
-  ]);
+    const range = usageWindow(now);
+    const [inBytes, outBytes] = await Promise.all([
+      sumMetric(client, config, "NetworkIn", range),
+      sumMetric(client, config, "NetworkOut", range),
+    ]);
 
-  // 虽然只有出向超量才计费，但两个方向都在消耗额度。除以 10^9 而不是 2^30：多算一点
-  // 会让实例稍微提前停机，对一个账单护栏来说，这正是应该犯错的方向。
-  const usedGb = (inBytes + outBytes) / 1e9;
-  const limitGb = config.quotaGb * config.threshold;
+    // 虽然只有出向超量才计费，但两个方向都在消耗额度。除以 10^9 而不是 2^30：多算一点
+    // 会让实例稍微提前停机，对一个账单护栏来说，这正是应该犯错的方向。
+    const usedGb = (inBytes + outBytes) / 1e9;
+    const limitGb = config.quotaGb * config.threshold;
 
-  if (usedGb >= limitGb) {
-    // 越线了。先查状态，这样第二次触发绝不会对一个已停机的实例再发一次停机。
-    const state = await getInstanceState(client, config);
-    if (state !== "running") {
-      console.log(
-        `${config.instanceName}: ${usedGb.toFixed(3)} GB used, over threshold but instance is "${state}"; nothing to do`,
+    if (usedGb >= limitGb) {
+      // 越线了。先查状态，这样第二次触发绝不会对一个已停机的实例再发一次停机。
+      const state = await getInstanceState(client, config);
+      if (state !== "running") {
+        console.log(
+          `${config.instanceName}: ${usedGb.toFixed(3)} GB used, over threshold but instance is "${state}"; nothing to do`,
+        );
+        return;
+      }
+
+      await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
+      console.error(
+        `${config.instanceName}: STOPPED at ${usedGb.toFixed(3)} GB month-to-date, over the ${limitGb.toFixed(3)} GB stop threshold (${config.quotaGb} GB quota x ${config.threshold})`,
       );
       return;
     }
 
-    await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
-    console.error(
-      `${config.instanceName}: STOPPED at ${usedGb.toFixed(3)} GB month-to-date, over the ${limitGb.toFixed(3)} GB stop threshold (${config.quotaGb} GB quota x ${config.threshold})`,
-    );
-    return;
-  }
-
-  console.log(
-    `${config.instanceName}: ${usedGb.toFixed(3)} GB used month-to-date, under the ${limitGb.toFixed(3)} GB stop threshold`,
-  );
-
-  // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
-  // 剩下的时间里用量会一直卡在阈值之上：「重新回到阈值以下」与旧的「1 号」分支想要捕捉
-  // 的是同一个事件，却没有它那个仅有 24 小时的窗口。从跨月那一刻起，每一次触发都是
-  // 一次新的补救机会。
-  //
-  // 「恰好零字节」是查询状态的闸门。运行中的实例几分钟内必然产生*某些*流量 —— DNS、
-  // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
-  // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
-  // 约 4300 次调用。
-  if (inBytes + outBytes > 0) return;
-
-  if (config.manualHold) {
     console.log(
-      `${config.instanceName}: no transfer recorded this month, but MANUAL_HOLD is set; leaving it alone`,
+      `${config.instanceName}: ${usedGb.toFixed(3)} GB used month-to-date, under the ${limitGb.toFixed(3)} GB stop threshold`,
     );
-    return;
-  }
 
-  const state = await getInstanceState(client, config);
-  if (state !== "stopped") {
-    // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
-    console.log(`${config.instanceName}: no transfer recorded this month, instance is "${state}"; nothing to do`);
-    return;
-  }
+    // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
+    // 剩下的时间里用量会一直卡在阈值之上：「重新回到阈值以下」与旧的「1 号」分支想要捕捉
+    // 的是同一个事件，却没有它那个仅有 24 小时的窗口。从跨月那一刻起，每一次触发都是
+    // 一次新的补救机会。
+    //
+    // 「恰好零字节」是查询状态的闸门。运行中的实例几分钟内必然产生*某些*流量 —— DNS、
+    // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
+    // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
+    // 约 4300 次调用。
+    if (inBytes + outBytes > 0) return;
 
-  await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
-  console.log(`${config.instanceName}: transfer allowance has reset, instance started`);
-}
+    if (config.manualHold) {
+      console.log(
+        `${config.instanceName}: no transfer recorded this month, but MANUAL_HOLD is set; leaving it alone`,
+      );
+      return;
+    }
 
-export default {
-  /**
-   * @param {ScheduledController} controller
-   * @param {Record<string, string | undefined>} env
-   * @param {ExecutionContext} ctx
-   */
-  async scheduled(controller, env, ctx) {
-    await runWatchdog(controller, env, ctx);
+    const state = await getInstanceState(client, config);
+    if (state !== "stopped") {
+      // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
+      console.log(`${config.instanceName}: no transfer recorded this month, instance is "${state}"; nothing to do`);
+      return;
+    }
+
+    await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
+    console.log(`${config.instanceName}: transfer allowance has reset, instance started`);
   },
 };

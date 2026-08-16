@@ -72,14 +72,11 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
-/** 在一个固定时刻运行 handler，并等待所有交给 waitUntil 的任务完成。 */
+/** 在一个固定时刻运行 handler。 */
 async function run(iso, env, mock) {
-  const pending = [];
-  const ctx = { waitUntil: (p) => pending.push(p), passThroughOnException() {} };
   const controller = { scheduledTime: Date.parse(iso), cron: "*/10 * * * *", noRetry() {} };
   try {
-    await worker.scheduled(controller, env, ctx);
-    await Promise.all(pending);
+    await worker.scheduled(controller, env);
   } finally {
     if (mock) mock.restore();
   }
