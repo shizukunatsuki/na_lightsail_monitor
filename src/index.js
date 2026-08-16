@@ -17,6 +17,7 @@ const METRIC_PERIOD_SECONDS = 86400;
  * @property {number} quotaGb
  * @property {number} threshold
  * @property {string} [alertWebhook]
+ * @property {boolean} manualHold
  */
 
 /**
@@ -53,6 +54,10 @@ export function readConfig(env) {
     quotaGb,
     threshold,
     alertWebhook: env.ALERT_WEBHOOK,
+    // Escape hatch for planned downtime. Compared against the exact string so
+    // that a typo ("yes", "1", "True") leaves the restart path enabled rather
+    // than silently pinning the instance down for a month.
+    manualHold: env.MANUAL_HOLD === "true",
   };
 }
 
@@ -69,15 +74,6 @@ export function readConfig(env) {
  */
 export function monthStartMs(now) {
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
-}
-
-/**
- * True when `now` falls on the 1st of the month in UTC.
- * @param {Date} now
- * @returns {boolean}
- */
-export function isFirstOfMonth(now) {
-  return now.getUTCDate() === 1;
 }
 
 /**
@@ -182,13 +178,33 @@ async function sumMetric(client, config, metricName, range) {
 }
 
 /**
+ * Strip credential values out of a message before it leaves the Worker.
+ *
+ * `lightsail()` already scrubs the access key id out of AWS error bodies. This
+ * is the backstop for every other throw site, because the handler's catch-all
+ * forwards arbitrary error text to an off-site webhook.
+ *
+ * @param {string} text
+ * @param {Record<string, string | undefined>} env
+ * @returns {string}
+ */
+function redactSecrets(text, env) {
+  let out = text;
+  for (const secret of [env.AWS_ACCESS_KEY_ID, env.AWS_SECRET_ACCESS_KEY]) {
+    if (secret) out = out.replaceAll(secret, "[redacted]");
+  }
+  return out;
+}
+
+/**
  * Best-effort operator notification.
  *
  * Deliberately does not throw: by the time this runs the instance action has
  * already succeeded, and a webhook outage must not make a successful stop look
- * like a failed run.
+ * like a failed run. The error path relies on the same property — a dead
+ * webhook must not replace the original exception with its own.
  *
- * @param {Config} config
+ * @param {{ alertWebhook?: string }} config
  * @param {object} payload
  */
 async function notify(config, payload) {
@@ -205,66 +221,46 @@ async function notify(config, payload) {
   }
 }
 
-export default {
-  /**
-   * @param {ScheduledController} controller
-   * @param {Record<string, string | undefined>} env
-   * @param {ExecutionContext} ctx
-   */
-  async scheduled(controller, env, ctx) {
-    const config = readConfig(env);
+/**
+ * One watchdog pass: measure first, then stop or start as the numbers dictate.
+ *
+ * Kept separate from `scheduled` so the handler can wrap the whole thing in one
+ * try/catch without indenting the logic behind it.
+ *
+ * @param {ScheduledController} controller
+ * @param {Record<string, string | undefined>} env
+ * @param {ExecutionContext} ctx
+ */
+async function runWatchdog(controller, env, ctx) {
+  const config = readConfig(env);
 
-    const client = new AwsClient({
-      accessKeyId: env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      service: "lightsail",
-      region: config.region,
-      // Two retries past the first attempt (5xx and 429 only) is plenty when
-      // the next run is ten minutes out, and surfaces outages promptly.
-      retries: 2,
-    });
+  const client = new AwsClient({
+    accessKeyId: env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+    service: "lightsail",
+    region: config.region,
+    // Two retries past the first attempt (5xx and 429 only) is plenty when
+    // the next run is ten minutes out, and surfaces outages promptly.
+    retries: 2,
+  });
 
-    // The scheduled time, not the wall clock: it lands exactly on the cron slot,
-    // so a delayed or retried invocation still evaluates the slot it was fired for.
-    const now = new Date(controller.scheduledTime ?? Date.now());
+  // The scheduled time, not the wall clock: it lands exactly on the cron slot,
+  // so a delayed or retried invocation still evaluates the slot it was fired for.
+  const now = new Date(controller.scheduledTime ?? Date.now());
 
-    if (isFirstOfMonth(now)) {
-      const state = await getInstanceState(client, config);
-      if (state === "stopped") {
-        await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
-        console.log(`${config.instanceName}: new billing month, instance started`);
-        ctx.waitUntil(
-          notify(config, {
-            event: "started",
-            instanceName: config.instanceName,
-            reason: "New billing month; data transfer allowance reset.",
-            timestamp: now.toISOString(),
-          }),
-        );
-        return;
-      }
-      // Running, or mid-transition: fall through to the usage check below.
-    }
+  const range = usageWindow(now);
+  const [inBytes, outBytes] = await Promise.all([
+    sumMetric(client, config, "NetworkIn", range),
+    sumMetric(client, config, "NetworkOut", range),
+  ]);
 
-    const range = usageWindow(now);
-    const [inBytes, outBytes] = await Promise.all([
-      sumMetric(client, config, "NetworkIn", range),
-      sumMetric(client, config, "NetworkOut", range),
-    ]);
+  // Both directions consume the allowance even though only outbound overage
+  // is billed. 10^9 rather than 2^30: over-counting stops the instance
+  // slightly early, which is the correct direction to be wrong in.
+  const usedGb = (inBytes + outBytes) / 1e9;
+  const limitGb = config.quotaGb * config.threshold;
 
-    // Both directions consume the allowance even though only outbound overage
-    // is billed. 10^9 rather than 2^30: over-counting stops the instance
-    // slightly early, which is the correct direction to be wrong in.
-    const usedGb = (inBytes + outBytes) / 1e9;
-    const limitGb = config.quotaGb * config.threshold;
-
-    if (usedGb < limitGb) {
-      console.log(
-        `${config.instanceName}: ${usedGb.toFixed(3)} GB used month-to-date, under the ${limitGb.toFixed(3)} GB stop threshold`,
-      );
-      return;
-    }
-
+  if (usedGb >= limitGb) {
     // Over the line. Check state first so a second run never issues a second
     // stop against an already-stopped instance.
     const state = await getInstanceState(client, config);
@@ -289,5 +285,79 @@ export default {
         timestamp: now.toISOString(),
       }),
     );
+    return;
+  }
+
+  console.log(
+    `${config.instanceName}: ${usedGb.toFixed(3)} GB used month-to-date, under the ${limitGb.toFixed(3)} GB stop threshold`,
+  );
+
+  // Restart is driven by usage, not by the calendar. A stop only ever happens
+  // at or above the threshold, so month-to-date usage stays above it for the
+  // rest of that month: "back under the threshold" is the same event the old
+  // 1st-of-month branch was reaching for, minus its single 24-hour window.
+  // Every run from the rollover onward is another chance to recover.
+  //
+  // Exactly zero bytes is the gate on the state lookup. A running instance
+  // transfers *something* within minutes — DNS, NTP, background scans — so a
+  // month-to-date total of zero means it is not up. Without this gate the
+  // handler would have to ask GetInstanceState on every run of every normal
+  // day, ~4300 extra calls a month for one restart.
+  if (inBytes + outBytes > 0) return;
+
+  if (config.manualHold) {
+    console.log(
+      `${config.instanceName}: no transfer recorded this month, but MANUAL_HOLD is set; leaving it alone`,
+    );
+    return;
+  }
+
+  const state = await getInstanceState(client, config);
+  if (state !== "stopped") {
+    // Usually the first minutes of a new month, before any metric datapoint has
+    // landed for an instance that never went down.
+    console.log(`${config.instanceName}: no transfer recorded this month, instance is "${state}"; nothing to do`);
+    return;
+  }
+
+  await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
+  console.log(`${config.instanceName}: transfer allowance has reset, instance started`);
+  ctx.waitUntil(
+    notify(config, {
+      event: "started",
+      instanceName: config.instanceName,
+      reason: "Month-to-date transfer is back under the threshold; the allowance has reset.",
+      timestamp: now.toISOString(),
+    }),
+  );
+}
+
+export default {
+  /**
+   * @param {ScheduledController} controller
+   * @param {Record<string, string | undefined>} env
+   * @param {ExecutionContext} ctx
+   */
+  async scheduled(controller, env, ctx) {
+    try {
+      await runWatchdog(controller, env, ctx);
+    } catch (err) {
+      // Without this the only trace of a broken watchdog — expired credentials,
+      // a mistyped INSTANCE_NAME, an AWS outage — is a failed invocation in a
+      // dashboard nobody is watching. Awaited rather than handed to waitUntil
+      // so the alert is already on the wire before the throw unwinds.
+      await notify(
+        { alertWebhook: env.ALERT_WEBHOOK },
+        {
+          event: "error",
+          instanceName: env.INSTANCE_NAME,
+          message: redactSecrets(err instanceof Error ? err.message : String(err), env),
+          timestamp: new Date(controller.scheduledTime ?? Date.now()).toISOString(),
+        },
+      );
+      // Rethrown so the invocation still counts as a failure in Workers logs.
+      // The webhook adds to that signal; it does not replace it.
+      throw err;
+    }
   },
 };

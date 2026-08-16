@@ -4,9 +4,14 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-15",
 
+  // This Worker has no `fetch` handler, so a public URL would only serve
+  // errors and invite traffic. Both routes off.
+  "workers_dev": false,
+  "preview_urls": false,
+
   // Exactly one cron trigger. The Workers Free plan allows 5 per account and
-  // 3 are already in use, so the 1st-of-month restart branches inside the
-  // handler rather than taking a second trigger.
+  // 3 are already in use, so the restart branches inside the handler rather
+  // than taking a second trigger.
   "triggers": {
     "crons": ["*/10 * * * *"]
   },
@@ -22,8 +27,14 @@
     // Fraction of the quota at which the instance is stopped. Must be in (0, 1].
     "THRESHOLD": "0.8"
 
-    // Optional: uncomment to POST a JSON notification on every stop/start.
+    // Strongly recommended: without it a stop, and any failure of the watchdog
+    // itself, happens in silence. See "Alerting is not optional" in README.md.
     // "ALERT_WEBHOOK": "https://example.com/hooks/lightsail"
+
+    // Optional. "true" suppresses every StartInstance, for when you have taken
+    // the instance down yourself and do not want it brought back. Stops are
+    // unaffected. Any other value, or absent, means normal operation.
+    // "MANUAL_HOLD": "true"
   },
 
   // AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are secrets, never vars.

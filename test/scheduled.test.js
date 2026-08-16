@@ -197,34 +197,82 @@ test("a failing webhook does not mask a successful stop", async () => {
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
 });
 
-test("on the 1st a stopped instance is started and usage is not queried", async () => {
-  const mock = stubAws({ state: "stopped", networkIn: 900 * GB });
+test("a reset allowance starts a stopped instance", async () => {
+  // New billing month: month-to-date is back to zero and the instance is still
+  // down from last month's stop.
+  const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
   const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
   await run("2026-09-01T00:00:00Z", env, mock);
 
-  assert.deepEqual(opsOf(mock.calls), ["GetInstanceState", "StartInstance", "webhook"]);
-  assert.deepEqual(mock.calls[1].body, { instanceName: "my-blog" });
-  assert.equal(mock.calls[2].body.event, "started");
-});
-
-test("on the 1st a running instance falls through to the usage check", async () => {
-  const mock = stubAws({ state: "running", networkIn: 1 * GB });
-  await run("2026-09-01T06:00:00Z", baseEnv, mock);
-
   assert.deepEqual(opsOf(mock.calls), [
+    "GetInstanceMetricData",
+    "GetInstanceMetricData",
     "GetInstanceState",
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
+    "StartInstance",
+    "webhook",
   ]);
-  // Fresh month: the window starts at the new month, not the old one.
-  assert.equal(mock.calls[1].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
+  assert.deepEqual(mock.calls[3].body, { instanceName: "my-blog" });
+  assert.equal(mock.calls[4].body.event, "started");
+  // The window is the new month, not the one whose usage caused the stop.
+  assert.equal(mock.calls[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });
 
-test("the instance is never started outside the 1st", async () => {
+test("the restart is retried on every later run, not just at the rollover", async () => {
+  // The bug this replaces: the old date test would have passed while the
+  // instance stayed down for a month if every run on the 1st failed. Here the
+  // trigger is the usage figure, which stays true until the start succeeds.
+  for (const at of ["2026-09-01T00:10:00Z", "2026-09-02T13:20:00Z", "2026-09-27T08:00:00Z"]) {
+    const mock = stubAws({ state: "stopped" });
+    await run(at, baseEnv, mock);
+    assert.ok(opsOf(mock.calls).includes("StartInstance"), `expected a start at ${at}`);
+  }
+});
+
+test("a stopped instance is not started while the month's usage is still spent", async () => {
+  // Same month as the stop: the allowance has not reset, so neither does the
+  // instance. This is what makes the usage trigger equivalent to the old
+  // 1st-of-month one rather than a restart loop.
   const mock = stubAws({ state: "stopped", networkIn: 900 * GB });
   await run("2026-08-02T00:00:00Z", baseEnv, mock);
 
   assert.ok(!opsOf(mock.calls).includes("StartInstance"));
+});
+
+test("a stopped instance with traffic on the meter is left alone", async () => {
+  // Under the threshold but not at zero — the operator stopped it themselves
+  // partway through the month. Nothing here says the allowance reset.
+  const mock = stubAws({ state: "stopped", networkIn: 120 * GB, networkOut: 80 * GB });
+  await run("2026-08-20T09:00:00Z", baseEnv, mock);
+
+  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+});
+
+test("zero usage on a running instance costs one state check and nothing else", async () => {
+  // The first minutes of a month, before any datapoint has landed.
+  const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
+  await run("2026-09-01T00:00:00Z", baseEnv, mock);
+
+  assert.deepEqual(opsOf(mock.calls), [
+    "GetInstanceMetricData",
+    "GetInstanceMetricData",
+    "GetInstanceState",
+  ]);
+});
+
+test("MANUAL_HOLD suppresses the start without suppressing the stop", async () => {
+  const held = { ...baseEnv, MANUAL_HOLD: "true" };
+
+  // Allowance reset, instance down: normally a start. Held, it does not even
+  // ask for the state.
+  const start = stubAws({ state: "stopped" });
+  await run("2026-09-01T00:00:00Z", held, start);
+  assert.deepEqual(opsOf(start.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+
+  // The bill guard still fires — a hold is about not being restarted, not
+  // about being allowed to run over quota.
+  const stop = stubAws({ state: "running", networkIn: 900 * GB });
+  await run("2026-08-15T12:00:00Z", held, stop);
+  assert.ok(opsOf(stop.calls).includes("StopInstance"));
 });
 
 test("an AWS failure throws, with the access key id scrubbed", async () => {
@@ -275,4 +323,65 @@ test("misconfiguration throws before any AWS call is made", async () => {
     /THRESHOLD/,
   );
   assert.deepEqual(mock.calls, []);
+});
+
+test("a failing run alerts and still throws", async () => {
+  const mock = stubAws({ fail: "GetInstanceMetricData" });
+  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
+
+  await assert.rejects(() => run("2026-08-15T12:00:00Z", env, mock), /HTTP 403/);
+
+  const alert = mock.calls.find((c) => c.operation === "webhook");
+  assert.ok(alert, "a watchdog that breaks silently is the failure mode this guards");
+  assert.equal(alert.body.event, "error");
+  assert.equal(alert.body.instanceName, "my-blog");
+  assert.match(alert.body.message, /GetInstanceMetricData failed: HTTP 403/);
+  assert.equal(alert.body.timestamp, "2026-08-15T12:00:00.000Z");
+});
+
+test("the error alert carries no credential material", async () => {
+  const mock = stubAws({ fail: "GetInstanceMetricData" });
+  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
+
+  await assert.rejects(() => run("2026-08-15T12:00:00Z", env, mock));
+
+  const alert = mock.calls.find((c) => c.operation === "webhook");
+  const serialised = JSON.stringify(alert.body);
+  assert.match(serialised, /\[redacted\]/);
+  assert.ok(!serialised.includes(ACCESS_KEY_ID), "access key id must not reach the webhook");
+  assert.ok(!serialised.includes(baseEnv.AWS_SECRET_ACCESS_KEY), "secret key must not reach the webhook");
+});
+
+test("a misconfigured watchdog alerts even though no config was parsed", async () => {
+  // The nastiest case: INSTANCE_NAME is wrong or a binding is missing, so
+  // readConfig throws before there is a Config to read the webhook out of.
+  const mock = stubAws();
+  const env = {
+    ...baseEnv,
+    INSTANCE_NAME: undefined,
+    ALERT_WEBHOOK: "https://example.com/hooks/lightsail",
+  };
+
+  await assert.rejects(() => run("2026-08-15T12:00:00Z", env, mock), /INSTANCE_NAME/);
+
+  const alert = mock.calls.find((c) => c.operation === "webhook");
+  assert.ok(alert, "expected an error alert");
+  assert.equal(alert.body.event, "error");
+  assert.match(alert.body.message, /Missing required binding INSTANCE_NAME/);
+});
+
+test("an unreachable webhook does not replace the original exception", async () => {
+  const mock = stubAws({ fail: "GetInstanceMetricData" });
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const req = input instanceof Request ? input : new Request(input, init);
+    if (!req.headers.get("X-Amz-Target")) throw new Error("webhook unreachable");
+    return inner(input, init);
+  };
+
+  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", env, mock),
+    /GetInstanceMetricData failed: HTTP 403/,
+  );
 });

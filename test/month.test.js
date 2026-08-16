@@ -7,7 +7,7 @@ process.env.TZ = "America/Los_Angeles";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { monthStartMs, isFirstOfMonth, usageWindow, readConfig } from "../src/index.js";
+import { monthStartMs, usageWindow, readConfig } from "../src/index.js";
 
 const utc = (iso) => new Date(iso);
 const epoch = (iso) => Date.parse(iso);
@@ -40,20 +40,26 @@ test("monthStartMs handles February in a leap year", () => {
   assert.equal(monthStartMs(utc("2028-02-29T18:00:00Z")), epoch("2028-02-01T00:00:00Z"));
 });
 
-test("isFirstOfMonth follows the UTC date", () => {
-  assert.equal(isFirstOfMonth(utc("2026-03-01T00:00:00Z")), true);
-  assert.equal(isFirstOfMonth(utc("2026-03-01T23:59:59Z")), true);
-  assert.equal(isFirstOfMonth(utc("2026-03-02T00:00:00Z")), false);
-  assert.equal(isFirstOfMonth(utc("2026-02-28T12:00:00Z")), false);
-
-  // Local time says the 1st here, UTC still says the 31st: restarting now
-  // would hand back an instance whose allowance has not actually reset.
+test("the allowance boundary is the UTC rollover, not the local one", () => {
+  // The restart no longer keys off a date, but the query window still has to
+  // flip at exactly the right instant: it is the window, and nothing else,
+  // that makes month-to-date usage drop back under the threshold. These are
+  // the two instants where a local-time implementation would disagree.
+  //
+  // Local time says the 1st here, UTC still says the 31st. Querying March
+  // already would report ~0 usage and hand back an instance whose allowance
+  // has not actually reset.
   const tokyoFirst = utc("2026-03-31T16:00:00Z");
-  assert.equal(isFirstOfMonth(tokyoFirst), false);
+  assert.equal(tokyoFirst.getUTCDate(), 31, "precondition: UTC is still the 31st");
+  assert.equal(monthStartMs(tokyoFirst), epoch("2026-03-01T00:00:00Z"));
+  assert.equal(usageWindow(tokyoFirst).startTime, epoch("2026-03-01T00:00:00Z") / 1000);
 
-  // Local time says the 28th, UTC says the 1st: the restart must still fire.
+  // The mirror image: local time says the 28th of February, UTC says the 1st
+  // of March. The window must have moved on, or the reset is missed.
   const laLastDay = utc("2026-03-01T00:30:00Z");
-  assert.equal(isFirstOfMonth(laLastDay), true);
+  assert.equal(laLastDay.getMonth(), 1, "precondition: local clock still says February");
+  assert.equal(monthStartMs(laLastDay), epoch("2026-03-01T00:00:00Z"));
+  assert.equal(usageWindow(laLastDay).startTime, epoch("2026-03-01T00:00:00Z") / 1000);
 });
 
 test("usageWindow returns Unix seconds, not milliseconds", () => {
@@ -96,6 +102,17 @@ test("readConfig parses the plain vars into numbers", () => {
   assert.equal(config.quotaGb, 1000);
   assert.equal(config.threshold, 0.8);
   assert.equal(config.alertWebhook, undefined);
+  assert.equal(config.manualHold, false);
+});
+
+test("readConfig only honours MANUAL_HOLD spelled exactly \"true\"", () => {
+  assert.equal(readConfig({ ...validEnv, MANUAL_HOLD: "true" }).manualHold, true);
+
+  // A hold that fails open is recoverable; one that engages on a typo pins the
+  // instance down until someone notices the blog is missing.
+  for (const MANUAL_HOLD of ["True", "TRUE", "yes", "1", "", " true", undefined]) {
+    assert.equal(readConfig({ ...validEnv, MANUAL_HOLD }).manualHold, false, JSON.stringify(MANUAL_HOLD));
+  }
 });
 
 test("readConfig rejects a QUOTA_GB that would compare as NaN", () => {
