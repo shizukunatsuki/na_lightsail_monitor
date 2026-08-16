@@ -1,16 +1,15 @@
 import { AwsClient } from "aws4fetch";
 
-/** Lightsail JSON-RPC target prefix; operations are `${API_TARGET}.${Operation}`. */
+/** Lightsail JSON-RPC 的 target 前缀，操作名形如 `${API_TARGET}.${Operation}`。 */
 const API_TARGET = "Lightsail_20161128";
 
 /**
- * Seconds per metric datapoint. One day keeps a month-to-date query to ~31
- * datapoints per metric; an hourly period would return ~744 and blow the
- * 10 ms CPU budget on JSON parsing alone.
+ * 每个指标数据点的秒数。取一天，可以把「月初至今」的查询控制在每个指标约 31 个
+ * 数据点；若改成按小时，会返回约 744 个，光是解析 JSON 就会撑爆 10ms 的 CPU 预算。
  */
 const METRIC_PERIOD_SECONDS = 86400;
 
-/** The value `wrangler.jsonc` ships with for vars the operator has to fill in. */
+/** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
 const PLACEHOLDER = "CHANGE_ME";
 
 /**
@@ -24,12 +23,10 @@ const PLACEHOLDER = "CHANGE_ME";
  */
 
 /**
- * Validate configuration up front and fail loud on anything missing or
- * unparseable. Left unchecked, a typo in QUOTA_GB makes every comparison
- * against NaN false, which reads as "over quota" and stops the instance.
+ * 前置校验配置，任何缺失或无法解析的值都直接报错退出。若不校验，QUOTA_GB 写错会让
+ * 后续所有比较都变成与 NaN 比较、结果恒为 false，这会被读作「已超额」从而停掉实例。
  *
- * Only the presence of the two secrets is checked; their values never leave
- * this function.
+ * 两个密钥只检查是否存在，其值不会离开此函数。
  *
  * @param {Record<string, string | undefined>} env
  * @returns {Config}
@@ -39,13 +36,11 @@ export function readConfig(env) {
     if (!env[name]) throw new Error(`Missing required binding ${name}`);
   }
 
-  // A shipped placeholder is non-empty, so the check above waves it through and
-  // every run then fails against Lightsail instead. With error alerts wired up
-  // that is 144 webhooks a day carrying a bare 404, which does not obviously
-  // read as "you never filled in the instance name". Say so here instead.
+  // 仓库自带的占位值是非空的，所以上面那道检查会放行它，之后每次触发都会在
+  // Lightsail 侧失败。配上错误告警后，就是每天 144 条 webhook、内容只有一个干巴巴的
+  // 404，很难让人立刻意识到「你压根没填实例名」。所以在这里直接把话说清楚。
   //
-  // Exact comparison, deliberately: an instance genuinely named
-  // `change_me_later` is somebody's real instance and must not be rejected.
+  // 刻意使用精确比较：真有实例就叫 `change_me_later`，那是别人正经的实例名，不能拦。
   for (const name of ["AWS_REGION", "INSTANCE_NAME"]) {
     if (env[name] === PLACEHOLDER) {
       throw new Error(`${name} is still the placeholder "${PLACEHOLDER}"; set it in wrangler.jsonc`);
@@ -57,8 +52,8 @@ export function readConfig(env) {
     throw new Error(`QUOTA_GB must be a positive number, got ${JSON.stringify(env.QUOTA_GB)}`);
   }
 
-  // Bounded above by 1 so a THRESHOLD written as a percentage ("80") cannot
-  // silently turn the watchdog into a no-op.
+  // 上界卡在 1，这样即使把 THRESHOLD 按百分比写成 "80"，也不会悄无声息地让看门狗
+  // 变成一个永远不触发的摆设。
   const threshold = Number(env.THRESHOLD);
   if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 1) {
     throw new Error(`THRESHOLD must be a fraction in (0, 1], got ${JSON.stringify(env.THRESHOLD)}`);
@@ -70,20 +65,18 @@ export function readConfig(env) {
     quotaGb,
     threshold,
     alertWebhook: env.ALERT_WEBHOOK,
-    // Escape hatch for planned downtime. Compared against the exact string so
-    // that a typo ("yes", "1", "True") leaves the restart path enabled rather
-    // than silently pinning the instance down for a month.
+    // 计划内停机的逃生阀。与字符串精确比较，这样打错字（"yes"、"1"、"True"）时
+    // 重启逻辑仍然有效，而不是不声不响地把实例摁住一整个月。
     manualHold: env.MANUAL_HOLD === "true",
   };
 }
 
 /**
- * First instant of the UTC month containing `now`, in milliseconds since epoch.
+ * `now` 所在 UTC 月份的第一个瞬间，单位为毫秒时间戳。
  *
- * Always UTC: the allowance resets at 00:00 UTC on the 1st, which is a
- * different moment from any local month boundary. Deriving this from
- * `getFullYear`/`getMonth` would query the wrong window for up to a day either
- * side of the rollover, every month.
+ * 一律用 UTC：额度是在每月 1 日 00:00 UTC 重置的，这与任何本地时区的月份边界都不是
+ * 同一个时刻。若改用 `getFullYear`/`getMonth` 推导，每个月在跨月前后各有最多一天的
+ * 时间会查错窗口。
  *
  * @param {Date} now
  * @returns {number}
@@ -93,11 +86,11 @@ export function monthStartMs(now) {
 }
 
 /**
- * Month-to-date query window for GetInstanceMetricData, in Unix *seconds*
- * (the Lightsail API takes numbers here, not ISO strings).
+ * 供 GetInstanceMetricData 使用的「月初至今」查询窗口，单位是 Unix *秒*
+ * （Lightsail API 这里收的是数字，不是 ISO 字符串）。
  *
- * The end is nudged a minute past the start so the first invocation of a new
- * month still sends a non-empty range; a zero-width range is rejected.
+ * 结束时间至少比起始时间晚一分钟，这样新月份的第一次触发送出的区间也不是空的；
+ * 宽度为零的区间会被 API 拒绝。
  *
  * @param {Date} now
  * @returns {{ startTime: number, endTime: number }}
@@ -109,11 +102,10 @@ export function usageWindow(now) {
 }
 
 /**
- * One signed Lightsail JSON-RPC call.
+ * 一次带签名的 Lightsail JSON-RPC 调用。
  *
- * Throws on any non-2xx so failures surface in Workers logs — a watchdog that
- * fails quietly is worse than no watchdog. Returns the raw response so callers
- * parse only the bodies they actually need.
+ * 任何非 2xx 都抛出，好让失败出现在 Workers 日志里 —— 一个静悄悄失效的看门狗比没有
+ * 看门狗更糟。返回原始 Response，让调用方只解析自己真正需要的响应体。
  *
  * @param {AwsClient} client
  * @param {Config} config
@@ -126,16 +118,16 @@ async function lightsail(client, config, operation, body) {
     method: "POST",
     headers: {
       "Content-Type": "application/x-amz-json-1.1",
-      // Request members are lowerCamelCase for Lightsail, unlike most AWS JSON
-      // APIs. PascalCase yields an unhelpful 400.
+      // 与多数 AWS JSON API 不同，Lightsail 的请求字段是小驼峰。写成大驼峰只会得到
+      // 一个毫无提示意义的 400。
       "X-Amz-Target": `${API_TARGET}.${operation}`,
     },
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
-    // SigV4 rejections echo the credential scope, which embeds the access key
-    // id, so scrub it before the message reaches the logs.
+    // SigV4 的拒绝响应会回显 credential scope，其中嵌着 access key id，所以要在这条
+    // 消息进入日志之前把它抹掉。
     const detail = (await res.text()).slice(0, 500).replaceAll(client.accessKeyId, "[redacted]");
     throw new Error(`Lightsail ${operation} failed: HTTP ${res.status} ${detail}`);
   }
@@ -143,11 +135,10 @@ async function lightsail(client, config, operation, body) {
 }
 
 /**
- * Current instance state name, e.g. "running" / "stopped".
+ * 实例当前的状态名，例如 "running" / "stopped"。
  *
- * Throws rather than returning undefined on an unrecognised response: the stop
- * path treats "not running" as nothing-to-do, so a silently absent state would
- * leave the instance running over quota on every subsequent run.
+ * 响应无法识别时抛错，而不是返回 undefined：停机路径把「不是 running」当作无事可做，
+ * 所以一个悄悄缺失的状态会导致此后每一次触发都放任实例超额运行下去。
  *
  * @param {AwsClient} client
  * @param {Config} config
@@ -166,7 +157,7 @@ async function getInstanceState(client, config) {
 }
 
 /**
- * Month-to-date total for one metric, in bytes.
+ * 单个指标的月初至今总量，单位字节。
  * @param {AwsClient} client
  * @param {Config} config
  * @param {"NetworkIn" | "NetworkOut"} metricName
@@ -186,19 +177,18 @@ async function sumMetric(client, config, metricName, range) {
 
   const { metricData } = await res.json();
 
-  // Datapoints are neither sorted nor dense, so sum them rather than indexing
-  // into positions. Order is irrelevant to a total; gaps are just zero traffic.
+  // 数据点既不保证有序也不保证连续，所以要累加而不是按下标取值。求总量与顺序无关；
+  // 缺口本身就代表那段时间没有流量。
   let total = 0;
   for (const point of metricData ?? []) total += point.sum ?? 0;
   return total;
 }
 
 /**
- * Strip credential values out of a message before it leaves the Worker.
+ * 在消息离开 Worker 之前抹掉其中的凭据内容。
  *
- * `lightsail()` already scrubs the access key id out of AWS error bodies. This
- * is the backstop for every other throw site, because the handler's catch-all
- * forwards arbitrary error text to an off-site webhook.
+ * `lightsail()` 已经把 access key id 从 AWS 的错误响应体里清掉了。这里是对其余所有
+ * 抛错位置的兜底 —— 因为 handler 的总 catch 会把任意错误文本转发给站外的 webhook。
  *
  * @param {string} text
  * @param {Record<string, string | undefined>} env
@@ -213,12 +203,11 @@ function redactSecrets(text, env) {
 }
 
 /**
- * Best-effort operator notification.
+ * 尽力而为的操作者通知。
  *
- * Deliberately does not throw: by the time this runs the instance action has
- * already succeeded, and a webhook outage must not make a successful stop look
- * like a failed run. The error path relies on the same property — a dead
- * webhook must not replace the original exception with its own.
+ * 刻意不抛异常：执行到这里时实例操作已经成功了，webhook 挂掉不该让一次成功的停机
+ * 看起来像失败的运行。错误路径同样依赖这个性质 —— 一个死掉的 webhook 不能用它自己的
+ * 异常顶替掉原始异常。
  *
  * @param {{ alertWebhook?: string }} config
  * @param {object} payload
@@ -230,13 +219,10 @@ async function notify(config, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      // An endpoint that accepts the connection and then never answers would
-      // otherwise hang here until the platform kills the invocation — and the
-      // error path awaits this call before rethrowing, so a wedged webhook
-      // would take the watchdog down with it. That is exactly backwards: the
-      // alert is an extra, and it must never be able to outrank the run that
-      // produced it. The resulting TimeoutError lands in the catch below and
-      // is logged like any other delivery failure.
+      // 如果一个端点接受了连接却始终不回应，这里就会一直挂着，直到整个调用被平台强制
+      // 终止 —— 而错误路径是 await 完这次通知才 rethrow 的，所以一个卡死的 webhook
+      // 会把看门狗一起拖垮。这个方向完全反了：告警只是附加品，绝不能压过产生它的那次
+      // 运行。超时抛出的 TimeoutError 会落进下面的 catch，与其它投递失败一样记一行日志。
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) console.error(`ALERT_WEBHOOK returned HTTP ${res.status}`);
@@ -246,10 +232,10 @@ async function notify(config, payload) {
 }
 
 /**
- * One watchdog pass: measure first, then stop or start as the numbers dictate.
+ * 一轮看门狗：先测量，再由数字决定是停机还是启动。
  *
- * Kept separate from `scheduled` so the handler can wrap the whole thing in one
- * try/catch without indenting the logic behind it.
+ * 从 `scheduled` 里拆出来，好让 handler 用一个 try/catch 把整段逻辑包住，而不必为此
+ * 把逻辑整体缩进一层。
  *
  * @param {ScheduledController} controller
  * @param {Record<string, string | undefined>} env
@@ -263,13 +249,13 @@ async function runWatchdog(controller, env, ctx) {
     secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
     service: "lightsail",
     region: config.region,
-    // Two retries past the first attempt (5xx and 429 only) is plenty when
-    // the next run is ten minutes out, and surfaces outages promptly.
+    // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在十分钟后，这个次数足够了，
+    // 同时也能让故障及时暴露出来。
     retries: 2,
   });
 
-  // The scheduled time, not the wall clock: it lands exactly on the cron slot,
-  // so a delayed or retried invocation still evaluates the slot it was fired for.
+  // 用调度时间而非墙上时钟：它精确落在 cron 的时间格上，所以即便调用被延迟或重试，
+  // 评估的仍然是它当初被触发的那一格。
   const now = new Date(controller.scheduledTime ?? Date.now());
 
   const range = usageWindow(now);
@@ -278,15 +264,13 @@ async function runWatchdog(controller, env, ctx) {
     sumMetric(client, config, "NetworkOut", range),
   ]);
 
-  // Both directions consume the allowance even though only outbound overage
-  // is billed. 10^9 rather than 2^30: over-counting stops the instance
-  // slightly early, which is the correct direction to be wrong in.
+  // 虽然只有出向超量才计费，但两个方向都在消耗额度。除以 10^9 而不是 2^30：多算一点
+  // 会让实例稍微提前停机，对一个账单护栏来说，这正是应该犯错的方向。
   const usedGb = (inBytes + outBytes) / 1e9;
   const limitGb = config.quotaGb * config.threshold;
 
   if (usedGb >= limitGb) {
-    // Over the line. Check state first so a second run never issues a second
-    // stop against an already-stopped instance.
+    // 越线了。先查状态，这样第二次触发绝不会对一个已停机的实例再发一次停机。
     const state = await getInstanceState(client, config);
     if (state !== "running") {
       console.log(
@@ -316,17 +300,15 @@ async function runWatchdog(controller, env, ctx) {
     `${config.instanceName}: ${usedGb.toFixed(3)} GB used month-to-date, under the ${limitGb.toFixed(3)} GB stop threshold`,
   );
 
-  // Restart is driven by usage, not by the calendar. A stop only ever happens
-  // at or above the threshold, so month-to-date usage stays above it for the
-  // rest of that month: "back under the threshold" is the same event the old
-  // 1st-of-month branch was reaching for, minus its single 24-hour window.
-  // Every run from the rollover onward is another chance to recover.
+  // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
+  // 剩下的时间里用量会一直卡在阈值之上：「重新回到阈值以下」与旧的「1 号」分支想要捕捉
+  // 的是同一个事件，却没有它那个仅有 24 小时的窗口。从跨月那一刻起，每一次触发都是
+  // 一次新的补救机会。
   //
-  // Exactly zero bytes is the gate on the state lookup. A running instance
-  // transfers *something* within minutes — DNS, NTP, background scans — so a
-  // month-to-date total of zero means it is not up. Without this gate the
-  // handler would have to ask GetInstanceState on every run of every normal
-  // day, ~4300 extra calls a month for one restart.
+  // 「恰好零字节」是查询状态的闸门。运行中的实例几分钟内必然产生*某些*流量 —— DNS、
+  // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
+  // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
+  // 约 4300 次调用。
   if (inBytes + outBytes > 0) return;
 
   if (config.manualHold) {
@@ -338,8 +320,7 @@ async function runWatchdog(controller, env, ctx) {
 
   const state = await getInstanceState(client, config);
   if (state !== "stopped") {
-    // Usually the first minutes of a new month, before any metric datapoint has
-    // landed for an instance that never went down.
+    // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
     console.log(`${config.instanceName}: no transfer recorded this month, instance is "${state}"; nothing to do`);
     return;
   }
@@ -366,10 +347,9 @@ export default {
     try {
       await runWatchdog(controller, env, ctx);
     } catch (err) {
-      // Without this the only trace of a broken watchdog — expired credentials,
-      // a mistyped INSTANCE_NAME, an AWS outage — is a failed invocation in a
-      // dashboard nobody is watching. Awaited rather than handed to waitUntil
-      // so the alert is already on the wire before the throw unwinds.
+      // 没有这一段，一个坏掉的看门狗 —— 过期的凭据、打错的 INSTANCE_NAME、AWS 故障 ——
+      // 留下的唯一痕迹就是某个没人盯着的面板里一次失败的调用。这里用 await 而不是
+      // waitUntil，是为了让告警在异常向上展开之前就已经发出去了。
       await notify(
         { alertWebhook: env.ALERT_WEBHOOK },
         {
@@ -379,8 +359,8 @@ export default {
           timestamp: new Date(controller.scheduledTime ?? Date.now()).toISOString(),
         },
       );
-      // Rethrown so the invocation still counts as a failure in Workers logs.
-      // The webhook adds to that signal; it does not replace it.
+      // 重新抛出，保证这次调用在 Workers 日志里仍然记为失败。webhook 是对这个信号的
+      // 补充，不是替代。
       throw err;
     }
   },

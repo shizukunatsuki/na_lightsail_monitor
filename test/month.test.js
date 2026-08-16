@@ -1,7 +1,6 @@
-// Run the whole suite in a zone well offset from UTC. Every assertion below is
-// written against an exact epoch value, so it stays correct in any zone — but
-// an implementation that reached for local-time helpers would coincidentally
-// pass under TZ=UTC. The offset is what makes these tests discriminating.
+// 整个套件都跑在一个与 UTC 有明显时差的时区里。下面每一条断言都是针对精确的 epoch
+// 值写的，所以它在任何时区下都成立 —— 但一个改用本地时间辅助函数的实现，在 TZ=UTC
+// 下会碰巧通过。正是这个时差让这些测试具备鉴别力。
 process.env.TZ = "America/Los_Angeles";
 
 import { test } from "node:test";
@@ -19,14 +18,13 @@ test("monthStartMs snaps to the first instant of the UTC month", () => {
 });
 
 test("monthStartMs uses UTC, not the local month", () => {
-  // 00:30 UTC on the 1st is still 16:30 on the 28th in Los Angeles. A local
-  // -time month start would report February and query a month of extra usage.
+  // 1 号 00:30 UTC 在洛杉矶还是 28 号的 16:30。按本地时间取月初会得到二月，
+  // 于是多查进整整一个月的用量。
   const justAfterRollover = utc("2026-03-01T00:30:00Z");
   assert.equal(justAfterRollover.getMonth(), 1, "precondition: local clock still says February");
   assert.equal(monthStartMs(justAfterRollover), epoch("2026-03-01T00:00:00Z"));
 
-  // And the mirror image: 23:30 UTC on the 31st is already the 1st in Tokyo,
-  // but the allowance has not reset yet.
+  // 镜像情形：31 号 23:30 UTC 在东京已经是 1 号了，但额度还没有重置。
   const justBeforeRollover = utc("2026-03-31T23:30:00Z");
   assert.equal(monthStartMs(justBeforeRollover), epoch("2026-03-01T00:00:00Z"));
 });
@@ -41,21 +39,19 @@ test("monthStartMs handles February in a leap year", () => {
 });
 
 test("the allowance boundary is the UTC rollover, not the local one", () => {
-  // The restart no longer keys off a date, but the query window still has to
-  // flip at exactly the right instant: it is the window, and nothing else,
-  // that makes month-to-date usage drop back under the threshold. These are
-  // the two instants where a local-time implementation would disagree.
+  // 重启已经不再看日期了，但查询窗口仍然必须在精确的那一刻翻页：让月初至今的用量
+  // 掉回阈值以下的，正是这个窗口，除此之外没有别的东西。下面这两个时刻，就是一个
+  // 按本地时间实现的版本会给出不同答案的地方。
   //
-  // Local time says the 1st here, UTC still says the 31st. Querying March
-  // already would report ~0 usage and hand back an instance whose allowance
-  // has not actually reset.
+  // 此刻本地时间已是 1 号，UTC 还停在 31 号。这时若已经开始查三月，会报出约 0 的
+  // 用量，从而把一台额度根本没重置的实例交还回去。
   const tokyoFirst = utc("2026-03-31T16:00:00Z");
   assert.equal(tokyoFirst.getUTCDate(), 31, "precondition: UTC is still the 31st");
   assert.equal(monthStartMs(tokyoFirst), epoch("2026-03-01T00:00:00Z"));
   assert.equal(usageWindow(tokyoFirst).startTime, epoch("2026-03-01T00:00:00Z") / 1000);
 
-  // The mirror image: local time says the 28th of February, UTC says the 1st
-  // of March. The window must have moved on, or the reset is missed.
+  // 镜像情形：本地时间是 2 月 28 日，UTC 已经是 3 月 1 日。窗口必须已经翻过去了，
+  // 否则就会错过这次重置。
   const laLastDay = utc("2026-03-01T00:30:00Z");
   assert.equal(laLastDay.getMonth(), 1, "precondition: local clock still says February");
   assert.equal(monthStartMs(laLastDay), epoch("2026-03-01T00:00:00Z"));
@@ -67,14 +63,14 @@ test("usageWindow returns Unix seconds, not milliseconds", () => {
   assert.equal(startTime, epoch("2026-08-01T00:00:00Z") / 1000);
   assert.equal(endTime, epoch("2026-08-15T12:00:00Z") / 1000);
 
-  // A stray factor of 1000 is the other classic bug here: seconds-since-epoch
-  // for any plausible date is 10 digits, milliseconds are 13.
+  // 多乘或少乘一个 1000 是这里另一个经典 bug：任何可信日期的秒级时间戳都是 10 位，
+  // 毫秒级则是 13 位。
   assert.ok(String(startTime).length === 10 && String(endTime).length === 10);
 });
 
 test("usageWindow keeps a non-empty range at the exact month rollover", () => {
-  // The 00:00 cron slot on the 1st would otherwise send startTime === endTime,
-  // which the API rejects — once a month, forever.
+  // 否则 1 号 00:00 那一格 cron 会送出 startTime === endTime，而 API 会拒绝它 ——
+  // 每月一次，永远如此。
   const { startTime, endTime } = usageWindow(utc("2026-09-01T00:00:00Z"));
   assert.equal(startTime, epoch("2026-09-01T00:00:00Z") / 1000);
   assert.ok(endTime > startTime, "range must be non-empty");
@@ -108,23 +104,23 @@ test("readConfig parses the plain vars into numbers", () => {
 test("readConfig only honours MANUAL_HOLD spelled exactly \"true\"", () => {
   assert.equal(readConfig({ ...validEnv, MANUAL_HOLD: "true" }).manualHold, true);
 
-  // A hold that fails open is recoverable; one that engages on a typo pins the
-  // instance down until someone notices the blog is missing.
+  // 一个「失效时默认放行」的锁是可以补救的；而一个因为打错字就生效的锁，会把实例
+  // 摁在那里，直到有人发现博客不见了。
   for (const MANUAL_HOLD of ["True", "TRUE", "yes", "1", "", " true", undefined]) {
     assert.equal(readConfig({ ...validEnv, MANUAL_HOLD }).manualHold, false, JSON.stringify(MANUAL_HOLD));
   }
 });
 
 test("readConfig rejects a QUOTA_GB that would compare as NaN", () => {
-  // `usedGb < NaN` is false, which reads as "over quota" and stops the
-  // instance. This has to fail loudly instead.
+  // `usedGb < NaN` 恒为 false，这会被读作「已超额」并停掉实例。所以必须在这里大声
+  // 报错。
   for (const QUOTA_GB of ["1,000", "1000 GB", "", undefined, "0", "-5"]) {
     assert.throws(() => readConfig({ ...validEnv, QUOTA_GB }), /QUOTA_GB/);
   }
 });
 
 test("readConfig rejects a THRESHOLD written as a percentage", () => {
-  // "80" meaning 80% yields an 80,000 GB limit — a watchdog that never fires.
+  // 把 "80" 当成 80% 来写，得到的是 80,000 GB 的上限 —— 一个永远不会触发的看门狗。
   for (const THRESHOLD of ["80", "1.5", "0", "-0.5", "eighty", undefined]) {
     assert.throws(() => readConfig({ ...validEnv, THRESHOLD }), /THRESHOLD/);
   }
@@ -132,9 +128,8 @@ test("readConfig rejects a THRESHOLD written as a percentage", () => {
 });
 
 test("readConfig rejects the shipped placeholder and says where to fix it", () => {
-  // "CHANGE_ME" is non-empty, so it clears the missing-binding check and then
-  // fails against Lightsail on every run instead — 144 unreadable 404s a day
-  // once error alerts are wired up.
+  // "CHANGE_ME" 是非空的，所以它能通过「必填项缺失」那道检查，然后改为每次触发都在
+  // Lightsail 侧失败 —— 配上错误告警就是每天 144 条读不懂的 404。
   for (const name of ["INSTANCE_NAME", "AWS_REGION"]) {
     assert.throws(
       () => readConfig({ ...validEnv, [name]: "CHANGE_ME" }),
@@ -148,8 +143,7 @@ test("readConfig rejects the shipped placeholder and says where to fix it", () =
 });
 
 test("readConfig only rejects the placeholder on an exact match", () => {
-  // Somebody's instance really is called this. Matching loosely would lock them
-  // out of their own watchdog.
+  // 真有人的实例就叫这些名字。做模糊匹配会把他们锁在自己的看门狗之外。
   for (const instanceName of ["change_me_later", "CHANGE_ME_LATER", "change_me", "my-CHANGE_ME"]) {
     assert.equal(readConfig({ ...validEnv, INSTANCE_NAME: instanceName }).instanceName, instanceName);
   }
@@ -161,7 +155,7 @@ test("readConfig requires the credentials and instance identity", () => {
       () => readConfig({ ...validEnv, [name]: undefined }),
       (err) => {
         assert.match(err.message, new RegExp(name));
-        // The message names the binding, never its value.
+        // 报错信息只点出绑定名，绝不带上它的值。
         assert.doesNotMatch(err.message, /EXAMPLE/);
         return true;
       },

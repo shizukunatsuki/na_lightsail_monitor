@@ -1,103 +1,90 @@
 # na-lightsail-monitor
 
-A Cloudflare Worker that watches an AWS Lightsail instance's month-to-date
-network transfer and **stops the instance** before it eats through its plan's
-data transfer allowance. When the allowance resets and usage falls back to zero,
-it starts the instance again.
+一个 Cloudflare Worker，监视 AWS Lightsail 实例月初至今的网络传输量，赶在它把套餐自带的
+数据传输额度耗尽之前**把实例停掉**。等到额度重置、用量回落到零，再把实例启动回来。
 
-The point is to make a runaway bandwidth bill structurally impossible. Lightsail
-bills transfer overage per GB (the rate varies by region), so an instance serving
-traffic it shouldn't can turn a $5/month plan into a four-figure invoice before
-anyone notices.
+它存在的意义是让「带宽账单失控」这件事在结构上不可能发生。Lightsail 的传输超量是按 GB
+计费的（费率随区域不同），所以一台在跑不该跑的流量的实例，能在任何人察觉之前，把一个
+每月 5 美元的套餐变成一张四位数的账单。
 
-The check is stateless — every run recomputes usage from the Lightsail metrics
-API, so there is no store to corrupt and nothing to reconcile after a failed run.
+这套检查是无状态的 —— 每次运行都从 Lightsail 指标 API 重新计算用量，因此没有会损坏的
+存储，一次失败的运行之后也没有什么需要对账。
 
 ---
 
-## How it works
+## 工作原理
 
-A single cron trigger (`*/10 * * * *`) runs the `scheduled` handler. Every run
-starts by measuring, and the measurement decides everything that follows:
+一个 cron trigger（`*/10 * * * *`）驱动 `scheduled` handler。每次运行都从测量开始，
+之后的一切都由测量结果决定：
 
-1. **Usage** — sum `NetworkIn` + `NetworkOut` for the month to date and divide by
-   10⁹. Two API calls, always.
-2. **At or over `QUOTA_GB × THRESHOLD`** → check the instance state. `running` →
-   stop it, log at error level, POST to `ALERT_WEBHOOK`. Anything else → nothing
-   to do; it is already down or on its way. *(4 calls, or 3 if already stopped.)*
-3. **Under the threshold with traffic on the meter** → log the number and return.
-   This is the normal path, and it is the whole run: two calls, no state lookup.
-4. **Under the threshold with exactly zero bytes** → check the instance state.
-   `stopped` → start it and POST to `ALERT_WEBHOOK`. *(4 calls.)*
+1. **用量** —— 把月初至今的 `NetworkIn` + `NetworkOut` 求和，再除以 10⁹。固定两次 API
+   调用。
+2. **达到或超过 `QUOTA_GB × THRESHOLD`** → 查询实例状态。`running` → 停机、按 error
+   级别记日志、POST 到 `ALERT_WEBHOOK`。其它状态 → 无事可做，它要么已经停了、要么正在
+   停。*（4 次调用；若已停机则为 3 次。）*
+3. **低于阈值且计量表上有流量** → 记下这个数字然后返回。这是正常路径，整次运行就到此
+   为止：两次调用，不查状态。
+4. **低于阈值且恰好为零字节** → 查询实例状态。`stopped` → 启动它并 POST 到
+   `ALERT_WEBHOOK`。*（4 次调用。）*
 
-Anything thrown anywhere in that sequence is POSTed as an `error` event and then
-rethrown, so the invocation is still recorded as a failure.
+上述流程中任何位置抛出的异常，都会先以 `error` 事件 POST 出去，再重新抛出，因此这次调用
+在日志里仍然记为失败。
 
-### Why the restart keys off usage rather than the date
+### 为什么重启看用量而不是看日期
 
-A stop only ever happens at or above the threshold, so month-to-date usage stays
-above it for the rest of that month. "Back under the threshold" therefore cannot
-occur until the allowance resets — the same event a *1st of the month* check
-would catch, without its single 24-hour window. If credentials expire or AWS is
-having a bad day, a date-driven restart gets one day of attempts and then leaves
-the instance down until the following month; a usage-driven one retries every ten
-minutes for as long as the condition holds.
+停机只会发生在用量达到或超过阈值时，所以那个月剩下的时间里，月初至今的用量会一直卡在
+阈值之上。也就是说，「重新回到阈值以下」在额度重置之前根本不可能发生 —— 它和「每月 1 号」
+那种检查捕捉的是同一个事件，却没有那个仅有 24 小时的窗口。如果凭据过期，或者 AWS 那天
+状态不好，按日期驱动的重启只有一天的尝试机会，之后实例就一直停到下个月；而按用量驱动的
+版本，只要条件仍然成立，就每十分钟重试一次。
 
-The zero-bytes gate in step 4 is what keeps the normal path at two API calls. A
-running instance transfers *something* within minutes — DNS, NTP, background port
-scans — so a month-to-date total of exactly zero means it is not up. Checking
-`GetInstanceState` on every under-threshold run instead would cost ~4,300 extra
-calls a month to catch one restart.
+第 4 步里那道「零字节」闸门，是正常路径能维持在两次 API 调用的原因。运行中的实例几分钟内
+必然产生*某些*流量 —— DNS、NTP、后台端口扫描 —— 所以月初至今总量恰好为零，就意味着它
+没有起来。若改成在每一次「低于阈值」的运行里都查 `GetInstanceState`，为了捕捉一次重启，
+每月要多花约 4300 次调用。
 
-One consequence worth knowing: an instance **you** stopped mid-month, after it
-had already moved some traffic, is not auto-started, because its usage is not
-zero. It is picked up at the next month boundary. Use `MANUAL_HOLD` if you want
-it left alone past that.
+有一个后果值得知道：如果是**你自己**在月中把实例停掉的，而它当时已经跑过一些流量，那么
+它不会被自动启动，因为用量不为零。它会等到下一个月份边界才被接手。如果你希望过了那个
+边界也别动它，就用 `MANUAL_HOLD`。
 
-Both directions count toward the check. Only *outbound* overage is billed, but
-the allowance itself is consumed by both, so both belong in the comparison.
+两个方向都计入这项检查。虽然只有*出向*超量才计费，但额度本身是被两个方向共同消耗的，
+所以两者都该进入比较。
 
-### What `QUOTA_GB = 1000` and `THRESHOLD = 0.8` actually stop at
+### `QUOTA_GB = 1000` 加 `THRESHOLD = 0.8` 究竟停在哪里
 
-Two conservative choices stack here, and the combined effect is not 80%. Read
-this before you tune either number.
+这里叠了两层保守选择，合起来的效果并不是 80%。调整这两个数字之前请先读这一节。
 
-`QUOTA_GB` is counted in units of 10⁹ bytes, and the Worker divides raw byte
-counts by 10⁹. So the defaults stop the instance at **8 × 10¹¹ bytes** of
-combined transfer. What fraction of the real allowance that is depends on what
-AWS means by "1 TB", which their console does not spell out:
+`QUOTA_GB` 是以 10⁹ 字节为单位计的，而 Worker 也是把原始字节数除以 10⁹。所以默认配置会在
+双向合计 **8 × 10¹¹ 字节**时停机。这占真实额度的多少，取决于 AWS 所说的「1 TB」到底是什么
+意思 —— 而他们的控制台并没有讲清楚：
 
-| If Lightsail's 1 TB is… | 8 × 10¹¹ bytes is | Headroom left |
+| 若 Lightsail 的 1 TB 是… | 8 × 10¹¹ 字节相当于 | 剩余余量 |
 | --- | --- | --- |
-| 10¹² bytes (decimal TB) | **80%** of the allowance | 200 GB of headroom |
-| 2⁴⁰ bytes (binary TiB) | **≈ 73%** of the allowance | ~300 GB of headroom |
+| 10¹² 字节（十进制 TB） | 额度的 **80%** | 200 GB |
+| 2⁴⁰ 字节（二进制 TiB） | 额度的 **约 73%** | 约 300 GB |
 
-So the true stop point sits somewhere in the **73%–80%** band, not at a known
-80%. Tune `THRESHOLD` against the pessimistic end: `0.9` means "stop somewhere
-between 82% and 90%", and `1.0` means "stop between 91% and 100%" — which leaves
-no margin at all for the metric lag described below. Erring low is the correct
-direction for a bill guard, which is why it is built this way, but you should
-know you are starting from ~73% and not from 80%.
+所以真实的停机点落在 **73%–80%** 这个区间里，而不是一个已知的 80%。调 `THRESHOLD` 时请
+按悲观的那一端来估：`0.9` 意味着「停在 82% 到 90% 之间的某处」，`1.0` 意味着「停在 91% 到
+100% 之间」—— 后者对下文提到的指标延迟已经不留任何余地了。往低了算对账单护栏来说是正确的
+方向，这也正是它被这样设计的原因，但你应当知道你的起点是约 73%，而不是 80%。
 
-If you have a plan whose allowance is not 1 TB, set `QUOTA_GB` to the plan figure
-in the console and the same reasoning carries over unchanged.
+如果你的套餐额度不是 1 TB，把 `QUOTA_GB` 设成控制台里显示的那个数字即可，上面的推理原样
+适用。
 
-There is deliberately **one** cron trigger: the Workers Free plan allows five per
-account, and the restart branches inside the handler rather than claiming a
-second one.
+这里刻意**只用一个** cron trigger：Workers 免费版每账号允许五个，而重启逻辑是在 handler
+内部分支处理的，没有再占一个。
 
-`workers_dev` and `preview_urls` are both off. This Worker has no `fetch`
-handler, so a public URL would serve nothing but errors and attract traffic to a
-thing whose entire job is to keep traffic down.
+`workers_dev` 和 `preview_urls` 都是关闭的。这个 Worker 没有 `fetch` handler，公开 URL
+除了返回错误什么也做不了，还会给一个「全部工作就是压低流量」的东西招来流量。
 
 ---
 
-## Setup
+## 部署步骤
 
-### 1. AWS: an IAM user with four actions
+### 1. AWS：一个只有四项权限的 IAM 用户
 
-Create an IAM user with programmatic access and attach this policy. It grants
-nothing beyond what the Worker calls.
+创建一个具备编程访问权限的 IAM 用户，附加下面这份策略。它授予的权限不多于 Worker 实际
+调用的那些。
 
 ```json
 {
@@ -118,120 +105,102 @@ nothing beyond what the Worker calls.
 }
 ```
 
-`"Resource": "*"` is the practical choice here. Lightsail resource ARNs are built
-from an instance's generated GUID rather than its name
-(`arn:aws:lightsail:REGION:ACCOUNT:Instance/GUID`), so narrowing the policy means
-looking that ARN up first with `aws lightsail get-instance --instance-name NAME`
-and pasting it in. Worth doing if the account holds instances you never want this
-Worker to touch.
+这里用 `"Resource": "*"` 是务实的选择。Lightsail 的资源 ARN 是用实例自动生成的 GUID
+拼出来的，而不是实例名（`arn:aws:lightsail:REGION:ACCOUNT:Instance/GUID`），所以要收窄
+这份策略，就得先用 `aws lightsail get-instance --instance-name NAME` 把那个 ARN 查出来
+再粘进去。如果账号里还有你绝不希望这个 Worker 碰到的实例，那这一步值得做。
 
-Then create an access key for the user and keep the two values to hand.
+然后为该用户创建访问密钥，把两个值留在手边。
 
-### 2. Configure the plain vars
+### 2. 配置明文变量
 
-Edit `wrangler.jsonc` — `AWS_REGION` and `INSTANCE_NAME` ship as placeholders:
+编辑 `wrangler.jsonc` —— `AWS_REGION` 和 `INSTANCE_NAME` 出厂时是占位值：
 
-| Var | Example | Notes |
+| 变量 | 示例 | 说明 |
 | --- | --- | --- |
-| `AWS_REGION` | `ap-northeast-1` | Lightsail region of the instance |
-| `INSTANCE_NAME` | `my-blog` | Lightsail instance name, not its ARN or GUID |
-| `QUOTA_GB` | `1000` | Plan allowance, counted as 10⁹ bytes |
-| `THRESHOLD` | `0.8` | Fraction of the quota at which to stop; must be in (0, 1] |
-| `ALERT_WEBHOOK` | `https://…` | POST target for stop / start / error notifications. **Set this** — see below |
-| `MANUAL_HOLD` | *(optional)* | `"true"` suppresses every start; anything else, or absent, is off |
+| `AWS_REGION` | `ap-northeast-1` | 实例所在的 Lightsail 区域 |
+| `INSTANCE_NAME` | `my-blog` | Lightsail 实例名，不是 ARN 也不是 GUID |
+| `QUOTA_GB` | `1000` | 套餐额度，按 10⁹ 字节计 |
+| `THRESHOLD` | `0.8` | 达到配额的这个比例时停机；必须落在 (0, 1] 内 |
+| `ALERT_WEBHOOK` | `https://…` | 停机 / 启动 / 错误通知的 POST 目标。**务必配置** —— 见下文 |
+| `MANUAL_HOLD` | *（可选）* | `"true"` 抑制所有启动；其它任何值或不设置都表示关闭 |
 
-`MANUAL_HOLD` is the switch for planned downtime: with it set, the Worker will
-never bring the instance back up, but it still stops it if usage goes over the
-line. It is compared against the exact string `"true"` — `"True"`, `"yes"` and
-`"1"` all read as off, deliberately, since a hold that engages on a typo pins the
-instance down until somebody notices the site is missing.
+`MANUAL_HOLD` 是计划内停机时用的开关：设上之后 Worker 永远不会把实例拉起来，但用量越线时
+它照样会停机。它与字符串 `"true"` 精确比较 —— `"True"`、`"yes"`、`"1"` 都被视为关闭，
+这是刻意的：一个因为打错字就生效的锁，会把实例摁在那里，直到有人发现站点不见了。
 
-`THRESHOLD` is a fraction, not a percentage — the Worker rejects `80` at startup
-rather than quietly setting an 80,000 GB limit it would never reach. Likewise a
-`QUOTA_GB` that does not parse as a positive number is a hard error, because a
-`NaN` comparison would read as "over quota" and stop the instance.
+`THRESHOLD` 是小数不是百分比 —— Worker 会在启动时拒绝 `80`，而不是不声不响地设成一个
+永远够不到的 80,000 GB 上限。同理，`QUOTA_GB` 若不能解析为正数就是硬错误，因为与 `NaN`
+的比较会被读作「已超额」并停掉实例。
 
-Find your plan's allowance under *Lightsail → Instances → your instance →
-Networking → Monthly data transfer*.
+你的套餐额度可以在 *Lightsail → 实例 → 你的实例 → 网络 → 每月数据传输* 里找到。
 
-### 3. Alerting is not optional
+### 3. 告警是必需项，不是可选项
 
-`ALERT_WEBHOOK` is presented as an optional var. Treat it as required. Without
-it:
+`ALERT_WEBHOOK` 在表里写的是可选变量。请把它当成必填。不配它的话：
 
-- **A stop is silent.** The instance goes down, the Worker writes one
-  `console.error` line into Workers logs, and that is the entire notification.
-  Nobody reads Workers logs unprompted. You find out when you visit your own
-  site.
-- **A broken watchdog is silent too**, and this is the worse half. A mistyped
-  `INSTANCE_NAME`, an expired access key, a deleted IAM user, a bad deploy — each
-  makes every run throw. The Worker keeps being invoked every ten minutes, keeps
-  failing, and keeps guarding nothing. From the outside it is indistinguishable
-  from a healthy watchdog on a quiet month.
+- **停机是无声的。** 实例下线，Worker 往 Workers 日志里写一行 `console.error`，通知就到此
+  为止。没有人会主动去翻 Workers 日志。你会在自己打开站点时才发现。
+- **看门狗自己坏掉同样无声**，而这是更糟的那一半。打错的 `INSTANCE_NAME`、过期的访问
+  密钥、被删掉的 IAM 用户、一次坏掉的部署 —— 每一种都会让每次运行都抛异常。Worker 仍然
+  每十分钟被调用一次，仍然每次都失败，也仍然什么都没在守护。从外面看，它和一个安然度过
+  淡季的健康看门狗毫无区别。
 
-Every run that throws now POSTs an `error` event before rethrowing, so a webhook
-turns that second case into something you actually receive. Point it at whatever
-you read: a Slack or Discord incoming webhook, an ntfy/Pushover topic, an email
-relay. It only needs to accept a JSON POST.
+现在每一次抛异常的运行都会先 POST 一条 `error` 事件再重新抛出，所以一个 webhook 能把
+第二种情况变成你真的收得到的东西。把它指向任何你会看的地方：Slack 或 Discord 的
+incoming webhook、ntfy/Pushover 的主题、一个邮件中继。它只需要能接受 JSON POST。
 
-If you would rather alert on the Worker's error rate instead, that works too —
-but configure *something*. The default configuration tells you nothing.
+如果你更愿意改为对 Worker 的错误率告警，那也行 —— 但请务必配*某样东西*。默认配置什么都
+不会告诉你。
 
-**Fill in `INSTANCE_NAME` before you point a webhook at anything you read.** A
-watchdog still carrying the shipped `CHANGE_ME` fails on every run, and every run
-alerts — 144 messages a day. The Worker now refuses to start with the placeholder
-in place and says so in the error, so you get one legible reason rather than a
-day of 404s, but it is a lot easier to fix the var first.
+**在把 webhook 指向任何你会看的地方之前，先把 `INSTANCE_NAME` 填好。** 一个还带着出厂
+`CHANGE_ME` 的看门狗会每次运行都失败，而每次运行都会告警 —— 一天 144 条。现在 Worker 会
+直接拒绝在占位值下运行，并在报错里说明原因，所以你拿到的是一条读得懂的理由，而不是一整天
+的 404；但先把变量填对，显然要省事得多。
 
-#### AWS Budgets is the one signal this Worker cannot compromise
+#### AWS Budgets 是唯一一个不会被这个 Worker 拖累的信号
 
-Every alert above is emitted **by the Worker itself**, which means every one of
-them shares the Worker's failure modes. If the Worker is not running at all —
-deleted, its cron trigger disabled, its account suspended, its deploy broken
-before the handler is reached — no error alert is ever generated, because
-nothing is there to generate it.
+上面所有告警都是**由 Worker 自己**发出的，这意味着它们全都共享 Worker 的故障模式。如果
+Worker 压根没在运行 —— 被删掉了、cron trigger 被禁用了、账号被停了、部署在还没走到
+handler 之前就坏了 —— 那么任何错误告警都不会产生，因为没有东西在那里产生它。
 
-So configure an **AWS Budgets** alert as well, in the AWS console, independently
-of this repository:
+所以请在 AWS 控制台里，独立于本仓库，另外配一个 **AWS Budgets** 告警：
 
-1. *Billing and Cost Management → Budgets → Create budget*.
-2. A cost budget slightly above your normal monthly Lightsail spend (a $5
-   instance with no overage bills ~$5; set the budget at, say, $10).
-3. Alert at 80% and 100% of budgeted amount, to an email address you read.
+1. *账单与成本管理 → 预算 → 创建预算*。
+2. 设一个略高于你 Lightsail 正常月度支出的成本预算（一台 5 美元的实例在没有超量时约
+   5 美元；那预算就设成比如 10 美元）。
+3. 在预算金额的 80% 和 100% 处告警，发到一个你真的会看的邮箱。
 
-That alert is generated by AWS, from AWS's own billing data, and arrives whether
-or not this Worker exists. It is the backstop for the case where the watchdog is
-gone, and it is the only signal in this design that is genuinely independent. It
-is slower than the Worker — billing data lags by hours — so it is a safety net,
-not a replacement.
+那条告警由 AWS 生成、取自 AWS 自己的账单数据，无论这个 Worker 是否存在都会送达。它是
+「看门狗已经没了」这种情况下的兜底，也是本设计中唯一一个真正独立的信号。它比 Worker 慢
+—— 账单数据有数小时的延迟 —— 所以它是安全网，不是替代品。
 
-### 4. Set the secrets
+### 4. 设置密钥
 
-Never put these in `wrangler.jsonc`:
+这两个值永远不要写进 `wrangler.jsonc`：
 
 ```sh
 npx wrangler secret put AWS_ACCESS_KEY_ID
 npx wrangler secret put AWS_SECRET_ACCESS_KEY
 ```
 
-Each prompts for the value and stores it encrypted on Cloudflare.
+每条命令都会提示你输入值，并把它加密存储在 Cloudflare 上。
 
-### 5. Deploy
+### 5. 部署
 
 ```sh
 npm install
 npx wrangler deploy
 ```
 
-Confirm the trigger under *Workers & Pages → na-lightsail-monitor → Settings →
-Triggers*. Logs are available in the dashboard (`observability` is enabled) or by
-tailing:
+到 *Workers & Pages → na-lightsail-monitor → Settings → Triggers* 确认 trigger 已生效。
+日志可以在控制台查看（`observability` 已开启），也可以直接 tail：
 
 ```sh
 npx wrangler tail
 ```
 
-A healthy run logs one line:
+一次健康的运行只记一行日志：
 
 ```
 my-blog: 137.482 GB used month-to-date, under the 800.000 GB stop threshold
@@ -239,102 +208,80 @@ my-blog: 137.482 GB used month-to-date, under the 800.000 GB stop threshold
 
 ---
 
-## Testing
+## 测试
 
-Unit tests — pure logic, no network, no AWS:
+单元测试 —— 纯逻辑，不联网，不碰 AWS：
 
 ```sh
 npm test
 ```
 
-These cover the month-boundary math (the off-by-one that would silently break
-everything at the rollover), the seconds-vs-milliseconds conversion, config
-validation, and the handler end-to-end against a stubbed `fetch`: request shape,
-the idempotent stop path, the usage-driven restart and its `MANUAL_HOLD`
-suppression, the two-call cost of a normal run, and that a failed AWS call
-alerts, throws, and keeps both credentials out of the message and the payload.
+覆盖范围包括：月份边界的计算（那个会在跨月时悄无声息地毁掉一切的差一错误）、秒与毫秒的
+换算、配置校验，以及针对打桩 `fetch` 的 handler 端到端测试 —— 请求结构、幂等的停机路径、
+由用量驱动的重启及其 `MANUAL_HOLD` 抑制、正常运行只花两次调用，还有 AWS 调用失败时会告警、
+会抛出，且两个密钥都不会出现在报错信息和通知载荷里。
 
-The date tests run under `TZ=America/Los_Angeles` on purpose. Every assertion is
-written against an exact epoch value, so it holds in any zone — but an
-implementation that reached for local-time helpers would coincidentally pass
-under `TZ=UTC`. The offset is what makes those tests worth running.
+日期相关的测试刻意跑在 `TZ=America/Los_Angeles` 下。每一条断言都是针对精确的 epoch 值写的，
+所以它在任何时区下都成立 —— 但一个改用本地时间辅助函数的实现，在 `TZ=UTC` 下会碰巧通过。
+正是这个时差让那些测试有跑的价值。
 
-To fire the real handler locally, put the credentials in `.dev.vars` (gitignored,
-never commit it):
+要在本地触发真实的 handler，把凭据放进 `.dev.vars`（已在 gitignore 中，绝不要提交）：
 
 ```
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
 ```
 
-then:
+然后：
 
 ```sh
 npx wrangler dev --test-scheduled
 curl http://localhost:8787/__scheduled
 ```
 
-> **This talks to the real AWS API.** If the instance is genuinely over its
-> threshold, a local run will stop it for real. Point it at a test instance, or
-> raise `THRESHOLD` in `wrangler.jsonc` while you experiment.
+> **这会真的调用 AWS API。** 如果实例确实已经超过阈值，本地运行会真的把它停掉。请指向一台
+> 测试实例，或者在你折腾期间先把 `wrangler.jsonc` 里的 `THRESHOLD` 调高。
 
 ---
 
-## Things worth knowing before you rely on this
+## 依赖它之前值得知道的几件事
 
-- **The billing month is UTC.** The allowance resets at 00:00 UTC on the 1st,
-  which is the afternoon of the last day of the month in the Americas. The Worker
-  computes everything in UTC; your Lightsail console may not.
-- **It only counts one instance; the allowance is per account.** Lightsail pools
-  the data transfer allowance across every instance on the account, but this
-  Worker queries `GetInstanceMetricData` for `INSTANCE_NAME` alone. With one
-  Lightsail instance those are the same number. Add a second instance and the
-  Worker's figure is an *undercount* of what the account is actually consuming —
-  it will let you sail past the real quota while reporting you are fine. If you
-  ever add instances, this needs to become a `GetInstances` call and a sum over
-  all of them; until then, the single-instance assumption is load-bearing and
-  undocumented anywhere in the AWS console.
-- **It will restart an instance you stopped on purpose**, once the month rolls
-  over and its usage reads zero. Set `MANUAL_HOLD` to `"true"` for planned
-  downtime — it blocks every start while leaving the bill guard active. A
-  mid-month manual stop is safe until the boundary regardless, since usage is
-  non-zero by then.
-- **There is no way to keep running once you are over the line**, and that is on
-  purpose. `MANUAL_HOLD` suppresses starts, not stops, so if you decide partway
-  through a month that you would rather eat the overage than have the site down,
-  starting the instance by hand buys you ten minutes before the next run puts it
-  back. The supported way to make that call is to raise `THRESHOLD` in
-  `wrangler.jsonc` — `1` disables the stop for the rest of the month — and
-  redeploy. Then put it back afterwards.
+- **计费月按 UTC 计。** 额度在每月 1 日 00:00 UTC 重置，那个时刻在美洲还是上个月最后一天
+  的下午。Worker 一切都按 UTC 计算；你的 Lightsail 控制台未必如此。
+- **它只统计一个实例，而额度是按账号算的。** Lightsail 把数据传输额度在账号下的所有实例
+  之间汇总，而这个 Worker 只对 `INSTANCE_NAME` 一个实例调用 `GetInstanceMetricData`。
+  账号里只有一台 Lightsail 实例时，这两个数字是一回事。一旦加了第二台，Worker 报出的数字
+  就是对账号实际消耗的*低估* —— 它会一边告诉你一切正常，一边放任你冲过真正的配额。日后
+  若要加实例，这里就得改成调 `GetInstances` 再对所有实例求和；在那之前，「只有单个实例」
+  这个假设是承重的，而且在 AWS 控制台里任何地方都没有写明。
+- **它会把你故意停掉的实例重新启动**，只要跨过月份边界、用量读数为零。计划内停机请把
+  `MANUAL_HOLD` 设为 `"true"` —— 它拦住所有启动，同时保留账单护栏。而月中的手动停机在
+  跨月之前本来就是安全的，因为那时用量不为零。
+- **一旦越线，就没有任何办法让实例继续跑**，这是刻意的。`MANUAL_HOLD` 抑制的是启动而不是
+  停机，所以如果你在月中决定「宁可认了这笔超额费用，也不能让站点下线」，手动启动实例只能
+  换来十分钟，下一次运行就会把它按回去。要做这个决定，受支持的做法是把 `wrangler.jsonc`
+  里的 `THRESHOLD` 调高 —— 设成 `1` 就等于当月不再停机 —— 然后重新部署。事后记得改回来。
 
-  A runtime switch would be friendlier and is deliberately absent. A toggle that
-  turns off the protection is a toggle somebody forgets to turn back on, and an
-  unattended bill guard that has been quietly disabled since March is the exact
-  scenario this whole Worker exists to prevent. Editing a file and redeploying is
-  mildly annoying, which is the point: it is hard to do by reflex, it shows up in
-  `git log`, and the diff sits there looking wrong until someone reverts it.
-- **A stop is not a graceful shutdown of your app.** It is the equivalent of a
-  power-off from the instance's perspective. If your workload needs to flush
-  state, use `ALERT_WEBHOOK` to get ahead of it, or set `THRESHOLD` low enough to
-  leave yourself room.
-- **Metrics lag.** Lightsail metric data lands a few minutes behind real traffic,
-  so the observed figure trails actual usage. The defaults leave 200–300 GB of
-  headroom on a 1 TB plan, which is plenty; raising `THRESHOLD` toward 1.0 eats
-  into that margin — see the units table above for what those numbers really
-  mean.
-- **Failures are loud on purpose.** Any non-2xx from AWS throws. The handler
-  catches it at the top, POSTs an `error` event, and rethrows, so the invocation
-  is still recorded as a failure in Workers logs *and* reaches you. With no
-  webhook configured only the first half of that happens.
-- The alert webhook is best-effort and never throws — not on the stop path, where
-  the instance is already down and a webhook outage must not make a successful
-  stop look like a failed run, and not on the error path, where it must not
-  replace the original exception with its own.
+  一个运行时开关会友好得多，而它被刻意省掉了。一个能关掉保护的开关，就是一个会被人忘记
+  打开回来的开关；而一个从三月起就被悄悄禁用、无人看管的账单护栏，正是这整个 Worker 存在
+  所要防止的场景。改文件再重新部署是有点麻烦，而这正是重点：它很难被随手做掉，它会留在
+  `git log` 里，而且那个 diff 会一直杵在那儿显得不对劲，直到有人把它改回来。
+- **停机不是应用层的优雅关闭。** 从实例的角度看，它等同于断电。如果你的工作负载需要把状态
+  刷盘，就用 `ALERT_WEBHOOK` 抢在前面处理，或者把 `THRESHOLD` 设得足够低给自己留出余地。
+- **指标有延迟。** Lightsail 的指标数据比真实流量晚几分钟落库，所以观察到的数字总是落后于
+  实际用量。默认配置在 1 TB 套餐上留了 200–300 GB 的余量，这很充裕；把 `THRESHOLD` 往 1.0
+  调会侵蚀这块余量 —— 这些数字的真实含义见上文的单位换算表。
+- **失败是刻意大声的。** AWS 返回的任何非 2xx 都会抛异常。handler 在最外层捕获它、POST 一条
+  `error` 事件，然后重新抛出，所以这次调用*既*在 Workers 日志里记为失败，*也*能送达到你。
+  没配 webhook 的话，就只剩前半句。
+- 告警 webhook 是尽力而为且永不抛异常的 —— 在停机路径上，实例此时已经停了，webhook 故障
+  不该让一次成功的停机看起来像失败的运行；在错误路径上，它也不能用自己的异常顶替掉原始
+  异常。此外它带 5 秒超时，这样一个接受连接却不回应的端点无法把整次调用挂死。
 
-## Alert payload
+## 告警载荷
 
-Three events, all POSTed as JSON. Credential values never appear in any of them;
-AWS error text is scrubbed of both keys before it is included.
+三种事件，都以 JSON POST 发出。任何一种里都不会出现凭据内容；AWS 的错误文本在被写入之前
+已经把两个密钥都抹掉了。
 
 ```json
 {
@@ -365,19 +312,21 @@ AWS error text is scrubbed of both keys before it is included.
 }
 ```
 
-An `error` event means the watchdog did not complete its run — the instance was
-neither checked nor acted on. One is a blip; a steady stream every ten minutes
-means you are unprotected.
+收到 `error` 事件意味着这次看门狗没有跑完 —— 实例既没被检查，也没被处理。偶尔一条是抖动；
+每十分钟稳定来一条，说明你现在毫无防护。
 
-## Layout
+## 目录结构
 
 ```
-src/index.js    the Worker
-test/           unit tests (node:test, no runner dependency)
-wrangler.jsonc  trigger, vars, and observability config
+src/index.js    Worker 本体
+test/           单元测试（node:test，不依赖测试运行器）
+wrangler.jsonc  trigger、vars 和 observability 配置
 ```
 
-One runtime dependency, [`aws4fetch`](https://github.com/mhart/aws4fetch), pinned
-to `1.0.20` — it does SigV4 signing in about 4 KB. The AWS SDK is far too large
-for a Worker. Plain JavaScript with JSDoc types, so there is no build step beyond
-what Wrangler does natively and the tests run on bare `node --test`.
+只有一个运行时依赖 [`aws4fetch`](https://github.com/mhart/aws4fetch)，版本钉死在 `1.0.20`
+—— 它用大约 4 KB 完成 SigV4 签名。AWS SDK 对 Worker 来说实在太大了。代码是带 JSDoc 类型
+标注的纯 JavaScript，所以除了 Wrangler 原生做的那一步之外没有任何构建步骤，测试直接跑在
+裸的 `node --test` 上。
+
+> 说明：代码里的日志文本、错误信息和告警载荷字段刻意保留英文 —— 它们会和 Workers 控制台、
+> AWS 的英文报错混在一起显示，保持一致更便于检索。测试用例名同理。

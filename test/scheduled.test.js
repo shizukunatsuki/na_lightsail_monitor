@@ -1,6 +1,5 @@
-// Exercises the scheduled handler end-to-end against a stubbed global fetch.
-// Requests are really signed by aws4fetch; nothing leaves the process and no
-// real AWS credentials or endpoints are involved.
+// 用一个打桩的全局 fetch 端到端地跑 scheduled handler。请求确实经过 aws4fetch 真实
+// 签名；但没有任何东西离开本进程，也不涉及任何真实的 AWS 凭据或端点。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -20,9 +19,9 @@ const baseEnv = {
 const GB = 1e9;
 
 /**
- * Stub `globalThis.fetch`, recording every Lightsail operation and webhook POST.
- * `state` may be a list, consumed one entry per GetInstanceState call, to model
- * an instance whose state changes between calls.
+ * 打桩 `globalThis.fetch`，记录每一次 Lightsail 操作和 webhook POST。
+ * `state` 可以传数组，每次 GetInstanceState 调用消费一项，用来模拟状态在两次调用之间
+ * 发生变化的实例。
  */
 function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}) {
   const calls = [];
@@ -43,7 +42,7 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
     calls.push({ operation, body, url: req.url, headers: req.headers });
 
     if (fail === operation) {
-      // Shaped like a real SigV4 rejection, which echoes the credential scope.
+      // 形状照着真实的 SigV4 拒绝响应来，它会回显 credential scope。
       return new Response(
         `{"__type":"InvalidSignatureException","message":"Credential should be scoped: ${ACCESS_KEY_ID}/20260815/ap-northeast-1/lightsail/aws4_request"}`,
         { status: 403 },
@@ -57,8 +56,8 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
       }
       case "GetInstanceMetricData": {
         const total = body.metricName === "NetworkIn" ? networkIn : networkOut;
-        // Unsorted, sparse, and with one datapoint missing `sum` entirely —
-        // the API guarantees none of those things.
+        // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
+        // 不保证。
         return Response.json({
           metricName: body.metricName,
           metricData: [
@@ -79,7 +78,7 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
-/** Run the handler at a fixed instant, awaiting anything handed to waitUntil. */
+/** 在一个固定时刻运行 handler，并等待所有交给 waitUntil 的任务完成。 */
 async function run(iso, env, mock) {
   const pending = [];
   const ctx = { waitUntil: (p) => pending.push(p), passThroughOnException() {} };
@@ -114,7 +113,7 @@ test("metric queries use the documented request shape", async () => {
   assert.equal(metric.headers.get("Content-Type"), "application/x-amz-json-1.1");
   assert.match(metric.headers.get("X-Amz-Target"), /^Lightsail_20161128\.GetInstanceMetricData$/);
 
-  // lowerCamelCase members, a daily period, and Unix-second timestamps.
+  // 小驼峰字段名、按天的 period，以及 Unix 秒级时间戳。
   assert.deepEqual(Object.keys(metric.body).sort(), [
     "endTime", "instanceName", "metricName", "period", "startTime", "statistics", "unit",
   ]);
@@ -127,7 +126,7 @@ test("metric queries use the documented request shape", async () => {
 });
 
 test("both directions count toward the allowance", async () => {
-  // 500 in + 400 out = 900 GB, over the 800 GB threshold; neither alone is.
+  // 入 500 + 出 400 = 900 GB，超过 800 GB 的阈值；但单看任何一个方向都没超。
   const mock = stubAws({ networkIn: 500 * GB, networkOut: 400 * GB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
@@ -151,7 +150,7 @@ test("over the threshold it stops a running instance exactly once", async () => 
 test("the stop path is idempotent when the instance is already stopped", async () => {
   const mock = stubAws({ state: "stopped", networkIn: 900 * GB, networkOut: 0 });
 
-  // Two consecutive runs, still over quota, must never issue a stop.
+  // 连续两次触发，用量仍然超额，但绝不能发出停机。
   await run("2026-08-15T12:00:00Z", baseEnv);
   await run("2026-08-15T12:10:00Z", baseEnv, mock);
 
@@ -198,8 +197,8 @@ test("a failing webhook does not mask a successful stop", async () => {
 });
 
 /**
- * Wrap the AWS stub so webhook POSTs — the only fetch made with a bare URL
- * rather than a signed Request — go through `onWebhook` instead.
+ * 在 AWS 打桩之外再包一层，把 webhook 的 POST —— 唯一一个用裸 URL 而不是已签名
+ * Request 发出的 fetch —— 转交给 `onWebhook` 处理。
  */
 function interceptWebhook(onWebhook) {
   const inner = globalThis.fetch;
@@ -220,9 +219,8 @@ test("the alert POST is bounded by a timeout", async () => {
   const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
   await run("2026-08-15T12:00:00Z", env, mock);
 
-  // A webhook that accepts the connection and never answers would otherwise
-  // hang the invocation; on the error path, which awaits the alert before
-  // rethrowing, that turns a broken endpoint into a broken watchdog.
+  // 一个接受连接却从不回应的 webhook 会把整次调用挂住；而错误路径是 await 完告警才
+  // rethrow 的，于是一个坏掉的端点就变成了一个坏掉的看门狗。
   assert.ok(signal instanceof AbortSignal, "the webhook POST must carry an abort signal");
   assert.equal(signal.aborted, false, "and it must still be live at send time");
 });
@@ -230,7 +228,7 @@ test("the alert POST is bounded by a timeout", async () => {
 test("a webhook that times out does not mask a successful stop", async () => {
   const mock = stubAws({ networkIn: 900 * GB });
   interceptWebhook(() => {
-    // What AbortSignal.timeout produces once the endpoint has gone quiet.
+    // 端点没了动静之后，AbortSignal.timeout 抛出的正是这个。
     throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
   });
 
@@ -254,8 +252,7 @@ test("a webhook that times out does not replace the original exception", async (
 });
 
 test("a reset allowance starts a stopped instance", async () => {
-  // New billing month: month-to-date is back to zero and the instance is still
-  // down from last month's stop.
+  // 新的计费月：月初至今归零，而实例还停在上个月那次停机的状态里。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
   const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
   await run("2026-09-01T00:00:00Z", env, mock);
@@ -269,14 +266,14 @@ test("a reset allowance starts a stopped instance", async () => {
   ]);
   assert.deepEqual(mock.calls[3].body, { instanceName: "my-blog" });
   assert.equal(mock.calls[4].body.event, "started");
-  // The window is the new month, not the one whose usage caused the stop.
+  // 窗口取的是新月份，而不是那个用量导致停机的月份。
   assert.equal(mock.calls[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });
 
 test("the restart is retried on every later run, not just at the rollover", async () => {
-  // The bug this replaces: the old date test would have passed while the
-  // instance stayed down for a month if every run on the 1st failed. Here the
-  // trigger is the usage figure, which stays true until the start succeeds.
+  // 这条替换掉的那个缺陷：旧的按日期测试里，只要 1 号那天每一次触发都失败，实例就会
+  // 一直停一个月，而测试照样是绿的。这里的触发条件是用量数字，它会一直成立到启动成功
+  // 为止。
   for (const at of ["2026-09-01T00:10:00Z", "2026-09-02T13:20:00Z", "2026-09-27T08:00:00Z"]) {
     const mock = stubAws({ state: "stopped" });
     await run(at, baseEnv, mock);
@@ -285,9 +282,8 @@ test("the restart is retried on every later run, not just at the rollover", asyn
 });
 
 test("a stopped instance is not started while the month's usage is still spent", async () => {
-  // Same month as the stop: the allowance has not reset, so neither does the
-  // instance. This is what makes the usage trigger equivalent to the old
-  // 1st-of-month one rather than a restart loop.
+  // 与停机同一个月：额度没有重置，实例也就不该重启。正是这一点让用量触发等价于旧的
+  // 「1 号」触发，而不是变成一个反复重启的死循环。
   const mock = stubAws({ state: "stopped", networkIn: 900 * GB });
   await run("2026-08-02T00:00:00Z", baseEnv, mock);
 
@@ -295,8 +291,7 @@ test("a stopped instance is not started while the month's usage is still spent",
 });
 
 test("a stopped instance with traffic on the meter is left alone", async () => {
-  // Under the threshold but not at zero — the operator stopped it themselves
-  // partway through the month. Nothing here says the allowance reset.
+  // 低于阈值但不为零 —— 是操作者自己在月中把它停掉的。这里没有任何迹象表明额度重置了。
   const mock = stubAws({ state: "stopped", networkIn: 120 * GB, networkOut: 80 * GB });
   await run("2026-08-20T09:00:00Z", baseEnv, mock);
 
@@ -304,7 +299,7 @@ test("a stopped instance with traffic on the meter is left alone", async () => {
 });
 
 test("zero usage on a running instance costs one state check and nothing else", async () => {
-  // The first minutes of a month, before any datapoint has landed.
+  // 新月份的头几分钟，还没有任何数据点落库。
   const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
   await run("2026-09-01T00:00:00Z", baseEnv, mock);
 
@@ -318,14 +313,12 @@ test("zero usage on a running instance costs one state check and nothing else", 
 test("MANUAL_HOLD suppresses the start without suppressing the stop", async () => {
   const held = { ...baseEnv, MANUAL_HOLD: "true" };
 
-  // Allowance reset, instance down: normally a start. Held, it does not even
-  // ask for the state.
+  // 额度已重置、实例处于停机：正常情况下应该启动。加了 hold 之后，它连状态都不去问。
   const start = stubAws({ state: "stopped" });
   await run("2026-09-01T00:00:00Z", held, start);
   assert.deepEqual(opsOf(start.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
 
-  // The bill guard still fires — a hold is about not being restarted, not
-  // about being allowed to run over quota.
+  // 账单护栏照常生效 —— hold 的含义是「不要把我拉起来」，不是「允许我超额跑着」。
   const stop = stubAws({ state: "running", networkIn: 900 * GB });
   await run("2026-08-15T12:00:00Z", held, stop);
   assert.ok(opsOf(stop.calls).includes("StopInstance"));
@@ -409,8 +402,8 @@ test("the error alert carries no credential material", async () => {
 });
 
 test("a misconfigured watchdog alerts even though no config was parsed", async () => {
-  // The nastiest case: INSTANCE_NAME is wrong or a binding is missing, so
-  // readConfig throws before there is a Config to read the webhook out of.
+  // 最难缠的情形：INSTANCE_NAME 填错了，或者某个绑定压根没配，于是 readConfig 在
+  // 还没有 Config 可供读取 webhook 地址之前就抛了异常。
   const mock = stubAws();
   const env = {
     ...baseEnv,
