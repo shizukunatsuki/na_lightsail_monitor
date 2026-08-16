@@ -10,6 +10,9 @@ const API_TARGET = "Lightsail_20161128";
  */
 const METRIC_PERIOD_SECONDS = 86400;
 
+/** The value `wrangler.jsonc` ships with for vars the operator has to fill in. */
+const PLACEHOLDER = "CHANGE_ME";
+
 /**
  * @typedef {object} Config
  * @property {string} region
@@ -34,6 +37,19 @@ const METRIC_PERIOD_SECONDS = 86400;
 export function readConfig(env) {
   for (const name of ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "INSTANCE_NAME"]) {
     if (!env[name]) throw new Error(`Missing required binding ${name}`);
+  }
+
+  // A shipped placeholder is non-empty, so the check above waves it through and
+  // every run then fails against Lightsail instead. With error alerts wired up
+  // that is 144 webhooks a day carrying a bare 404, which does not obviously
+  // read as "you never filled in the instance name". Say so here instead.
+  //
+  // Exact comparison, deliberately: an instance genuinely named
+  // `change_me_later` is somebody's real instance and must not be rejected.
+  for (const name of ["AWS_REGION", "INSTANCE_NAME"]) {
+    if (env[name] === PLACEHOLDER) {
+      throw new Error(`${name} is still the placeholder "${PLACEHOLDER}"; set it in wrangler.jsonc`);
+    }
   }
 
   const quotaGb = Number(env.QUOTA_GB);
@@ -214,6 +230,14 @@ async function notify(config, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      // An endpoint that accepts the connection and then never answers would
+      // otherwise hang here until the platform kills the invocation — and the
+      // error path awaits this call before rethrowing, so a wedged webhook
+      // would take the watchdog down with it. That is exactly backwards: the
+      // alert is an extra, and it must never be able to outrank the run that
+      // produced it. The resulting TimeoutError lands in the catch below and
+      // is logged like any other delivery failure.
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) console.error(`ALERT_WEBHOOK returned HTTP ${res.status}`);
   } catch (err) {

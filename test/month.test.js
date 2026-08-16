@@ -131,6 +131,30 @@ test("readConfig rejects a THRESHOLD written as a percentage", () => {
   assert.equal(readConfig({ ...validEnv, THRESHOLD: "1" }).threshold, 1);
 });
 
+test("readConfig rejects the shipped placeholder and says where to fix it", () => {
+  // "CHANGE_ME" is non-empty, so it clears the missing-binding check and then
+  // fails against Lightsail on every run instead — 144 unreadable 404s a day
+  // once error alerts are wired up.
+  for (const name of ["INSTANCE_NAME", "AWS_REGION"]) {
+    assert.throws(
+      () => readConfig({ ...validEnv, [name]: "CHANGE_ME" }),
+      (err) => {
+        assert.match(err.message, new RegExp(`^${name} is still the placeholder`));
+        assert.match(err.message, /wrangler\.jsonc/, "the message has to say where to fix it");
+        return true;
+      },
+    );
+  }
+});
+
+test("readConfig only rejects the placeholder on an exact match", () => {
+  // Somebody's instance really is called this. Matching loosely would lock them
+  // out of their own watchdog.
+  for (const instanceName of ["change_me_later", "CHANGE_ME_LATER", "change_me", "my-CHANGE_ME"]) {
+    assert.equal(readConfig({ ...validEnv, INSTANCE_NAME: instanceName }).instanceName, instanceName);
+  }
+});
+
 test("readConfig requires the credentials and instance identity", () => {
   for (const name of ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "INSTANCE_NAME"]) {
     assert.throws(

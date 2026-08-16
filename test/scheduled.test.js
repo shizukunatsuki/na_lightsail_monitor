@@ -197,6 +197,62 @@ test("a failing webhook does not mask a successful stop", async () => {
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
 });
 
+/**
+ * Wrap the AWS stub so webhook POSTs — the only fetch made with a bare URL
+ * rather than a signed Request — go through `onWebhook` instead.
+ */
+function interceptWebhook(onWebhook) {
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    if (input instanceof Request) return inner(input, init);
+    return onWebhook(init);
+  };
+}
+
+test("the alert POST is bounded by a timeout", async () => {
+  const mock = stubAws({ networkIn: 900 * GB });
+  let signal;
+  interceptWebhook((init) => {
+    signal = init?.signal;
+    return new Response("ok");
+  });
+
+  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
+  await run("2026-08-15T12:00:00Z", env, mock);
+
+  // A webhook that accepts the connection and never answers would otherwise
+  // hang the invocation; on the error path, which awaits the alert before
+  // rethrowing, that turns a broken endpoint into a broken watchdog.
+  assert.ok(signal instanceof AbortSignal, "the webhook POST must carry an abort signal");
+  assert.equal(signal.aborted, false, "and it must still be live at send time");
+});
+
+test("a webhook that times out does not mask a successful stop", async () => {
+  const mock = stubAws({ networkIn: 900 * GB });
+  interceptWebhook(() => {
+    // What AbortSignal.timeout produces once the endpoint has gone quiet.
+    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  });
+
+  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
+  await run("2026-08-15T12:00:00Z", env, mock);
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"), "the stop already succeeded");
+});
+
+test("a webhook that times out does not replace the original exception", async () => {
+  const mock = stubAws({ fail: "GetInstanceMetricData" });
+  interceptWebhook(() => {
+    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  });
+
+  const env = { ...baseEnv, ALERT_WEBHOOK: "https://example.com/hooks/lightsail" };
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", env, mock),
+    /GetInstanceMetricData failed: HTTP 403/,
+  );
+});
+
 test("a reset allowance starts a stopped instance", async () => {
   // New billing month: month-to-date is back to zero and the instance is still
   // down from last month's stop.

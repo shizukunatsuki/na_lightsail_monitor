@@ -177,6 +177,12 @@ relay. It only needs to accept a JSON POST.
 If you would rather alert on the Worker's error rate instead, that works too —
 but configure *something*. The default configuration tells you nothing.
 
+**Fill in `INSTANCE_NAME` before you point a webhook at anything you read.** A
+watchdog still carrying the shipped `CHANGE_ME` fails on every run, and every run
+alerts — 144 messages a day. The Worker now refuses to start with the placeholder
+in place and says so in the error, so you get one legible reason rather than a
+day of 404s, but it is a lot easier to fix the var first.
+
 #### AWS Budgets is the one signal this Worker cannot compromise
 
 Every alert above is emitted **by the Worker itself**, which means every one of
@@ -293,6 +299,20 @@ curl http://localhost:8787/__scheduled
   downtime — it blocks every start while leaving the bill guard active. A
   mid-month manual stop is safe until the boundary regardless, since usage is
   non-zero by then.
+- **There is no way to keep running once you are over the line**, and that is on
+  purpose. `MANUAL_HOLD` suppresses starts, not stops, so if you decide partway
+  through a month that you would rather eat the overage than have the site down,
+  starting the instance by hand buys you ten minutes before the next run puts it
+  back. The supported way to make that call is to raise `THRESHOLD` in
+  `wrangler.jsonc` — `1` disables the stop for the rest of the month — and
+  redeploy. Then put it back afterwards.
+
+  A runtime switch would be friendlier and is deliberately absent. A toggle that
+  turns off the protection is a toggle somebody forgets to turn back on, and an
+  unattended bill guard that has been quietly disabled since March is the exact
+  scenario this whole Worker exists to prevent. Editing a file and redeploying is
+  mildly annoying, which is the point: it is hard to do by reflex, it shows up in
+  `git log`, and the diff sits there looking wrong until someone reverts it.
 - **A stop is not a graceful shutdown of your app.** It is the equivalent of a
   power-off from the instance's perspective. If your workload needs to flush
   state, use `ALERT_WEBHOOK` to get ahead of it, or set `THRESHOLD` low enough to
