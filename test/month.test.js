@@ -86,7 +86,7 @@ const validEnv = {
   AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
   AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
   AWS_REGION: "ap-northeast-1",
-  INSTANCE_NAME: "my-blog",
+  INSTANCE_NAME: "example-instance",
   QUOTA_GIB: "1024",
   THRESHOLD: "0.8",
 };
@@ -94,10 +94,20 @@ const validEnv = {
 test("readConfig parses the plain vars into numbers", () => {
   const config = readConfig(validEnv);
   assert.equal(config.region, "ap-northeast-1");
-  assert.equal(config.instanceName, "my-blog");
+  assert.equal(config.instanceName, "example-instance");
   assert.equal(config.quotaGib, 1024);
   assert.equal(config.threshold, 0.8);
   assert.equal(config.manualHold, false);
+});
+
+test("readConfig derives the log identity from the name and the region", () => {
+  // 每行日志的前缀。实例名只在单个区域内唯一，所以两者都要有 —— 这个仓库是公开的，
+  // 谁复制过去都会得到一份自我说明的日志。
+  assert.equal(readConfig(validEnv).label, "example-instance@ap-northeast-1");
+  assert.equal(
+    readConfig({ ...validEnv, INSTANCE_NAME: "blog", AWS_REGION: "us-east-1" }).label,
+    "blog@us-east-1",
+  );
 });
 
 test("readConfig only honours MANUAL_HOLD spelled exactly \"true\"", () => {
@@ -135,7 +145,7 @@ test("readConfig rejects a THRESHOLD written as a percentage", () => {
 
 test("readConfig rejects the shipped placeholder and says where to fix it", () => {
   // "CHANGE_ME" 是非空的，所以它能通过「必填项缺失」那道检查，然后改为每次触发都在
-  // Lightsail 侧失败 —— 配上错误告警就是每天 144 条读不懂的 404。
+  // Lightsail 侧失败 —— 配上错误告警就是每天几百条读不懂的 404。
   for (const name of ["INSTANCE_NAME", "AWS_REGION"]) {
     assert.throws(
       () => readConfig({ ...validEnv, [name]: "CHANGE_ME" }),

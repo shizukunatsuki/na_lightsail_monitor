@@ -11,7 +11,7 @@ const baseEnv = {
   AWS_ACCESS_KEY_ID: ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
   AWS_REGION: "ap-northeast-1",
-  INSTANCE_NAME: "my-blog",
+  INSTANCE_NAME: "example-instance",
   QUOTA_GIB: "1024",
   THRESHOLD: "0.8",
 };
@@ -148,6 +148,23 @@ async function capturingLogs(fn) {
   return lines;
 }
 
+test("every log line is prefixed with the instance identity, including the region", async () => {
+  // 这个仓库是公开的，谁复制过去都会得到一份自我说明的日志。实例名只在单个区域内唯一，
+  // 所以光有名字不够 —— 前缀必须能独立回答「这行是哪个部署写的」。
+  const mock = stubAws({ networkIn: 900 * GIB, recentIn: GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(lines.length > 0);
+  for (const line of lines) assert.match(line, /^example-instance@ap-northeast-1: /);
+
+  // 换个区域就是另一个标识，即便实例重名。
+  const other = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
+  const otherLines = await capturingLogs(() =>
+    run("2026-08-15T12:00:00Z", { ...baseEnv, AWS_REGION: "us-east-1" }, other),
+  );
+  assert.match(otherLines.at(-1), /^example-instance@us-east-1: /);
+});
+
 test("bytes are converted on a 2^30 basis", async () => {
   // 恰好 1 GiB 的字节数必须读作 1.000 GiB，而不是 1.074 —— 这是整套单位体系的锚点。
   // 同一行里也确认停机线是 1024 × 0.8 = 819.2 GiB。
@@ -155,7 +172,7 @@ test("bytes are converted on a 2^30 basis", async () => {
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.deepEqual(lines, [
-    "my-blog: 1.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
+    "example-instance@ap-northeast-1: 1.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
   ]);
 });
 
@@ -207,7 +224,7 @@ test("metric queries use the documented request shape", async () => {
   assert.deepEqual(Object.keys(metric.body).sort(), [
     "endTime", "instanceName", "metricName", "period", "startTime", "statistics", "unit",
   ]);
-  assert.equal(metric.body.instanceName, "my-blog");
+  assert.equal(metric.body.instanceName, "example-instance");
   assert.equal(metric.body.period, MONTH_PERIOD);
   assert.equal(metric.body.unit, "Bytes");
   assert.deepEqual(metric.body.statistics, ["Sum"]);
@@ -249,7 +266,7 @@ test("over the threshold it stops a running instance exactly once", async () => 
     "StopInstance",
   ]);
   const stop = mock.calls.at(-1);
-  assert.deepEqual(stop.body, { instanceName: "my-blog" });
+  assert.deepEqual(stop.body, { instanceName: "example-instance" });
 });
 
 test("the stop path is idempotent when the instance is already stopped", async () => {
@@ -299,7 +316,7 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
 
   assert.ok(!opsOf(mock.calls).includes("StopInstance"));
   assert.deepEqual(lines, [
-    "my-blog: 700.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
+    "example-instance@ap-northeast-1: 700.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
   ]);
 });
 
@@ -366,7 +383,7 @@ test("a reset allowance starts a stopped instance", async () => {
     "GetInstanceState",
     "StartInstance",
   ]);
-  assert.deepEqual(mock.calls[3].body, { instanceName: "my-blog" });
+  assert.deepEqual(mock.calls[3].body, { instanceName: "example-instance" });
   // 窗口取的是新月份，而不是那个用量导致停机的月份。
   assert.equal(mock.calls[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });

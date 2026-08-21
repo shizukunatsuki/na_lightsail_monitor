@@ -55,6 +55,7 @@ const BYTES_PER_GIB = 1024 ** 3;
  * @typedef {object} Config
  * @property {string} region
  * @property {string} instanceName
+ * @property {string} label
  * @property {number} quotaGib
  * @property {number} threshold
  * @property {boolean} manualHold
@@ -100,6 +101,9 @@ export function readConfig(env) {
   return {
     region: env.AWS_REGION,
     instanceName: env.INSTANCE_NAME,
+    // 每一行日志的前缀。带上 region 是因为实例名只在单个区域内唯一，而这个仓库是公开的
+    // —— 谁复制过去都会得到一份自我说明的日志，不必回头去猜是哪个部署写的。
+    label: `${env.INSTANCE_NAME}@${env.AWS_REGION}`,
     quotaGib,
     threshold,
     // 计划内停机的逃生阀。与字符串精确比较，这样打错字（"yes"、"1"、"True"）时
@@ -190,7 +194,7 @@ async function getInstanceState(client, config) {
   const body = await res.json();
   const name = body?.state?.name;
   if (typeof name !== "string") {
-    throw new Error(`GetInstanceState returned no state name for ${config.instanceName}`);
+    throw new Error(`GetInstanceState returned no state name for ${config.label}`);
   }
   return name;
 }
@@ -264,19 +268,19 @@ async function sumMetric(client, config, metricName, range, period) {
  */
 async function stopOverLimit(client, config, usedGib, reason) {
   const state = await getInstanceState(client, config).catch((err) => {
-    console.error(`${config.instanceName}: instance state unreadable (${err.message}); erring toward the stop`);
+    console.error(`${config.label}: instance state unreadable (${err.message}); erring toward the stop`);
     return null;
   });
 
   if (state !== null && state !== "running") {
     console.log(
-      `${config.instanceName}: ${usedGib.toFixed(3)} GiB used, ${reason}, but instance is "${state}"; nothing to do`,
+      `${config.label}: ${usedGib.toFixed(3)} GiB used, ${reason}, but instance is "${state}"; nothing to do`,
     );
     return;
   }
 
   await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
-  console.error(`${config.instanceName}: STOPPED at ${usedGib.toFixed(3)} GiB month-to-date, ${reason}`);
+  console.error(`${config.label}: STOPPED at ${usedGib.toFixed(3)} GiB month-to-date, ${reason}`);
 }
 
 /**
@@ -330,7 +334,7 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   // 覆盖的事，所以一旦发生就必须响亮地说出来：此刻真正在守账单的只剩静态线。
   if (lagSeconds !== null && lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS) {
     console.error(
-      `${config.instanceName}: metric lag is ${(lagSeconds / 60).toFixed(1)} min, leaving under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window; the burst gate is losing resolution`,
+      `${config.label}: metric lag is ${(lagSeconds / 60).toFixed(1)} min, leaving under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window; the burst gate is losing resolution`,
     );
   }
 
@@ -419,7 +423,7 @@ export default {
     }
 
     console.log(
-      `${config.instanceName}: ${usedGib.toFixed(3)} GiB used month-to-date, under the ${limitGib.toFixed(3)} GiB stop threshold${meter}`,
+      `${config.label}: ${usedGib.toFixed(3)} GiB used month-to-date, under the ${limitGib.toFixed(3)} GiB stop threshold${meter}`,
     );
 
     // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
@@ -435,7 +439,7 @@ export default {
 
     if (config.manualHold) {
       console.log(
-        `${config.instanceName}: no transfer recorded this month, but MANUAL_HOLD is set; leaving it alone`,
+        `${config.label}: no transfer recorded this month, but MANUAL_HOLD is set; leaving it alone`,
       );
       return;
     }
@@ -446,13 +450,13 @@ export default {
     const state = await getInstanceState(client, config);
     if (state !== "stopped") {
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
-      console.log(`${config.instanceName}: no transfer recorded this month, instance is "${state}"; nothing to do`);
+      console.log(`${config.label}: no transfer recorded this month, instance is "${state}"; nothing to do`);
       return;
     }
 
     await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
     // 只陈述观察到的事实：handler 知道的是「月初至今为零且实例是 stopped」，它并没有
     // 独立核实过额度重置这件事。
-    console.log(`${config.instanceName}: no transfer recorded this month and instance was stopped; started`);
+    console.log(`${config.label}: no transfer recorded this month and instance was stopped; started`);
   },
 };
