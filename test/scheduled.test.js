@@ -45,6 +45,7 @@ function stubAws({
   recentIn = 0,
   recentOut = 0,
   recentPoints = 6,
+  recentLagSeconds = 300,
   malformedMetrics = false,
   unreadableState = false,
   fail,
@@ -80,11 +81,14 @@ function stubAws({
 
         if (body.period === BURST_PERIOD) {
           const total = body.metricName === "NetworkIn" ? recentIn : recentOut;
+          // 时间戳锚定到请求的 endTime：最新那个桶覆盖 [newest, newest + 300)，而它比
+          // 「此刻」早了 recentLagSeconds —— 这就是被模拟的落库延迟。
+          const newest = body.endTime - recentLagSeconds - BURST_PERIOD;
           return Response.json({
             metricName: body.metricName,
             metricData: Array.from({ length: recentPoints }, (_, i) => ({
               sum: total / recentPoints,
-              timestamp: 1.7540064e9 + i * BURST_PERIOD,
+              timestamp: newest - (recentPoints - 1 - i) * BURST_PERIOD,
               unit: "Bytes",
             })),
           });
@@ -151,7 +155,7 @@ test("bytes are converted on a 2^30 basis", async () => {
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.deepEqual(lines, [
-    "my-blog: 1.000 GiB used month-to-date, under the 819.200 GiB stop threshold",
+    "my-blog: 1.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
   ]);
 });
 
@@ -295,7 +299,7 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
 
   assert.ok(!opsOf(mock.calls).includes("StopInstance"));
   assert.deepEqual(lines, [
-    "my-blog: 700.000 GiB used month-to-date, under the 819.200 GiB stop threshold",
+    "my-blog: 700.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
   ]);
 });
 
@@ -307,6 +311,31 @@ test("the burst rate divides by the data that landed, not by the window length",
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"), "half-covered window must still be read at full rate");
+});
+
+test("the metric lag is measured from the newest bucket and reported every run", async () => {
+  // AWS 不公开落库延迟，而整套余量标定都建立在它之上 —— 所以只能自己量，并且让它每次
+  // 都出现在正常那一行里，而不是留作一个假设。
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 12 * 60 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.at(-1), /meter 12\.0 min behind$/);
+});
+
+test("a lag that leaves under two usable buckets is called out loudly", async () => {
+  // 延迟吃掉窗口后，速率估计失去意义，此刻真正在守账单的只剩静态线。这件事必须说出来。
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 22 * 60, recentPoints: 1 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /metric lag is 22\.0 min, leaving under two usable buckets in the 30 min burst window/);
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"), "报警归报警，不能因此停机");
+});
+
+test("a still-open newest bucket reads as zero lag rather than a negative one", async () => {
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: -120 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.at(-1), /meter 0\.0 min behind$/);
 });
 
 test("an idle instance with no recent data points is not treated as a burst", async () => {

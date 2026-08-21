@@ -201,12 +201,15 @@ async function getInstanceState(client, config) {
  * `points` 不是调试信息，突发闸门要用它当速率的分母：指标有几分钟落库延迟，窗口尾部
  * 通常还是空的，拿窗口长度去除会把速率算低 —— 而算低正是不安全的那个方向。
  *
+ * `newest` 是最新一个数据点的桶起点（Unix 秒），用来实测那个落库延迟。AWS 从不公开这个
+ * 数，只说「随服务而变」，而整套余量标定都依赖它 —— 所以只能自己量。
+ *
  * @param {AwsClient} client
  * @param {Config} config
  * @param {"NetworkIn" | "NetworkOut"} metricName
  * @param {{ startTime: number, endTime: number }} range
  * @param {number} period
- * @returns {Promise<{ bytes: number, points: number }>}
+ * @returns {Promise<{ bytes: number, points: number, newest: number | null }>}
  */
 async function sumMetric(client, config, metricName, range, period) {
   const res = await lightsail(client, config, "GetInstanceMetricData", {
@@ -232,8 +235,15 @@ async function sumMetric(client, config, metricName, range, period) {
   // 数据点既不保证有序也不保证连续，所以要累加而不是按下标取值。求总量与顺序无关；
   // 缺口本身就代表那段时间没有流量。
   let bytes = 0;
-  for (const point of metricData) bytes += point.sum ?? 0;
-  return { bytes, points: metricData.length };
+  let newest = null;
+  for (const point of metricData) {
+    bytes += point.sum ?? 0;
+    // 时间戳走 Unix 秒。非数字就当没有，绝不让一个读不懂的时间戳污染延迟读数。
+    if (typeof point.timestamp === "number" && (newest === null || point.timestamp > newest)) {
+      newest = point.timestamp;
+    }
+  }
+  return { bytes, points: metricData.length, newest };
 }
 
 /**
@@ -281,16 +291,19 @@ async function stopOverLimit(client, config, usedGib, reason) {
  *
  * @param {AwsClient} client
  * @param {Config} config
+ * 同时顺带实测指标的落库延迟 —— 这个数 AWS 不公开，而整套余量标定都建立在它之上。
+ *
  * @param {{ startTime: number, endTime: number }} monthRange
  * @param {number} usedBytes 月初至今总量，字节
- * @returns {Promise<string | null>} 需要停机时返回原因，否则 null
+ * @returns {Promise<{ reason: string | null, lagSeconds: number | null }>}
+ *   `reason` 非空表示需要停机；`lagSeconds` 是实测的落库延迟，测不出时为 null
  */
 async function burstCheck(client, config, monthRange, usedBytes) {
   const { endTime } = monthRange;
   const startTime = Math.max(monthRange.startTime, endTime - BURST_WINDOW_SECONDS);
 
   // 跨月后的头几分钟，窗口会短于一个数据点，测不出速率。那时月度用量也必然离额度极远。
-  if (endTime - startTime < BURST_PERIOD_SECONDS) return null;
+  if (endTime - startTime < BURST_PERIOD_SECONDS) return { reason: null, lagSeconds: null };
 
   const range = { startTime, endTime };
   const [recentIn, recentOut] = await Promise.all([
@@ -305,18 +318,36 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   // 所以「最近半小时没有数据点」只可能意味着实例本来就没在跑 —— 那是操作者月中自己停的，
   // 每两分钟报一次警只会制造噪音。
   const covered = Math.max(recentIn.points, recentOut.points) * BURST_PERIOD_SECONDS;
+
+  // 实测落库延迟：最新那个桶覆盖 [newest, newest + 300)，它已经能查到，所以延迟就是
+  // 「此刻」减去那个桶的结束时刻。桶还开着时会算出负数，钳到 0 —— 那表示数据是新鲜的。
+  const newest = Math.max(recentIn.newest ?? -Infinity, recentOut.newest ?? -Infinity);
+  const lagSeconds = Number.isFinite(newest)
+    ? Math.max(0, endTime - (newest + BURST_PERIOD_SECONDS))
+    : null;
+
+  // 延迟吃掉窗口后，闸门可用的数据点就不足两个，速率估计随之失去意义。这不是猜测能
+  // 覆盖的事，所以一旦发生就必须响亮地说出来：此刻真正在守账单的只剩静态线。
+  if (lagSeconds !== null && lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS) {
+    console.error(
+      `${config.instanceName}: metric lag is ${(lagSeconds / 60).toFixed(1)} min, leaving under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window; the burst gate is losing resolution`,
+    );
+  }
+
   const bytesPerSecond = covered > 0 ? (recentIn.bytes + recentOut.bytes) / covered : 0;
-  if (bytesPerSecond <= 0) return null;
+  if (bytesPerSecond <= 0) return { reason: null, lagSeconds };
 
   const remainingBytes = config.quotaGib * BYTES_PER_GIB - usedBytes;
   const secondsToQuota = remainingBytes / bytesPerSecond;
-  if (secondsToQuota >= REACTION_HORIZON_SECONDS) return null;
+  if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, lagSeconds };
 
   const mbps = (bytesPerSecond * 8) / 1e6;
-  return (
-    `burning ${mbps.toFixed(1)} Mbps with ${(remainingBytes / BYTES_PER_GIB).toFixed(3)} GiB of quota left` +
-    ` = ${Math.round(secondsToQuota / 60)} min to overage, inside the ${REACTION_HORIZON_SECONDS / 60} min reaction horizon`
-  );
+  return {
+    reason:
+      `burning ${mbps.toFixed(1)} Mbps with ${(remainingBytes / BYTES_PER_GIB).toFixed(3)} GiB of quota left` +
+      ` = ${Math.round(secondsToQuota / 60)} min to overage, inside the ${REACTION_HORIZON_SECONDS / 60} min reaction horizon`,
+    lagSeconds,
+  };
 }
 
 export default {
@@ -375,16 +406,20 @@ export default {
     }
 
     // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
+    let meter = "";
     if (usedBytes > 0) {
       const burst = await burstCheck(client, config, range, usedBytes);
-      if (burst) {
-        await stopOverLimit(client, config, usedGib, burst);
+      if (burst.reason) {
+        await stopOverLimit(client, config, usedGib, burst.reason);
         return;
       }
+      // 把实测的落库延迟写进正常那一行。它是整套余量标定唯一一个来自上游、又没有文档
+      // 的输入，所以它必须每次都出现在眼前，而不是留作一个假设。
+      if (burst.lagSeconds !== null) meter = `, meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`;
     }
 
     console.log(
-      `${config.instanceName}: ${usedGib.toFixed(3)} GiB used month-to-date, under the ${limitGib.toFixed(3)} GiB stop threshold`,
+      `${config.instanceName}: ${usedGib.toFixed(3)} GiB used month-to-date, under the ${limitGib.toFixed(3)} GiB stop threshold${meter}`,
     );
 
     // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
