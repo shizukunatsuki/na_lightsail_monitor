@@ -131,7 +131,7 @@ async function runScenario(sc, at) {
   let threw = null;
   try {
     await worker.scheduled(
-      { scheduledTime: Date.parse(at), cron: "*/2 * * * *", noRetry() {} },
+      { scheduledTime: Date.parse(at), cron: "*/10 * * * *", noRetry() {} },
       {
         AWS_ACCESS_KEY_ID: ACCESS_KEY_ID,
         AWS_SECRET_ACCESS_KEY: SECRET,
@@ -285,7 +285,7 @@ test("invariants hold across randomised scenarios", async () => {
     const rateOf = (gib, pts) => (pts > 0 ? (gib * GIB) / (pts * 300) : 0);
     const bps = rateOf(sc.recentInGib, sc.inPoints) + rateOf(sc.recentOutGib, sc.outPoints);
     const remaining = (sc.quotaGib - sc.usedGib) * GIB;
-    if (metricsUsable && sc.state === "running" && sc.usedGib > 0 && bps > 0 && remaining > 0 && remaining / bps < 1800) {
+    if (metricsUsable && sc.state === "running" && sc.usedGib > 0 && bps > 0 && remaining > 0 && remaining / bps < 3600) {
       assert.ok(stopped, `${where}: MISSED BURST STOP — ${(remaining / bps / 60).toFixed(1)} min to quota`);
     }
   }

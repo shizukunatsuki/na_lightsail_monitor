@@ -6,7 +6,7 @@ process.env.TZ = "America/Los_Angeles";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { monthStartMs, usageWindow, readConfig, monthElapsedFraction } from "../src/index.js";
+import { monthStartMs, usageWindow, readConfig, monthElapsedFraction, formatDuration } from "../src/index.js";
 
 const utc = (iso) => new Date(iso);
 const epoch = (iso) => Date.parse(iso);
@@ -94,6 +94,26 @@ test("monthElapsedFraction spans exactly the UTC month, leap years included", ()
   // 跨年由 Date.UTC(y, 12, 1) 自己处理。
   assert.equal(monthElapsedFraction(utc("2026-12-16T12:00:00Z")), 0.5, "十二月 31 天，中点是 16 日 12:00");
   assert.ok(monthElapsedFraction(utc("2026-12-31T23:59:59Z")) < 1);
+});
+
+test("formatDuration covers each range it is meant to distinguish", () => {
+  // 速率为零时「还能撑多久」是无穷 —— 那正是实情，不能显示成一个很大的数字。
+  assert.equal(formatDuration(Infinity), "never");
+  assert.equal(formatDuration(NaN), "never");
+
+  // 不到一小时按分钟。视野是 60 分钟时这一档从 handler 那头走不到（正常那一行只在
+  // 「撑得过视野」时才写），但把视野调低它就会活过来 —— 所以在这里直接测。
+  assert.equal(formatDuration(0), "0 min");
+  assert.equal(formatDuration(1740), "29 min");
+  assert.equal(formatDuration(3599), "60 min");
+
+  assert.equal(formatDuration(3600), "1.0 h");
+  assert.equal(formatDuration(47 * 3600), "47.0 h");
+
+  // 48 小时以上按天，超过 90 天封顶 —— 额度每月都会重置，再精确也没有意义。
+  assert.equal(formatDuration(48 * 3600), "2.0 d");
+  assert.equal(formatDuration(90 * 86400), "90.0 d");
+  assert.equal(formatDuration(91 * 86400), "> 90 d");
 });
 
 const validEnv = {

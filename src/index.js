@@ -31,16 +31,21 @@ const BURST_PERIOD_SECONDS = 300;
 /**
  * 反应视野：按当前速率剩余额度撑不过这么久，就立刻停机，不等月度总量越过 THRESHOLD。
  *
- * 这个数必须覆盖一整个检测回路 —— cron 间隔（`wrangler.jsonc` 里是 2 分钟）＋ 指标落库
- * 延迟（几分钟）＋ StopInstance 真正断流的时间（约一分钟）。取 30 分钟，是三者之和的
- * 两倍有余。**改动 cron 间隔时必须回来重新审视这个数。**
+ * 这个数必须覆盖一整个检测回路 —— 桶必须先关闭（≤ 300 秒）＋ 指标落库延迟 ＋ cron 间隔
+ * （`wrangler.jsonc` 里是 10 分钟）＋ StopInstance 真正断流的时间（约一分钟）。按落库延迟
+ * 10 分钟算，回路是 26 分钟，取 60 分钟得到 2.3 倍余量。
+ *
+ * **改动 cron 间隔时必须回来重新审视这个数。** cron 是回路里最大的一项：两分钟一次时
+ * 回路只有 18 分钟，30 分钟的视野就够了；改成十分钟一次之后回路变成 26 分钟，同样的
+ * 30 分钟只剩 1.15 倍余量，而落库延迟一旦到 15 分钟就直接跌破 1.0 —— 额度会在闸门能
+ * 动手之前烧完。（cron 表达式不写在这里：`*` 加 `/` 会把这段块注释提前闭合。）
  *
  * 它同时是闸门唯一的灵敏度旋钮：跳闸判据等价于 `速率 > 剩余额度 / 视野`，所以调大它
- * 会线性地降低触发所需的速率。空表时需要约 4.9 Gbps 才跳闸，用到 800 GiB 时约 1.1 Gbps
- * —— 对一台个人站实例来说，这两个数都远在正常业务之上，误停的风险很小。想更保守就调大
- * 这个数（代价是可能掐掉一次合法的大流量传输），不要去动 BURST_WINDOW_SECONDS。
+ * 会线性地降低触发所需的速率。60 分钟意味着空表时要约 2.4 Gbps、用到 800 GiB 时约
+ * 534 Mbps 才跳闸 —— 对一台个人站实例，这两个数仍然远在正常业务之上。想更保守就继续
+ * 调大这个数（代价是可能掐掉一次合法的大流量传输），不要去动 BURST_WINDOW_SECONDS。
  */
-const REACTION_HORIZON_SECONDS = 1800;
+const REACTION_HORIZON_SECONDS = 3600;
 
 /** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
 const PLACEHOLDER = "CHANGE_ME";
@@ -156,8 +161,18 @@ export function monthElapsedFraction(now) {
  */
 const PROJECTION_MIN_ELAPSED = 0.02;
 
-/** 人可读的时长。日志是给人扫的，不是给机器解析的。 */
-function formatDuration(seconds) {
+/**
+ * 人可读的时长。日志是给人扫的，不是给机器解析的。
+ *
+ * 导出只为了能直接做单元测试：它唯一的调用点是正常那一行，而那一行只在
+ * `secondsToQuota >= REACTION_HORIZON_SECONDS` 时才写——视野一旦是 60 分钟，「分钟」
+ * 那个分支就再也走不到，从 handler 那头测不出来。把视野调低时它又会活过来，所以不能
+ * 因为「当前配置下走不到」就把它删掉。
+ *
+ * @param {number} seconds
+ * @returns {string}
+ */
+export function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return "never";
   if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
   if (seconds < 48 * 3600) return `${(seconds / 3600).toFixed(1)} h`;
@@ -477,7 +492,7 @@ export default {
       secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
       service: "lightsail",
       region: config.region,
-      // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在两分钟后，这个次数足够了，
+      // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在十分钟后，这个次数足够了，
       // 同时也能让故障及时暴露出来。
       retries: 2,
     });
@@ -565,7 +580,7 @@ export default {
     // 「恰好零字节」是查询状态的闸门。运行中的实例几分钟内必然产生*某些*流量 —— DNS、
     // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
     // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
-    // 约两万次调用。
+    // 约 4300 次调用。
     if (config.manualHold) {
       console.log([`${config.label} HOLD`, ...common, "MANUAL_HOLD is set, leaving the instance alone"].join(" | "));
       return;

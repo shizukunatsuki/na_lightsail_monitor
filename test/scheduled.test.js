@@ -139,7 +139,7 @@ function stubAws({
 
 /** 在一个固定时刻运行 handler。 */
 async function run(iso, env, mock) {
-  const controller = { scheduledTime: Date.parse(iso), cron: "*/2 * * * *", noRetry() {} };
+  const controller = { scheduledTime: Date.parse(iso), cron: "*/10 * * * *", noRetry() {} };
   try {
     await worker.scheduled(controller, env);
   } finally {
@@ -328,7 +328,7 @@ test("a burst that would blow the quota before the next reaction stops the insta
     "StopInstance",
   ]);
   assert.match(lines.at(-1), /STOPPED \| used 700\.000 GiB \(68\.4% of 1024\) \| burning 1622\.5 Mbps/);
-  assert.match(lines.at(-1), /324\.000 GiB of quota left = 29 min to overage, inside the 30 min reaction horizon/);
+  assert.match(lines.at(-1), /324\.000 GiB of quota left = 29 min to overage, inside the 60 min reaction horizon/);
 });
 
 test("ordinary traffic at the same month-to-date total does not trip the gate", async () => {
@@ -347,10 +347,12 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
 });
 
 test("the burst rate divides by the data that landed, not by the window length", async () => {
-  // 指标有几分钟落库延迟，半小时的窗口里常常只有一部分数据点。150 GiB 落在 3 个点
-  // （15 分钟）里，真实速率是拿 900 秒去除；用整个 1800 秒窗口去除会把它算成一半，
-  // 于是这次突发就被放过了 —— 而算低速率正是不安全的那个方向。
-  const mock = stubAws({ networkIn: 800 * GIB, recentIn: 150 * GIB, recentPoints: 3 });
+  // 指标有几分钟落库延迟，半小时的窗口里常常只有一部分数据点。80 GiB 落在 3 个点
+  // （15 分钟）里 = 763.5 Mbps，剩余 224 GiB 撑 42 分钟，落在 60 分钟视野之内；用整个
+  // 1800 秒窗口去除会把它算成 381.8 Mbps、84 分钟，于是这次突发就被放过了 —— 而算低
+  // 速率正是不安全的那个方向。（视野从 30 改成 60 分钟时这组数必须重算：原来的 150 GiB
+  // 在两种分母下都会跳闸，那条测试会变成一条看着绿、其实什么都没证明的测试。）
+  const mock = stubAws({ networkIn: 800 * GIB, recentIn: 80 * GIB, recentPoints: 3 });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"), "half-covered window must still be read at full rate");
@@ -390,27 +392,28 @@ test("a still-open newest bucket reads as zero lag rather than a negative one", 
 
 test("each direction's rate is divided by its own coverage, not a shared denominator", async () => {
   // 两个指标的落库进度不保证同步。这里 NetworkIn 落了 6 个桶（1800 秒）而 NetworkOut
-  // 只落了 2 个（600 秒），出向那 150 GiB 其实是 2147 Mbps —— 剩余 224 GiB 撑 15 分钟。
-  // 把两个方向的字节合起来除以「较长的那个」覆盖时长，会把它报成 716 Mbps 从而放行；
-  // 除以「较短的那个」又会在某个方向零数据点时让分母归零、闸门整个失效。各算各的。
+  // 只落了 2 个（600 秒），出向那 75 GiB 其实是 1073.7 Mbps —— 剩余 224 GiB 撑 30 分钟，
+  // 落在 60 分钟视野之内。把两个方向的字节合起来除以「较长的那个」覆盖时长，会把它报成
+  // 357.9 Mbps、90 分钟从而放行；除以「较短的那个」又会在某个方向零数据点时让分母归零、
+  // 闸门整个失效。各算各的。
   const mock = stubAws({
     networkIn: 800 * GIB,
     recentIn: 0,
-    recentOut: 150 * GIB,
+    recentOut: 75 * GIB,
     recentInPoints: 6,
     recentOutPoints: 2,
   });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
-  assert.ok(opsOf(mock.calls).includes("StopInstance"), "2147 Mbps 必须停机");
-  assert.match(lines.at(-1), /burning 2147\.5 Mbps/);
+  assert.ok(opsOf(mock.calls).includes("StopInstance"), "1073.7 Mbps 必须停机");
+  assert.match(lines.at(-1), /burning 1073\.7 Mbps/);
 });
 
 test("a direction with no landed points contributes zero instead of blinding the gate", async () => {
   // NetworkIn 一个点都没落，NetworkOut 正常。闸门必须照常按出向的速率判断。
   const mock = stubAws({
     networkIn: 800 * GIB,
-    recentOut: 150 * GIB,
+    recentOut: 75 * GIB,
     recentInPoints: 0,
     recentOutPoints: 2,
   });
@@ -420,13 +423,13 @@ test("a direction with no landed points contributes zero instead of blinding the
 });
 
 test("just outside the reaction horizon it reports the countdown instead of stopping", async () => {
-  // 剩余 324 GiB、速率 128.8 MB/s = 45 分钟到额度。45 > 30，闸门刻意不跳 —— 但那一行
-  // 必须把倒计时写出来。这是视野上沿的另一侧：29 分钟会停（见上面那条），45 分钟不停。
-  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 216 * GIB });
+  // 剩余 324 GiB、速率 620.4 Mbps = 75 分钟到额度。75 > 60，闸门刻意不跳 —— 但那一行
+  // 必须把倒计时写出来。这是视野上沿的另一侧：29 分钟会停（见上面那条），75 分钟不停。
+  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 130 * GIB });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
-  assert.ok(!opsOf(mock.calls).includes("StopInstance"), "45 分钟在视野之外，不该停机");
-  assert.match(lines.at(-1), /^\S+ OK \|.*\| now 1030\.8 Mbps, 45 min to quota \|/);
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"), "75 分钟在视野之外，不该停机");
+  assert.match(lines.at(-1), /^\S+ OK \|.*\| now 620\.4 Mbps, 1\.2 h to quota \|/);
 });
 
 test("a very long runway is capped rather than printed to the day", async () => {
@@ -682,7 +685,7 @@ test("a controller without scheduledTime falls back to the wall clock", async ()
   // Workers 一定会给 scheduledTime，但兜底那条分支不该是没跑过的代码。
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
   try {
-    await worker.scheduled({ cron: "*/2 * * * *", noRetry() {} }, baseEnv);
+    await worker.scheduled({ cron: "*/10 * * * *", noRetry() {} }, baseEnv);
   } finally {
     mock.restore();
   }
