@@ -20,7 +20,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-cp -R "$ROOT/src" "$ROOT/test" "$ROOT/package.json" "$WORK/"
+# wrangler.jsonc 也要带上：tuning.test.js 会读它来核对 cron 与视野的耦合。少复制一个
+# 文件的后果是整个套件在副本里报错，于是每个变异都被误判成「抓到」—— 对照组就是为了
+# 拦住这种假绿。
+cp -R "$ROOT/src" "$ROOT/test" "$ROOT/package.json" "$ROOT/wrangler.jsonc" "$WORK/"
 ln -s "$ROOT/node_modules" "$WORK/node_modules"
 cd "$WORK"
 
@@ -34,7 +37,9 @@ SURVIVORS=0
 # 永远匹配不上，于是每次都被当成「测试没跑起来」。
 detect() {
   local out ran failed
-  out="$(node --test test/invariants.test.js 2>&1)" || true
+  # 跑**整个**套件，不只是性质测试 —— 例子测试和性质测试各自能抓到的缺陷并不重合，
+  # 只跑一层等于给另一层的覆盖打了白条。
+  out="$(node --test 2>&1)" || true
   ran="$(grep -oE 'tests [0-9]+' <<<"$out" | head -1 | grep -oE '[0-9]+')"
   if [ -z "$ran" ] || [ "$ran" -eq 0 ]; then
     echo "检测器异常：测试没有跑起来" >&2
@@ -86,6 +91,26 @@ mutate "if (metricData != null && !Array.isArray(metricData)) {" "if (false) {" 
 mutate 'if (typeof sum !== "number" || !Number.isFinite(sum) || sum < 0) {' "if (false) {" "去掉 sum 的类型检查"
 mutate "|| quotaGib > MAX_QUOTA_GIB" "" "去掉 QUOTA_GIB 上界"
 mutate "bytes += sum;" "bytes += 0;" "月度用量恒为零"
+# 比较符号写反 —— 单点看着正常，只有把两个点排起来（单调性）才露馅
+mutate "if (usedGib >= limitGib) {" "if (usedGib <= limitGib) {" "静态线比较符号写反"
+mutate "if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };" \
+       "if (secondsToQuota <= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };" \
+       "突发闸门比较符号写反"
+# 告警门槛退回到「从窗口推」的旧写法：cron 十分钟下它会迟到四分钟
+mutate "lagSeconds >= MAX_TOLERABLE_LAG_SECONDS" \
+       "lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS" \
+       "延迟告警门槛退回按窗口推导（迟到）"
+# 调参常量之间的耦合断裂 —— 代码照样跑、行为照样对，只是防线悄悄变薄
+mutate "export const REACTION_HORIZON_SECONDS = 3600;" "export const REACTION_HORIZON_SECONDS = 1800;" \
+       "视野调回 30 分钟（与十分钟的 cron 不再匹配）"
+mutate "export const MAX_TOLERABLE_LAG_SECONDS = 720;" "export const MAX_TOLERABLE_LAG_SECONDS = 1200;" \
+       "延迟容忍退回按窗口推导的旧值"
+mutate "export const BURST_WINDOW_SECONDS = 1800;" "export const BURST_WINDOW_SECONDS = 900;" \
+       "窗口缩到 15 分钟（容忍延迟下凑不出两个数据点）"
+# 模块级缓存 —— 无状态承诺一旦破掉，「失败的触发不需要对账」就不再成立
+mutate "export function monthStartMs(now) {" \
+       "let _cache = null;\nexport function monthStartMs(now) {\n  if (_cache !== null) return _cache;\n  _cache = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);\n  return _cache;" \
+       "给 monthStartMs 加模块级缓存（破坏无状态）"
 
 echo
 if [ "$SURVIVORS" -gt 0 ]; then

@@ -367,14 +367,14 @@ test("the metric lag is measured from the newest bucket and reported every run",
   assert.match(lines.at(-1), /meter 12\.0 min behind$/);
 });
 
-test("a lag that leaves under two usable buckets is called out loudly", async () => {
-  // 延迟吃掉窗口后，速率估计失去意义，此刻真正在守账单的只剩静态线。这件事必须说出来。
+test("a lag past the tolerance is called out loudly", async () => {
+  // 延迟超过容忍上限后，突发闸门已经追不上一场满速突发，此刻真正在守账单的只剩静态线。
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 22 * 60, recentPoints: 1 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.match(
     lines.join("\n"),
-    /^\S+ BLIND \| newest metric bucket is 22\.0 min old, under two usable buckets in the 30 min burst window \|/m,
+    /^\S+ BLIND \| newest metric bucket is 22\.0 min old, past the 12 min tolerance \|/m,
   );
   // 措辞只陈述观察到的事实：光看指标分不出「指标侧延迟」和「实例没在跑」。
   assert.match(lines.join("\n"), /meter lagging, or the instance is not running/);
@@ -438,6 +438,27 @@ test("a very long runway is capped rather than printed to the day", async () => 
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.match(lines.at(-1), /now \d+ kbps, > 90 d to quota/);
+});
+
+test("the lag alarm fires before the design stops holding, not after", async () => {
+  // 这条守的是一个只在改了 cron 之后才出现的缺陷。告警门槛原先是从**观察窗口**推出来的
+  // （凑不出两个数据点 = 20 分钟）；而真正会断的是**检测回路**：cron 每 2 分钟时闸门在
+  // 延迟 25 分钟才守不住，20 分钟的告警是提前的；cron 放宽到 10 分钟后临界点降到 16 分钟，
+  // 同一个 20 分钟就变成了迟到四分钟 —— 延迟落在 [16, 20) 分钟时设计已经失效而没有任何
+  // 提示。门槛必须挂在回路上，且留出提前量。
+  for (const minutes of [12, 14, 16, 19]) {
+    const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: minutes * 60, recentPoints: 3 });
+    const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+    assert.match(lines.join("\n"), /BLIND \|/, `延迟 ${minutes} 分钟必须告警`);
+  }
+
+  // 容忍上限之内不该有任何噪音。
+  for (const minutes of [5, 8, 11]) {
+    const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: minutes * 60 });
+    const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+    assert.ok(!lines.join("\n").includes("BLIND"), `延迟 ${minutes} 分钟不该告警`);
+    assert.ok(!lines.at(-1).includes("(stale)"), `延迟 ${minutes} 分钟不该标 stale`);
+  }
 });
 
 test("an idle instance with no recent data points is not treated as a burst", async () => {

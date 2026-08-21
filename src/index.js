@@ -7,7 +7,7 @@ const API_TARGET = "Lightsail_20161128";
  * 「月初至今」查询的数据点秒数。取一天，可以把这个查询控制在每个指标约 31 个数据点；
  * 若改成按小时，会返回约 744 个，光是解析 JSON 就会撑爆 10ms 的 CPU 预算。
  */
-const METRIC_PERIOD_SECONDS = 86400;
+export const METRIC_PERIOD_SECONDS = 86400;
 
 /**
  * 突发闸门的观察窗口与粒度：最近半小时，300 秒一个点。300 秒是 Lightsail 的原生上报
@@ -25,8 +25,8 @@ const METRIC_PERIOD_SECONDS = 86400;
  * 30 分钟是这两条曲线的交点。**它只影响反应快慢，不影响灵敏度**——跳闸判据
  * `速率 > 剩余额度 / 视野` 里没有 W，所以缩短窗口不会让闸门更容易误报。
  */
-const BURST_WINDOW_SECONDS = 1800;
-const BURST_PERIOD_SECONDS = 300;
+export const BURST_WINDOW_SECONDS = 1800;
+export const BURST_PERIOD_SECONDS = 300;
 
 /**
  * 反应视野：按当前速率剩余额度撑不过这么久，就立刻停机，不等月度总量越过 THRESHOLD。
@@ -45,7 +45,26 @@ const BURST_PERIOD_SECONDS = 300;
  * 534 Mbps 才跳闸 —— 对一台个人站实例，这两个数仍然远在正常业务之上。想更保守就继续
  * 调大这个数（代价是可能掐掉一次合法的大流量传输），不要去动 BURST_WINDOW_SECONDS。
  */
-const REACTION_HORIZON_SECONDS = 3600;
+export const REACTION_HORIZON_SECONDS = 3600;
+
+/**
+ * 指标落库延迟的容忍上限。超过它就报警 —— 此时突发闸门已经追不上一场满速突发了。
+ *
+ * **这个数是从检测回路推出来的，不是从观察窗口推出来的。** 两者管的是不同的事：窗口管
+ * 分辨率（够不够几个数据点算速率），回路管及时性（跳闸时还剩多少额度）。
+ *
+ * 推导用的是和视野同一条规则 —— 回路必须留在视野的一半以内（即 2 倍余量）：回路里除
+ * 延迟之外的固定部分是 桶关闭 300 + cron 600 + 停机生效 60 = 960 秒，于是延迟上限是
+ * 3600/2 − 960 = 840 秒。取 12 分钟，比这个上限再早一点，也比「5 Gbps 下真的守不住」
+ * 的经验临界点（16 分钟）早四分钟。`test/tuning.test.js` 会把这条关系钉住。
+ *
+ * 早先这个门槛写成 `BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS`（20 分钟）。cron 是
+ * 两分钟一次时临界点在 25 分钟，20 分钟的告警是**提前**的，没问题；cron 放宽到十分钟
+ * 之后临界点降到 16 分钟，同一个 20 分钟就变成了**迟到四分钟**的告警 —— 延迟落在
+ * [16, 20) 分钟这一段时，设计已经失效而没有任何提示。所以它必须跟着 cron 和视野一起
+ * 复核，而不能挂在窗口上。
+ */
+export const MAX_TOLERABLE_LAG_SECONDS = 720;
 
 /** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
 const PLACEHOLDER = "CHANGE_ME";
@@ -443,17 +462,17 @@ async function burstCheck(client, config, monthRange, usedBytes) {
     ? Math.max(0, endTime - (newest + BURST_PERIOD_SECONDS))
     : null;
 
-  // 最新的桶老到窗口里凑不出两个可用数据点时，速率估计已经失去意义，这一轮真正在守
-  // 账单的只剩静态线 —— 必须说出来。
+  // 数据老到超过容忍上限时，突发闸门已经给不出它承诺的那个保证，这一轮真正在守账单的
+  // 只剩静态线 —— 必须说出来。
   //
   // 措辞只陈述观察到的事实，不替它选解释：「最新的桶很旧」在指标侧延迟和实例根本没在
   // 跑这两种情况下长得一模一样，光看指标分辨不了（真跑着就会有新桶落下来）。所以两种
   // 读法都写进去。操作者月中自己停机时这条会连报几次直到那个桶滑出窗口，这是可以接受
   // 的代价：漏掉一次真的指标失明要糟糕得多。
-  const stale = lagSeconds !== null && lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS;
+  const stale = lagSeconds !== null && lagSeconds >= MAX_TOLERABLE_LAG_SECONDS;
   if (stale) {
     console.error(
-      `${config.label} BLIND | newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window | the burst gate cannot see a burst this run (meter lagging, or the instance is not running)`,
+      `${config.label} BLIND | newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, past the ${MAX_TOLERABLE_LAG_SECONDS / 60} min tolerance | the burst gate can no longer outrun a full-rate burst this run (meter lagging, or the instance is not running)`,
     );
   }
 

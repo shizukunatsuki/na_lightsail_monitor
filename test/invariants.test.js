@@ -163,6 +163,88 @@ async function runScenario(sc, at) {
   return { calls, lines, threw, ops: calls.map((c) => c.op) };
 }
 
+/** 只跑一个「干净」场景（不注入故障、不畸形、额度正常），用来做成对比较。 */
+async function decide(overrides) {
+  const sc = {
+    quotaGib: 1024,
+    threshold: 0.8,
+    usedGib: 0,
+    recentInGib: 0,
+    recentOutGib: 0,
+    inPoints: 6,
+    outPoints: 6,
+    state: "running",
+    manualHold: false,
+    lagSeconds: 300,
+    failOp: null,
+    failStatus: 400,
+    badShape: null,
+    absurdQuota: false,
+    ...overrides,
+  };
+  const { ops, threw } = await runScenario(sc, "2026-08-15T12:00:00Z");
+  assert.equal(threw, null, `unexpected throw: ${threw?.message}`);
+  return ops.includes("StopInstance");
+}
+
+test("the decision is monotone in usage: more usage never turns a stop into a no-stop", async () => {
+  // 随机点测很难撞到「比较符号写反」这类缺陷 —— 它在单点上看着完全正常，只有把两个
+  // 点排起来才露馅。这条断言的是需求本身：用得越多，越不该更不容易被停。
+  const r = rng(7);
+  for (let i = 0; i < 120; i++) {
+    const recentInGib = r() * 400;
+    const lo = r() * 900;
+    const hi = lo + r() * 300;
+    const stoppedLo = await decide({ usedGib: lo, recentInGib });
+    const stoppedHi = await decide({ usedGib: hi, recentInGib });
+    assert.ok(
+      !stoppedLo || stoppedHi,
+      `用量 ${lo.toFixed(1)} GiB 会停，但更高的 ${hi.toFixed(1)} GiB 不停（recentIn=${recentInGib.toFixed(1)}）`,
+    );
+  }
+});
+
+test("the decision is monotone in recent rate", async () => {
+  const r = rng(11);
+  for (let i = 0; i < 120; i++) {
+    const usedGib = 1 + r() * 800;
+    const lo = r() * 200;
+    const hi = lo + r() * 400;
+    const stoppedLo = await decide({ usedGib, recentInGib: lo });
+    const stoppedHi = await decide({ usedGib, recentInGib: hi });
+    assert.ok(
+      !stoppedLo || stoppedHi,
+      `速率低时停、速率高时反而不停（used=${usedGib.toFixed(1)}, ${lo.toFixed(1)} -> ${hi.toFixed(1)} GiB）`,
+    );
+  }
+});
+
+test("the decision is monotone in THRESHOLD: a lower line never stops less often", async () => {
+  const r = rng(13);
+  for (let i = 0; i < 80; i++) {
+    const usedGib = 1 + r() * 1000;
+    const recentInGib = r() * 200;
+    const low = 0.3 + r() * 0.3;
+    const high = low + r() * (1 - low);
+    const stoppedLow = await decide({ usedGib, recentInGib, threshold: low });
+    const stoppedHigh = await decide({ usedGib, recentInGib, threshold: high });
+    assert.ok(
+      !stoppedHigh || stoppedLow,
+      `阈值 ${high.toFixed(2)} 会停，但更低的 ${low.toFixed(2)} 不停（used=${usedGib.toFixed(1)}）`,
+    );
+  }
+});
+
+test("the handler is stateless: the same tick decided twice gives the same answer", async () => {
+  // 没有 KV、没有全局状态 —— 但这件事必须被锁住，否则哪天有人加了个模块级缓存，
+  // 「一次失败的触发之后没有任何东西需要对账」这条承诺就悄悄没了。
+  const r = rng(17);
+  for (let i = 0; i < 60; i++) {
+    const o = { usedGib: r() * 1000, recentInGib: r() * 400, state: STATES[Math.floor(r() * STATES.length)] };
+    assert.equal(await decide(o), await decide(o), `同一场景两次给出不同结论: ${JSON.stringify(o)}`);
+  }
+});
+
 test("invariants hold across randomised scenarios", async () => {
   const r = rng(20260821);
   const moments = ["2026-08-15T12:00:00Z", "2026-09-01T00:00:00Z", "2026-09-01T04:00:00Z", "2026-02-28T23:00:00Z"];
