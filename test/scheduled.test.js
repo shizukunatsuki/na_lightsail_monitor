@@ -48,7 +48,8 @@ function stubAws({
   recentInPoints,
   recentOutPoints,
   recentLagSeconds = 300,
-  malformedMetrics = false,
+  metricShape,
+  serviceErrors = 0,
   unreadableState = false,
   fail,
 } = {}) {
@@ -65,10 +66,19 @@ function stubAws({
 
     if (fail === operation) {
       // 形状照着真实的 SigV4 拒绝响应来，它会回显 credential scope。
+      // 状态码用 400：Lightsail 把 AccessDenied / Unauthenticated / NotFound /
+      // InvalidInput / OperationFailure 全部归为 HTTP 400，只有 ServiceException 是 500。
+      // 这个区分很要紧 —— 签名客户端只对 5xx 和 429 重试，所以 400 是一次性的终局失败。
       return new Response(
         `{"__type":"InvalidSignatureException","message":"Credential should be scoped: ${ACCESS_KEY_ID}/20260815/ap-northeast-1/lightsail/aws4_request"}`,
-        { status: 403 },
+        { status: 400 },
       );
+    }
+
+    // ServiceException（500）会被重试；前 serviceErrors 次调用返回 500。
+    if (serviceErrors > 0) {
+      serviceErrors -= 1;
+      return new Response('{"__type":"ServiceException","message":"internal"}', { status: 500 });
     }
 
     switch (operation) {
@@ -78,8 +88,11 @@ function stubAws({
         return Response.json({ state: { code: name === "running" ? 16 : 80, name } });
       }
       case "GetInstanceMetricData": {
-        // 200 但读不懂：`metricData` 整个字段缺席。
-        if (malformedMetrics) return Response.json({ metricName: body.metricName });
+        // 指标响应的几种形状。`omitted` 是**合法**的：AWS 允许在没有数据时省掉空集合。
+        if (metricShape === "omitted") return Response.json({ metricName: body.metricName });
+        if (metricShape === "notArray") return Response.json({ metricName: body.metricName, metricData: "oops" });
+        if (metricShape === "unrelated") return Response.json({ ok: true });
+        if (metricShape === "wrongMetric") return Response.json({ metricName: "CPUUtilization", metricData: [] });
 
         if (body.period === BURST_PERIOD) {
           const isIn = body.metricName === "NetworkIn";
@@ -496,7 +509,7 @@ test("an AWS failure throws, with the access key id scrubbed", async () => {
   await assert.rejects(
     () => run("2026-08-15T12:00:00Z", baseEnv, mock),
     (err) => {
-      assert.match(err.message, /GetInstanceMetricData failed: HTTP 403/);
+      assert.match(err.message, /GetInstanceMetricData failed: HTTP 400/);
       assert.match(err.message, /\[redacted\]/);
       assert.ok(!err.message.includes(ACCESS_KEY_ID), "access key id must not reach the logs");
       return true;
@@ -509,38 +522,51 @@ test("a failure on the stop call itself is not swallowed", async () => {
 
   await assert.rejects(
     () => run("2026-08-15T12:00:00Z", baseEnv, mock),
-    /StopInstance failed: HTTP 403/,
+    /StopInstance failed: HTTP 400/,
   );
 });
 
-test("an unreadable metric response throws instead of reading as zero traffic", async () => {
-  // 200 但没有 metricData。把它折算成 0 字节就等于报告「本月没用流量」——
-  // 那是唯一会让看门狗什么都不做的读数，指标侧一次降级就能让它一边报平安一边放任超额。
-  const mock = stubAws({ malformedMetrics: true });
+test("an omitted metricData field is a legitimate zero, not an error", async () => {
+  // 这条守的是一个差点被写进生产的 bug。AWS 的响应定义里 metricData 没有任何「必然
+  // 出现」的保证，各语言 SDK 一律把「字段缺失」正规化成空数组 —— 也就是说服务端允许
+  // 在没有数据时把它整个省掉。此前的实现把「字段缺失」当成读不懂并抛错，而一台停机的
+  // 实例在新月份读到的恰恰就是这种空响应：每次触发都抛错，重启永远发不出去，实例会
+  // 停满一整个月。
+  //
+  // 更隐蔽的是，当时的打桩正是用 `{ metricName }` 来模拟「畸形响应」的 —— 夹具和测试
+  // 一起把同一个错误假设印证了两遍，而 53 个用例全绿。
+  const mock = stubAws({ state: "stopped", metricShape: "omitted" });
+  const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("StartInstance"), "省掉 metricData 必须读作零，而不是抛错");
+  assert.match(lines.at(-1), /no transfer recorded this month and instance was stopped; started$/);
+});
+
+test("an empty metricData array is also a legitimate zero", async () => {
+  const mock = stubAws({ state: "stopped", metricShape: "wrongMetric" });
+  // wrongMetric 回显的是 CPUUtilization，但 metricData 确实是个数组 —— 数据可用，放行。
+  await run("2026-09-01T00:00:00Z", baseEnv, mock);
+  assert.ok(opsOf(mock.calls).includes("StartInstance"));
+});
+
+test("a response with neither a metricData array nor a matching metricName throws", async () => {
+  // 两个信号都没有，才是真的读不懂。此时绝不能折算成 0 字节 —— 那是唯一会让看门狗
+  // 什么都不做的读数，指标侧一次降级就能让它一边报平安一边放任超额。
+  const mock = stubAws({ metricShape: "unrelated" });
 
   await assert.rejects(
     () => run("2026-08-15T12:00:00Z", baseEnv, mock),
-    /GetInstanceMetricData returned no metricData array for Network(In|Out)/,
+    /returned neither a metricData array nor a matching metricName for Network(In|Out)/,
   );
 });
 
-test("an empty metricData array is still a legitimate zero", async () => {
-  // 跨月之后本来就没有数据点。严格化不能把这条正常路径一起拦掉，否则每月 1 号
-  // 那次重启永远发不出去。
-  const mock = stubAws({ state: "stopped" });
-  mock.calls.length = 0;
-  const inner = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const req = input instanceof Request ? input : new Request(input, init);
-    if (req.headers.get("X-Amz-Target")?.endsWith("GetInstanceMetricData")) {
-      await inner(input.clone?.() ?? input, init); // 仍然记账
-      return Response.json({ metricData: [] });
-    }
-    return inner(input, init);
-  };
+test("a metricData that is present but not an array always throws", async () => {
+  const mock = stubAws({ metricShape: "notArray" });
 
-  await run("2026-09-01T00:00:00Z", baseEnv, mock);
-  assert.ok(opsOf(mock.calls).includes("StartInstance"));
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    /returned a non-array metricData for Network(In|Out)/,
+  );
 });
 
 test("an unreadable instance state still stops an over-limit instance", async () => {
@@ -571,6 +597,52 @@ test("an unreadable instance state on the restart path throws rather than starti
     /GetInstanceState returned no state name/,
   );
   assert.ok(!opsOf(mock.calls).includes("StartInstance"));
+});
+
+test("at the exact month rollover the burst window is too short to measure", async () => {
+  // usageWindow 在这一刻只有 60 秒宽，短于一个 300 秒的数据桶 —— 测不出速率。这条路径
+  // 每个月都会走，此前一次测试都没有覆盖过。它必须安静地跳过闸门，而不是拿一个
+  // 无意义的分母去算速率。
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: 5 * GIB });
+  const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
+
+  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+  // 测不出延迟，所以正常那一行不该带 meter 后缀。
+  assert.match(lines.at(-1), /under the 819\.200 GiB stop threshold$/);
+});
+
+test("a controller without scheduledTime falls back to the wall clock", async () => {
+  // Workers 一定会给 scheduledTime，但兜底那条分支不该是没跑过的代码。
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
+  try {
+    await worker.scheduled({ cron: "*/2 * * * *", noRetry() {} }, baseEnv);
+  } finally {
+    mock.restore();
+  }
+
+  const now = new Date();
+  assert.equal(
+    mock.calls[0].body.startTime,
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000,
+    "窗口仍然要落在当前 UTC 月份的月初",
+  );
+});
+
+test("a 500 is retried, a 400 is not", async () => {
+  // README 声称「2 次重试，只针对 5xx 和 429」。此前这条只靠读 aws4fetch 源码来确认，
+  // 没有任何行为测试 —— 而它决定了一次 ServiceException 抖动会不会白白丢掉一个 cron
+  // 周期的防护。Lightsail 的客户端错误全是 400，重试它们只会浪费时间。
+  const retried = stubAws({ networkIn: 10 * GIB, recentIn: GIB, serviceErrors: 2 });
+  await run("2026-08-15T12:00:00Z", baseEnv, retried);
+  // 两个月度查询是并行发出的，各吃一次 500 各重试一次，然后是两次突发窗口查询：
+  // 4 次逻辑调用 + 2 次重试 = 6。
+  assert.equal(retried.calls.length, 6, "两次 500 应当各触发一次重试");
+  assert.equal(opsOf(retried.calls).filter((o) => o === "GetInstanceMetricData").length, 6);
+
+  const notRetried = stubAws({ fail: "GetInstanceMetricData" });
+  await assert.rejects(() => run("2026-08-15T12:00:00Z", baseEnv, notRetried), /HTTP 400/);
+  // 400 是终局的：两个指标各试一次就抛，不该出现第三次尝试。
+  assert.ok(notRetried.calls.length <= 2, `400 不该重试，实际 ${notRetried.calls.length} 次`);
 });
 
 test("misconfiguration throws before any AWS call is made", async () => {

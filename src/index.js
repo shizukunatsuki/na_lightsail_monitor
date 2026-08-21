@@ -226,28 +226,46 @@ async function sumMetric(client, config, metricName, range, period) {
     statistics: ["Sum"],
   });
 
-  const { metricData } = await res.json();
+  const body = await res.json();
+  const metricData = body?.metricData;
 
-  // 严格要求它是个数组。成功响应里 `metricData` 一定存在，没有数据时是空数组；字段缺失
-  // 或不是数组意味着这份响应读不懂 —— 把它折算成 0 字节，就等于报告「本月没用流量」，
-  // 而那是唯一会让看门狗什么都不做的读数。指标侧一次降级，就能让它一边报平安一边放任
-  // 实例烧到超额。读不懂就响亮地失败，与 getInstanceState 保持同一种姿态。
-  if (!Array.isArray(metricData)) {
-    throw new Error(`GetInstanceMetricData returned no metricData array for ${metricName}`);
+  // 读不懂的响应一律抛错，绝不折算成 0 —— 0 字节是唯一会让看门狗什么都不做的读数，
+  // 指标侧一次降级就能让它一边报平安一边放任实例烧到超额。
+  //
+  // 但「读不懂」的判据**不能**挂在 `metricData` 存不存在上。AWS 的响应定义里它没有任何
+  // 「必然出现」的保证，而各语言 SDK 一律把「字段缺失」正规化成空数组 —— 这恰恰说明
+  // 服务端允许在没有数据时把它整个省掉。把缺失当成错误，代价是致命的：一台停机的实例
+  // 在新月份读到的就是空响应，于是每次触发都抛错，重启永远发不出去，实例停满一个月。
+  //
+  // 判据改挂在两个信号上，满足其一就认定这份响应是真的：
+  //   - `metricName` 正确回显（有值的标量必然被序列化，不像空集合那样可省）；
+  //   - 或者 `metricData` 确实是个数组。
+  // 两个都没有，才是真的读不懂。而 `metricData` 存在却不是数组，无论如何都是坏的。
+  if (metricData != null && !Array.isArray(metricData)) {
+    throw new Error(
+      `GetInstanceMetricData returned a non-array metricData for ${metricName}: ${JSON.stringify(metricData).slice(0, 80)}`,
+    );
   }
+  if (metricData == null && body?.metricName !== metricName) {
+    throw new Error(
+      `GetInstanceMetricData returned neither a metricData array nor a matching metricName for ${metricName}`,
+    );
+  }
+
+  const points = metricData ?? [];
 
   // 数据点既不保证有序也不保证连续，所以要累加而不是按下标取值。求总量与顺序无关；
   // 缺口本身就代表那段时间没有流量。
   let bytes = 0;
   let newest = null;
-  for (const point of metricData) {
+  for (const point of points) {
     bytes += point.sum ?? 0;
     // 时间戳走 Unix 秒。非数字就当没有，绝不让一个读不懂的时间戳污染延迟读数。
     if (typeof point.timestamp === "number" && (newest === null || point.timestamp > newest)) {
       newest = point.timestamp;
     }
   }
-  return { bytes, points: metricData.length, newest };
+  return { bytes, points: points.length, newest };
 }
 
 /**

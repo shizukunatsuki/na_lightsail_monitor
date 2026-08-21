@@ -145,7 +145,7 @@ test("readConfig rejects a THRESHOLD written as a percentage", () => {
 
 test("readConfig rejects the shipped placeholder and says where to fix it", () => {
   // "CHANGE_ME" 是非空的，所以它能通过「必填项缺失」那道检查，然后改为每次触发都在
-  // Lightsail 侧失败 —— 配上错误告警就是每天几百条读不懂的 404。
+  // Lightsail 侧失败 —— 配上错误告警就是每天几百条读不懂的 400。
   for (const name of ["INSTANCE_NAME", "AWS_REGION"]) {
     assert.throws(
       () => readConfig({ ...validEnv, [name]: "CHANGE_ME" }),
