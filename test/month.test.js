@@ -6,7 +6,7 @@ process.env.TZ = "America/Los_Angeles";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { monthStartMs, usageWindow, readConfig } from "../src/index.js";
+import { monthStartMs, usageWindow, readConfig, monthElapsedFraction } from "../src/index.js";
 
 const utc = (iso) => new Date(iso);
 const epoch = (iso) => Date.parse(iso);
@@ -80,6 +80,20 @@ test("usageWindow truncates sub-second precision without going backwards", () =>
   const { startTime, endTime } = usageWindow(utc("2026-08-15T12:00:00.750Z"));
   assert.equal(endTime, epoch("2026-08-15T12:00:00Z") / 1000);
   assert.ok(endTime > startTime);
+});
+
+test("monthElapsedFraction spans exactly the UTC month, leap years included", () => {
+  // 日志里的「照这个月的平均速度整月会用到多少」就靠它。月份长度必须由日历算出来，
+  // 不能拿 30 天当近似 —— 二月会把预测抬高约 7%，而这个数是用来判断趋势的。
+  assert.equal(monthElapsedFraction(utc("2026-08-01T00:00:00Z")), 0);
+  assert.equal(monthElapsedFraction(utc("2026-08-16T12:00:00Z")), 0.5, "八月 31 天，中点是 16 日 12:00");
+  assert.equal(monthElapsedFraction(utc("2026-09-16T00:00:00Z")), 0.5, "九月 30 天，中点是 16 日 00:00");
+  assert.equal(monthElapsedFraction(utc("2028-02-15T12:00:00Z")), 0.5, "闰年二月 29 天");
+  assert.equal(monthElapsedFraction(utc("2026-02-15T00:00:00Z")), 0.5, "平年二月 28 天");
+
+  // 跨年由 Date.UTC(y, 12, 1) 自己处理。
+  assert.equal(monthElapsedFraction(utc("2026-12-16T12:00:00Z")), 0.5, "十二月 31 天，中点是 16 日 12:00");
+  assert.ok(monthElapsedFraction(utc("2026-12-31T23:59:59Z")) < 1);
 });
 
 const validEnv = {

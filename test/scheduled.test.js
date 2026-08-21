@@ -173,14 +173,14 @@ test("every log line is prefixed with the instance identity, including the regio
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.ok(lines.length > 0);
-  for (const line of lines) assert.match(line, /^example-instance@ap-northeast-1: /);
+  for (const line of lines) assert.match(line, /^example-instance@ap-northeast-1 [A-Z]+ \| /);
 
   // 换个区域就是另一个标识，即便实例重名。
   const other = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
   const otherLines = await capturingLogs(() =>
     run("2026-08-15T12:00:00Z", { ...baseEnv, AWS_REGION: "us-east-1" }, other),
   );
-  assert.match(otherLines.at(-1), /^example-instance@us-east-1: /);
+  assert.match(otherLines.at(-1), /^example-instance@us-east-1 OK \| /);
 });
 
 test("bytes are converted on a 2^30 basis", async () => {
@@ -189,8 +189,10 @@ test("bytes are converted on a 2^30 basis", async () => {
   const mock = stubAws({ networkIn: GIB, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
+  // 一次触发只写一行，行首是可 grep 的状态标记，字段全部是这一轮已经算出来的东西。
   assert.deepEqual(lines, [
-    "example-instance@ap-northeast-1: 1.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
+    "example-instance@ap-northeast-1 OK | used 1.000 GiB (0.1% of 1024) | stop at 819.200 GiB" +
+      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | meter 5.0 min behind",
   ]);
 });
 
@@ -207,7 +209,7 @@ test("just over the 819.2 GiB stop line the instance is stopped", async () => {
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
-  assert.match(lines.at(-1), /STOPPED at 819\.201 GiB month-to-date, over the 819\.200 GiB stop threshold \(1024 GiB quota x 0\.8\)/);
+  assert.match(lines.at(-1), /^\S+ STOPPED \| used 819\.201 GiB \(80\.0% of 1024\) \| over the 819\.200 GiB stop threshold \(1024 GiB quota x 0\.8\)$/);
 });
 
 test("crossing the static line short-circuits the burst check", async () => {
@@ -323,7 +325,7 @@ test("a burst that would blow the quota before the next reaction stops the insta
     "GetInstanceState",
     "StopInstance",
   ]);
-  assert.match(lines.at(-1), /STOPPED at 700\.000 GiB month-to-date, burning 1622\.5 Mbps/);
+  assert.match(lines.at(-1), /STOPPED \| used 700\.000 GiB \(68\.4% of 1024\) \| burning 1622\.5 Mbps/);
   assert.match(lines.at(-1), /324\.000 GiB of quota left = 29 min to overage, inside the 30 min reaction horizon/);
 });
 
@@ -333,9 +335,13 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.ok(!opsOf(mock.calls).includes("StopInstance"));
-  assert.deepEqual(lines, [
-    "example-instance@ap-northeast-1: 700.000 GiB used month-to-date, under the 819.200 GiB stop threshold, meter 5.0 min behind",
-  ]);
+  assert.equal(lines.length, 1, "一次触发只写一行");
+  // 速率照常露出来，闸门在正常运行里也是可见的；而 projected 1497 GiB 已经越过 1024 的
+  // 额度——这正是这个字段存在的意义：静态线还没碰到，但趋势已经写在脸上了。
+  assert.match(
+    lines[0],
+    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| meter 5\.0 min behind$/,
+  );
 });
 
 test("the burst rate divides by the data that landed, not by the window length", async () => {
@@ -364,10 +370,12 @@ test("a lag that leaves under two usable buckets is called out loudly", async ()
 
   assert.match(
     lines.join("\n"),
-    /newest metric bucket is 22\.0 min old, under two usable buckets in the 30 min burst window; the burst gate is blind this run/,
+    /^\S+ BLIND \| newest metric bucket is 22\.0 min old, under two usable buckets in the 30 min burst window \|/m,
   );
   // 措辞只陈述观察到的事实：光看指标分不出「指标侧延迟」和「实例没在跑」。
   assert.match(lines.join("\n"), /meter lagging, or the instance is not running/);
+  // 而且刚被宣布不可信的那个速率，在 OK 行里必须带 (stale) 标记，不能装成正常读数。
+  assert.match(lines.at(-1), /^\S+ OK \|.*\| now \S+ \S+ \(stale\), /);
   assert.ok(!opsOf(mock.calls).includes("StopInstance"), "报警归报警，不能因此停机");
 });
 
@@ -407,6 +415,24 @@ test("a direction with no landed points contributes zero instead of blinding the
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
+});
+
+test("just outside the reaction horizon it reports the countdown instead of stopping", async () => {
+  // 剩余 324 GiB、速率 128.8 MB/s = 45 分钟到额度。45 > 30，闸门刻意不跳 —— 但那一行
+  // 必须把倒计时写出来。这是视野上沿的另一侧：29 分钟会停（见上面那条），45 分钟不停。
+  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 216 * GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"), "45 分钟在视野之外，不该停机");
+  assert.match(lines.at(-1), /^\S+ OK \|.*\| now 1030\.8 Mbps, 45 min to quota \|/);
+});
+
+test("a very long runway is capped rather than printed to the day", async () => {
+  // 额度每月都会重置，「还能撑 213 天」只是噪音。
+  const mock = stubAws({ networkIn: GIB, recentIn: 0.1 * GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.at(-1), /now \d+ kbps, > 90 d to quota/);
 });
 
 test("an idle instance with no recent data points is not treated as a burst", async () => {
@@ -539,7 +565,7 @@ test("an omitted metricData field is a legitimate zero, not an error", async () 
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
   assert.ok(opsOf(mock.calls).includes("StartInstance"), "省掉 metricData 必须读作零，而不是抛错");
-  assert.match(lines.at(-1), /no transfer recorded this month and instance was stopped; started$/);
+  assert.match(lines.at(-1), /^\S+ STARTED \| used 0\.000 GiB \(0\.0% of 1024\) \| stop at 819\.200 GiB \| allowance reads empty and the instance was stopped$/);
 });
 
 test("an empty metricData array is also a legitimate zero", async () => {
@@ -607,8 +633,8 @@ test("at the exact month rollover the burst window is too short to measure", asy
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
   assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
-  // 测不出延迟，所以正常那一行不该带 meter 后缀。
-  assert.match(lines.at(-1), /under the 819\.200 GiB stop threshold$/);
+  // 测不出速率也测不出延迟，所以这一行只有用量和停机线，没有 now / meter 字段。
+  assert.match(lines.at(-1), /^\S+ OK \| used 10\.000 GiB \(1\.0% of 1024\) \| stop at 819\.200 GiB$/);
 });
 
 test("a controller without scheduledTime falls back to the wall clock", async () => {

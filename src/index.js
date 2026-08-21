@@ -127,6 +127,49 @@ export function monthStartMs(now) {
 }
 
 /**
+ * `now` 在其所属 UTC 月份里已经走过的比例，落在 [0, 1]。
+ *
+ * 用来把「月初至今用了多少」换算成「照这个平均速度整月会用多少」。跨年由
+ * `Date.UTC(y, 12, 1)` 自动处理，月份长度也由它算出，不需要闰年表。
+ *
+ * @param {Date} now
+ * @returns {number}
+ */
+export function monthElapsedFraction(now) {
+  const start = monthStartMs(now);
+  const next = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  return Math.min(1, Math.max(0, (now.getTime() - start) / (next - start)));
+}
+
+/**
+ * 月初的头几个小时里，「月初至今」的样本太短，外推出来的整月用量会剧烈跳动。
+ * 走过这个比例（约 15 小时）之前不给预测，宁可少一个字段也不给一个会误导人的数。
+ */
+const PROJECTION_MIN_ELAPSED = 0.02;
+
+/** 人可读的时长。日志是给人扫的，不是给机器解析的。 */
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds)) return "never";
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  if (seconds < 48 * 3600) return `${(seconds / 3600).toFixed(1)} h`;
+  // 超过 90 天就没有区分意义了 —— 额度每月都会重置，「还能撑 5317 天」只是噪音。
+  if (seconds > 90 * 86400) return "> 90 d";
+  return `${(seconds / 86400).toFixed(1)} d`;
+}
+
+/** 人可读的速率。安静的实例在 Mbps 下会显示成 0.0，所以低速切到 kbps。 */
+function formatRate(bytesPerSecond) {
+  const bits = bytesPerSecond * 8;
+  return bits >= 1e6 ? `${(bits / 1e6).toFixed(1)} Mbps` : `${(bits / 1e3).toFixed(0)} kbps`;
+}
+
+/** 每条日志里都出现的用量片段，让「137 GiB」这个数字自带参照系。 */
+function formatUsage(config, usedGib) {
+  const pct = (usedGib / config.quotaGib) * 100;
+  return `used ${usedGib.toFixed(3)} GiB (${pct.toFixed(1)}% of ${config.quotaGib})`;
+}
+
+/**
  * 供 GetInstanceMetricData 使用的「月初至今」查询窗口，单位是 Unix *秒*
  * （Lightsail API 这里收的是数字，不是 ISO 字符串）。
  *
@@ -286,19 +329,19 @@ async function sumMetric(client, config, metricName, range, period) {
  */
 async function stopOverLimit(client, config, usedGib, reason) {
   const state = await getInstanceState(client, config).catch((err) => {
-    console.error(`${config.label}: instance state unreadable (${err.message}); erring toward the stop`);
+    console.error(`${config.label} DEGRADED | instance state unreadable (${err.message}) | erring toward the stop`);
     return null;
   });
 
   if (state !== null && state !== "running") {
     console.log(
-      `${config.label}: ${usedGib.toFixed(3)} GiB used, ${reason}, but instance is "${state}"; nothing to do`,
+      `${config.label} NOOP | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}", nothing to do`,
     );
     return;
   }
 
   await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
-  console.error(`${config.label}: STOPPED at ${usedGib.toFixed(3)} GiB month-to-date, ${reason}`);
+  console.error(`${config.label} STOPPED | ${formatUsage(config, usedGib)} | ${reason}`);
 }
 
 /**
@@ -317,15 +360,19 @@ async function stopOverLimit(client, config, usedGib, reason) {
  *
  * @param {{ startTime: number, endTime: number }} monthRange
  * @param {number} usedBytes 月初至今总量，字节
- * @returns {Promise<{ reason: string | null, lagSeconds: number | null }>}
- *   `reason` 非空表示需要停机；`lagSeconds` 是实测的落库延迟，测不出时为 null
+ * @returns {Promise<{ reason: string | null, lagSeconds: number | null,
+ *   bytesPerSecond: number | null, secondsToQuota: number | null }>}
+ *   `reason` 非空表示需要停机。其余几项是这一轮算出来的遥测，**不跳闸时也要带回去** ——
+ *   否则闸门在正常运行里完全不可见，没人能确认它是不是还在正常工作。`stale` 表示这个
+ *   速率是从过旧的数据点算出来的，日志里必须标出来，不能让它看起来和正常读数一样可信。
  */
 async function burstCheck(client, config, monthRange, usedBytes) {
   const { endTime } = monthRange;
   const startTime = Math.max(monthRange.startTime, endTime - BURST_WINDOW_SECONDS);
 
   // 跨月后的头几分钟，窗口会短于一个数据点，测不出速率。那时月度用量也必然离额度极远。
-  if (endTime - startTime < BURST_PERIOD_SECONDS) return { reason: null, lagSeconds: null };
+  const blank = { reason: null, lagSeconds: null, bytesPerSecond: null, secondsToQuota: null, stale: false };
+  if (endTime - startTime < BURST_PERIOD_SECONDS) return blank;
 
   const range = { startTime, endTime };
   const [recentIn, recentOut] = await Promise.all([
@@ -356,24 +403,25 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   // 跑这两种情况下长得一模一样，光看指标分辨不了（真跑着就会有新桶落下来）。所以两种
   // 读法都写进去。操作者月中自己停机时这条会连报几次直到那个桶滑出窗口，这是可以接受
   // 的代价：漏掉一次真的指标失明要糟糕得多。
-  if (lagSeconds !== null && lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS) {
+  const stale = lagSeconds !== null && lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS;
+  if (stale) {
     console.error(
-      `${config.label}: newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window; the burst gate is blind this run (meter lagging, or the instance is not running)`,
+      `${config.label} BLIND | newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window | the burst gate cannot see a burst this run (meter lagging, or the instance is not running)`,
     );
   }
 
-  if (bytesPerSecond <= 0) return { reason: null, lagSeconds };
-
   const remainingBytes = config.quotaGib * BYTES_PER_GIB - usedBytes;
-  const secondsToQuota = remainingBytes / bytesPerSecond;
-  if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, lagSeconds };
+  // 速率为零时「还能撑多久」是无穷 —— formatDuration 会把它写成 never，那正是实情。
+  const secondsToQuota = bytesPerSecond > 0 ? remainingBytes / bytesPerSecond : Infinity;
+  const telemetry = { lagSeconds, bytesPerSecond, secondsToQuota, stale };
 
-  const mbps = (bytesPerSecond * 8) / 1e6;
+  if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };
+
   return {
     reason:
-      `burning ${mbps.toFixed(1)} Mbps with ${(remainingBytes / BYTES_PER_GIB).toFixed(3)} GiB of quota left` +
+      `burning ${formatRate(bytesPerSecond)} with ${(remainingBytes / BYTES_PER_GIB).toFixed(3)} GiB of quota left` +
       ` = ${Math.round(secondsToQuota / 60)} min to overage, inside the ${REACTION_HORIZON_SECONDS / 60} min reaction horizon`,
-    lagSeconds,
+    ...telemetry,
   };
 }
 
@@ -433,22 +481,50 @@ export default {
     }
 
     // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
-    let meter = "";
+    let burst = null;
     if (usedBytes > 0) {
-      const burst = await burstCheck(client, config, range, usedBytes);
+      burst = await burstCheck(client, config, range, usedBytes);
       if (burst.reason) {
         await stopOverLimit(client, config, usedGib, burst.reason);
         return;
       }
-      // 把实测的落库延迟写进正常那一行。它是整套余量标定唯一一个来自上游、又没有文档
-      // 的输入，所以它必须每次都出现在眼前，而不是留作一个假设。
-      if (burst.lagSeconds !== null) meter = `, meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`;
     }
 
-    console.log(
-      `${config.label}: ${usedGib.toFixed(3)} GiB used month-to-date, under the ${limitGib.toFixed(3)} GiB stop threshold${meter}`,
-    );
+    // 每次触发只写一行，行首是可 grep 的状态标记（OK / STOPPED / STARTED / NOOP /
+    // HOLD / BLIND / DEGRADED）。`wrangler tail | grep -v " OK "` 就只剩下值得看的事件。
+    //
+    // 字段各回答一个问题，而且全部是这一轮**已经算出来**的东西，没有额外调用：
+    //   used / stop at    —— 我在哪、线在哪
+    //   now ... to quota  —— 突发闸门这一轮读到了什么。不露出来的话，它在正常运行里
+    //                        完全不可见，没人能确认它还在正常工作。
+    //   month / projected —— 照这个月的平均速度，整月会用到多少
+    //   meter             —— 上游数据有多新。整套余量标定唯一一个没有文档的输入。
+    const common = [formatUsage(config, usedGib), `stop at ${limitGib.toFixed(3)} GiB`];
 
+    if (burst && burst.bytesPerSecond !== null) {
+      // 速率来自过旧的数据点时必须标出来 —— 上面刚写了一行 BLIND 说它不可信，这里就
+      // 不能再把同一个数字摆得和正常读数一样。
+      const mark = burst.stale ? " (stale)" : "";
+      common.push(`now ${formatRate(burst.bytesPerSecond)}${mark}, ${formatDuration(burst.secondsToQuota)} to quota`);
+    }
+
+    const elapsed = monthElapsedFraction(now);
+    if (elapsed >= PROJECTION_MIN_ELAPSED) {
+      common.push(`month ${(elapsed * 100).toFixed(0)}% elapsed, projected ${(usedGib / elapsed).toFixed(0)} GiB`);
+    }
+
+    if (burst && burst.lagSeconds !== null) {
+      common.push(`meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`);
+    }
+
+    if (usedBytes > 0) {
+      console.log([`${config.label} OK`, ...common].join(" | "));
+      return;
+    }
+
+    // 到这里说明月初至今恰为零。下面三个出口各写一行，都带着上面那组共同字段 ——
+    // 长期停机的实例每次触发只留一行，而不是「一行 OK + 一行结果」。
+    //
     // 重启由用量驱动，而不是由日历驱动。停机只会发生在用量达到或超过阈值时，所以那个月
     // 剩下的时间里用量会一直卡在阈值之上：「重新回到阈值以下」与旧的「1 号」分支想要捕捉
     // 的是同一个事件，却没有它那个仅有 24 小时的窗口。从跨月那一刻起，每一次触发都是
@@ -458,12 +534,8 @@ export default {
     // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
     // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
     // 约两万次调用。
-    if (usedBytes > 0) return;
-
     if (config.manualHold) {
-      console.log(
-        `${config.label}: no transfer recorded this month, but MANUAL_HOLD is set; leaving it alone`,
-      );
+      console.log([`${config.label} HOLD`, ...common, "MANUAL_HOLD is set, leaving the instance alone"].join(" | "));
       return;
     }
 
@@ -473,13 +545,15 @@ export default {
     const state = await getInstanceState(client, config);
     if (state !== "stopped") {
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
-      console.log(`${config.label}: no transfer recorded this month, instance is "${state}"; nothing to do`);
+      console.log([`${config.label} NOOP`, ...common, `instance is "${state}", nothing to do`].join(" | "));
       return;
     }
 
     await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
     // 只陈述观察到的事实：handler 知道的是「月初至今为零且实例是 stopped」，它并没有
     // 独立核实过额度重置这件事。
-    console.log(`${config.label}: no transfer recorded this month and instance was stopped; started`);
+    console.log(
+      [`${config.label} STARTED`, ...common, "allowance reads empty and the instance was stopped"].join(" | "),
+    );
   },
 };
