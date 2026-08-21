@@ -10,10 +10,22 @@ const API_TARGET = "Lightsail_20161128";
 const METRIC_PERIOD_SECONDS = 86400;
 
 /**
- * 突发闸门的观察窗口与粒度：最近一小时，300 秒一个点，每个指标最多 13 个数据点。
- * 300 秒是 Lightsail 的原生上报粒度，取得再细也不会有更多信息。
+ * 突发闸门的观察窗口与粒度：最近半小时，300 秒一个点。300 秒是 Lightsail 的原生上报
+ * 粒度，取得再细也不会有更多信息。
+ *
+ * 窗口长度是被**稀释**和**落库延迟**两头夹出来的，不是随手取的整数：
+ *
+ * - 太长会稀释。速率是窗口内的平均值，所以一场刚开始 5 分钟的突发，在一小时的窗口里
+ *   只显出真实速率的十二分之一。可以证明闸门会在「距离额度耗尽还剩 H/(H+W−L)」处跳闸
+ *   （W 窗口、H 视野、L 落库延迟），与速率无关：W=60 分钟时要等耗尽进度走完 63% 才跳，
+ *   5 Gbps 下只剩 7 分钟余量；W=30 分钟时 40% 就跳，余量 11.6 分钟。
+ * - 太短会瞎。窗口整个落在落库延迟的阴影里就一个数据点都没有，闸门直接失效。W=20 分钟
+ *   在延迟 20 分钟时归零；W=30 分钟即便延迟到 20 分钟仍有 2 个点。
+ *
+ * 30 分钟是这两条曲线的交点。**它只影响反应快慢，不影响灵敏度**——跳闸判据
+ * `速率 > 剩余额度 / 视野` 里没有 W，所以缩短窗口不会让闸门更容易误报。
  */
-const BURST_WINDOW_SECONDS = 3600;
+const BURST_WINDOW_SECONDS = 1800;
 const BURST_PERIOD_SECONDS = 300;
 
 /**
@@ -22,6 +34,11 @@ const BURST_PERIOD_SECONDS = 300;
  * 这个数必须覆盖一整个检测回路 —— cron 间隔（`wrangler.jsonc` 里是 2 分钟）＋ 指标落库
  * 延迟（几分钟）＋ StopInstance 真正断流的时间（约一分钟）。取 30 分钟，是三者之和的
  * 两倍有余。**改动 cron 间隔时必须回来重新审视这个数。**
+ *
+ * 它同时是闸门唯一的灵敏度旋钮：跳闸判据等价于 `速率 > 剩余额度 / 视野`，所以调大它
+ * 会线性地降低触发所需的速率。空表时需要约 4.9 Gbps 才跳闸，用到 800 GiB 时约 1.1 Gbps
+ * —— 对一台个人站实例来说，这两个数都远在正常业务之上，误停的风险很小。想更保守就调大
+ * 这个数（代价是可能掐掉一次合法的大流量传输），不要去动 BURST_WINDOW_SECONDS。
  */
 const REACTION_HORIZON_SECONDS = 1800;
 
@@ -282,6 +299,11 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   ]);
 
   // 分母取「实际落库的点数 × 粒度」，理由见 sumMetric 里 points 的说明。
+  //
+  // 一个点都没有时静默放行，不报警：能走到这里说明月度查询是有字节数的，也就是指标 API
+  // 本身在正常工作（真坏了会在 sumMetric 那里抛错，或者月度也读到 0 从而根本不进闸门）。
+  // 所以「最近半小时没有数据点」只可能意味着实例本来就没在跑 —— 那是操作者月中自己停的，
+  // 每两分钟报一次警只会制造噪音。
   const covered = Math.max(recentIn.points, recentOut.points) * BURST_PERIOD_SECONDS;
   const bytesPerSecond = covered > 0 ? (recentIn.bytes + recentOut.bytes) / covered : 0;
   if (bytesPerSecond <= 0) return null;

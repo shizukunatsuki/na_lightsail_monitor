@@ -44,7 +44,7 @@ function stubAws({
   networkOut = 0,
   recentIn = 0,
   recentOut = 0,
-  recentPoints = 12,
+  recentPoints = 6,
   malformedMetrics = false,
   unreadableState = false,
   fail,
@@ -211,7 +211,7 @@ test("metric queries use the documented request shape", async () => {
   assert.equal(metric.body.endTime, Date.parse("2026-08-15T12:00:00Z") / 1000);
 });
 
-test("the burst window is the trailing hour at 300-second granularity", async () => {
+test("the burst window is the trailing half hour at 300-second granularity", async () => {
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
@@ -219,7 +219,9 @@ test("the burst window is the trailing hour at 300-second granularity", async ()
   for (const call of burstCalls(mock.calls)) {
     assert.equal(call.body.period, BURST_PERIOD);
     assert.equal(call.body.endTime, now);
-    assert.equal(call.body.startTime, now - 3600);
+    // 半小时而不是一小时：一小时的平均会把刚开始的突发稀释掉，闸门要等耗尽进度走完
+    // 63% 才跳；半小时是 40%。见 src/index.js 里 BURST_WINDOW_SECONDS 的说明。
+    assert.equal(call.body.startTime, now - 1800);
   }
   assert.deepEqual(burstCalls(mock.calls).map((c) => c.body.metricName).sort(), ["NetworkIn", "NetworkOut"]);
 });
@@ -269,9 +271,9 @@ test("a stop is not repeated while the instance is still stopping", async () => 
 // --- 突发闸门 -----------------------------------------------------------------
 
 test("a burst that would blow the quota before the next reaction stops the instance", async () => {
-  // 月度 700 GiB 远在 819.2 的静态线之下，但最近一小时烧掉了 690 GiB —— 按这个速率，
+  // 月度 700 GiB 远在 819.2 的静态线之下，但最近半小时烧掉了 340 GiB —— 按这个速率，
   // 剩下的 324 GiB 撑不到半小时。静态线在这里毫无用处，因为它要等总量先越线。
-  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 690 * GIB });
+  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 340 * GIB });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.deepEqual(opsOf(mock.calls), [
@@ -282,13 +284,13 @@ test("a burst that would blow the quota before the next reaction stops the insta
     "GetInstanceState",
     "StopInstance",
   ]);
-  assert.match(lines.at(-1), /STOPPED at 700\.000 GiB month-to-date, burning 1646\.4 Mbps/);
-  assert.match(lines.at(-1), /324\.000 GiB of quota left = 28 min to overage, inside the 30 min reaction horizon/);
+  assert.match(lines.at(-1), /STOPPED at 700\.000 GiB month-to-date, burning 1622\.5 Mbps/);
+  assert.match(lines.at(-1), /324\.000 GiB of quota left = 29 min to overage, inside the 30 min reaction horizon/);
 });
 
 test("ordinary traffic at the same month-to-date total does not trip the gate", async () => {
-  // 同样是 700 GiB 月度用量，但最近一小时只有 10 GiB：按这个速率还能跑一天多。
-  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 10 * GIB });
+  // 同样是 700 GiB 月度用量，但最近半小时只有 5 GiB：按这个速率还能跑一天多。
+  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 5 * GIB });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.ok(!opsOf(mock.calls).includes("StopInstance"));
@@ -298,10 +300,10 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
 });
 
 test("the burst rate divides by the data that landed, not by the window length", async () => {
-  // 指标有几分钟落库延迟，一小时的窗口里常常只有一部分数据点。300 GiB 落在 6 个点
-  // （半小时）里，真实速率是拿 1800 秒去除；用整个 3600 秒窗口去除会把它算成一半，
+  // 指标有几分钟落库延迟，半小时的窗口里常常只有一部分数据点。150 GiB 落在 3 个点
+  // （15 分钟）里，真实速率是拿 900 秒去除；用整个 1800 秒窗口去除会把它算成一半，
   // 于是这次突发就被放过了 —— 而算低速率正是不安全的那个方向。
-  const mock = stubAws({ networkIn: 800 * GIB, recentIn: 300 * GIB, recentPoints: 6 });
+  const mock = stubAws({ networkIn: 800 * GIB, recentIn: 150 * GIB, recentPoints: 3 });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"), "half-covered window must still be read at full rate");
