@@ -45,6 +45,8 @@ function stubAws({
   recentIn = 0,
   recentOut = 0,
   recentPoints = 6,
+  recentInPoints,
+  recentOutPoints,
   recentLagSeconds = 300,
   malformedMetrics = false,
   unreadableState = false,
@@ -80,15 +82,18 @@ function stubAws({
         if (malformedMetrics) return Response.json({ metricName: body.metricName });
 
         if (body.period === BURST_PERIOD) {
-          const total = body.metricName === "NetworkIn" ? recentIn : recentOut;
+          const isIn = body.metricName === "NetworkIn";
+          const total = isIn ? recentIn : recentOut;
+          // 两个方向的落库进度可以不同 —— 真实 API 不保证它们同步。
+          const n = (isIn ? recentInPoints : recentOutPoints) ?? recentPoints;
           // 时间戳锚定到请求的 endTime：最新那个桶覆盖 [newest, newest + 300)，而它比
           // 「此刻」早了 recentLagSeconds —— 这就是被模拟的落库延迟。
           const newest = body.endTime - recentLagSeconds - BURST_PERIOD;
           return Response.json({
             metricName: body.metricName,
-            metricData: Array.from({ length: recentPoints }, (_, i) => ({
-              sum: total / recentPoints,
-              timestamp: newest - (recentPoints - 1 - i) * BURST_PERIOD,
+            metricData: Array.from({ length: n }, (_, i) => ({
+              sum: n ? total / n : 0,
+              timestamp: newest - (n - 1 - i) * BURST_PERIOD,
               unit: "Bytes",
             })),
           });
@@ -344,7 +349,12 @@ test("a lag that leaves under two usable buckets is called out loudly", async ()
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 22 * 60, recentPoints: 1 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
-  assert.match(lines.join("\n"), /metric lag is 22\.0 min, leaving under two usable buckets in the 30 min burst window/);
+  assert.match(
+    lines.join("\n"),
+    /newest metric bucket is 22\.0 min old, under two usable buckets in the 30 min burst window; the burst gate is blind this run/,
+  );
+  // 措辞只陈述观察到的事实：光看指标分不出「指标侧延迟」和「实例没在跑」。
+  assert.match(lines.join("\n"), /meter lagging, or the instance is not running/);
   assert.ok(!opsOf(mock.calls).includes("StopInstance"), "报警归报警，不能因此停机");
 });
 
@@ -353,6 +363,37 @@ test("a still-open newest bucket reads as zero lag rather than a negative one", 
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.match(lines.at(-1), /meter 0\.0 min behind$/);
+});
+
+test("each direction's rate is divided by its own coverage, not a shared denominator", async () => {
+  // 两个指标的落库进度不保证同步。这里 NetworkIn 落了 6 个桶（1800 秒）而 NetworkOut
+  // 只落了 2 个（600 秒），出向那 150 GiB 其实是 2147 Mbps —— 剩余 224 GiB 撑 15 分钟。
+  // 把两个方向的字节合起来除以「较长的那个」覆盖时长，会把它报成 716 Mbps 从而放行；
+  // 除以「较短的那个」又会在某个方向零数据点时让分母归零、闸门整个失效。各算各的。
+  const mock = stubAws({
+    networkIn: 800 * GIB,
+    recentIn: 0,
+    recentOut: 150 * GIB,
+    recentInPoints: 6,
+    recentOutPoints: 2,
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"), "2147 Mbps 必须停机");
+  assert.match(lines.at(-1), /burning 2147\.5 Mbps/);
+});
+
+test("a direction with no landed points contributes zero instead of blinding the gate", async () => {
+  // NetworkIn 一个点都没落，NetworkOut 正常。闸门必须照常按出向的速率判断。
+  const mock = stubAws({
+    networkIn: 800 * GIB,
+    recentOut: 150 * GIB,
+    recentInPoints: 0,
+    recentOutPoints: 2,
+  });
+  await run("2026-08-15T12:00:00Z", baseEnv, mock);
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"));
 });
 
 test("an idle instance with no recent data points is not treated as a burst", async () => {

@@ -315,13 +315,14 @@ async function burstCheck(client, config, monthRange, usedBytes) {
     sumMetric(client, config, "NetworkOut", range, BURST_PERIOD_SECONDS),
   ]);
 
-  // 分母取「实际落库的点数 × 粒度」，理由见 sumMetric 里 points 的说明。
-  //
-  // 一个点都没有时静默放行，不报警：能走到这里说明月度查询是有字节数的，也就是指标 API
-  // 本身在正常工作（真坏了会在 sumMetric 那里抛错，或者月度也读到 0 从而根本不进闸门）。
-  // 所以「最近半小时没有数据点」只可能意味着实例本来就没在跑 —— 那是操作者月中自己停的，
-  // 每两分钟报一次警只会制造噪音。
-  const covered = Math.max(recentIn.points, recentOut.points) * BURST_PERIOD_SECONDS;
+  // 每个方向各自除以自己的覆盖时长，再相加 —— 不能把两个方向的字节数合起来除以一个
+  // 共同的分母。两个指标的落库进度并不同步：NetworkIn 落了 6 个桶而 NetworkOut 只落了
+  // 2 个时，用「较长的那个」当分母会把 Out 那 600 秒里的字节摊到 1800 秒上，速率报低
+  // 三倍，一场 2 Gbps 的突发就这样被放行。用「较短的那个」也不行 —— 某个方向一个点
+  // 都没有时分母归零，闸门直接失效。各算各的，两边都不会错。
+  const rateOf = (metric) =>
+    metric.points > 0 ? metric.bytes / (metric.points * BURST_PERIOD_SECONDS) : 0;
+  const bytesPerSecond = rateOf(recentIn) + rateOf(recentOut);
 
   // 实测落库延迟：最新那个桶覆盖 [newest, newest + 300)，它已经能查到，所以延迟就是
   // 「此刻」减去那个桶的结束时刻。桶还开着时会算出负数，钳到 0 —— 那表示数据是新鲜的。
@@ -330,15 +331,19 @@ async function burstCheck(client, config, monthRange, usedBytes) {
     ? Math.max(0, endTime - (newest + BURST_PERIOD_SECONDS))
     : null;
 
-  // 延迟吃掉窗口后，闸门可用的数据点就不足两个，速率估计随之失去意义。这不是猜测能
-  // 覆盖的事，所以一旦发生就必须响亮地说出来：此刻真正在守账单的只剩静态线。
+  // 最新的桶老到窗口里凑不出两个可用数据点时，速率估计已经失去意义，这一轮真正在守
+  // 账单的只剩静态线 —— 必须说出来。
+  //
+  // 措辞只陈述观察到的事实，不替它选解释：「最新的桶很旧」在指标侧延迟和实例根本没在
+  // 跑这两种情况下长得一模一样，光看指标分辨不了（真跑着就会有新桶落下来）。所以两种
+  // 读法都写进去。操作者月中自己停机时这条会连报几次直到那个桶滑出窗口，这是可以接受
+  // 的代价：漏掉一次真的指标失明要糟糕得多。
   if (lagSeconds !== null && lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS) {
     console.error(
-      `${config.label}: metric lag is ${(lagSeconds / 60).toFixed(1)} min, leaving under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window; the burst gate is losing resolution`,
+      `${config.label}: newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, under two usable buckets in the ${BURST_WINDOW_SECONDS / 60} min burst window; the burst gate is blind this run (meter lagging, or the instance is not running)`,
     );
   }
 
-  const bytesPerSecond = covered > 0 ? (recentIn.bytes + recentOut.bytes) / covered : 0;
   if (bytesPerSecond <= 0) return { reason: null, lagSeconds };
 
   const remainingBytes = config.quotaGib * BYTES_PER_GIB - usedBytes;
