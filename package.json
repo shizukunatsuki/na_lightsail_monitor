@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
     "deploy": "npm test && npx wrangler deploy",
-    "test": "node --test"
+    "test": "node --test",
+    "mutate": "bash scripts/mutation-test.sh"
   },
   "dependencies": {
     "aws4fetch": "1.0.20"

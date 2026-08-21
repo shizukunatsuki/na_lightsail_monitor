@@ -49,6 +49,7 @@ function stubAws({
   recentOutPoints,
   recentLagSeconds = 300,
   metricShape,
+  badPoints,
   serviceErrors = 0,
   unreadableState = false,
   fail,
@@ -93,6 +94,7 @@ function stubAws({
         if (metricShape === "notArray") return Response.json({ metricName: body.metricName, metricData: "oops" });
         if (metricShape === "unrelated") return Response.json({ ok: true });
         if (metricShape === "wrongMetric") return Response.json({ metricName: "CPUUtilization", metricData: [] });
+        if (badPoints) return Response.json({ metricName: body.metricName, metricData: badPoints });
 
         if (body.period === BURST_PERIOD) {
           const isIn = body.metricName === "NetworkIn";
@@ -586,6 +588,38 @@ test("a response with neither a metricData array nor a matching metricName throw
   );
 });
 
+test("a string sum throws instead of silently concatenating", async () => {
+  // `bytes += "500"` 走的是字符串拼接：两个 500 GiB 的桶会被读成 0.005 GiB —— 少报三个
+  // 数量级，而少报正是唯一会让看门狗什么都不做的方向。JSON 里 "500" 是完全合法的值。
+  const mock = stubAws({ badPoints: [{ sum: "500", timestamp: 1.754e9 }] });
+
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    /returned an unusable sum for Network(In|Out): "500"/,
+  );
+});
+
+test("a negative sum throws", async () => {
+  const mock = stubAws({ badPoints: [{ sum: -1, timestamp: 1.754e9 }] });
+  await assert.rejects(() => run("2026-08-15T12:00:00Z", baseEnv, mock), /unusable sum/);
+});
+
+test("a null data point throws deliberately rather than crashing", async () => {
+  // 此前这里是一句不透明的 TypeError: Cannot read properties of null。
+  const mock = stubAws({ badPoints: [null] });
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    /returned a non-object data point for Network(In|Out)/,
+  );
+});
+
+test("a missing sum is still a legitimate zero", async () => {
+  // 桶里没有这个统计量是允许的，按零算 —— 严格化不能把这条正常路径一起拦掉。
+  const mock = stubAws({ badPoints: [{ timestamp: 1.754e9 }] });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  assert.match(lines.at(-1), /used 0\.000 GiB/);
+});
+
 test("a metricData that is present but not an array always throws", async () => {
   const mock = stubAws({ metricShape: "notArray" });
 
@@ -625,16 +659,23 @@ test("an unreadable instance state on the restart path throws rather than starti
   assert.ok(!opsOf(mock.calls).includes("StartInstance"));
 });
 
-test("at the exact month rollover the burst window is too short to measure", async () => {
-  // usageWindow 在这一刻只有 60 秒宽，短于一个 300 秒的数据桶 —— 测不出速率。这条路径
-  // 每个月都会走，此前一次测试都没有覆盖过。它必须安静地跳过闸门，而不是拿一个
-  // 无意义的分母去算速率。
+test("at the exact month rollover the burst window reaches back into the previous month", async () => {
+  // 月度窗口在这一刻只有 60 秒宽，但突发窗口**不**跟着钳到月初 —— 速率是个物理量，
+  // 跨过 00:00 UTC 那一刻实例并没有变慢。跟着钳的代价是每个月头 5 分钟闸门完全失明，
+  // 而那恰恰是额度刚重置、最可能有人开始猛跑的时候。
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: 5 * GIB });
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
-  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
-  // 测不出速率也测不出延迟，所以这一行只有用量和停机线，没有 now / meter 字段。
-  assert.match(lines.at(-1), /^\S+ OK \| used 10\.000 GiB \(1\.0% of 1024\) \| stop at 819\.200 GiB$/);
+  const rollover = Date.parse("2026-09-01T00:00:00Z") / 1000;
+  const burst = burstCalls(mock.calls);
+  assert.equal(burst.length, 2, "闸门必须照常工作");
+  for (const call of burst) {
+    assert.equal(call.body.startTime, rollover + 60 - 1800, "窗口整整 30 分钟，越过月份边界");
+    assert.ok(call.body.startTime < rollover, "起点落在上个月");
+  }
+  // 上个月的流量落进窗口不会误停：剩余额度用的是本月的用量，此刻接近满额。
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"));
+  assert.match(lines.at(-1), /^\S+ OK \| used 10\.000 GiB \(1\.0% of 1024\) \|.*\| now /);
 });
 
 test("a controller without scheduledTime falls back to the wall clock", async () => {

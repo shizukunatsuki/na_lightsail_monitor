@@ -86,9 +86,18 @@ export function readConfig(env) {
     }
   }
 
+  // 上界不是随手定的：超过它之后 `quotaGib * BYTES_PER_GIB` 就落到 Number 的安全整数
+  // 范围之外，字节比较开始丢精度；再大一点直接溢出成 Infinity，于是停机线变成一个永远
+  // 够不到的数 —— 一个看起来在跑、实际上什么都不做的看门狗。这正是 THRESHOLD 那条上界
+  // 要防的东西，QUOTA_GIB 此前却没有对应的防护。
+  //
+  // 8 PiB/月大约是 Lightsail 最大套餐的四千倍，不会误伤任何真实配置。
+  const MAX_QUOTA_GIB = Number.MAX_SAFE_INTEGER / BYTES_PER_GIB;
   const quotaGib = Number(env.QUOTA_GIB);
-  if (!Number.isFinite(quotaGib) || quotaGib <= 0) {
-    throw new Error(`QUOTA_GIB must be a positive number, got ${JSON.stringify(env.QUOTA_GIB)}`);
+  if (!Number.isFinite(quotaGib) || quotaGib <= 0 || quotaGib > MAX_QUOTA_GIB) {
+    throw new Error(
+      `QUOTA_GIB must be a positive number of at most ${Math.floor(MAX_QUOTA_GIB)}, got ${JSON.stringify(env.QUOTA_GIB)}`,
+    );
   }
 
   // 上界卡在 1，这样即使把 THRESHOLD 按百分比写成 "80"，也不会悄无声息地让看门狗
@@ -210,11 +219,19 @@ async function lightsail(client, config, operation, body) {
   });
 
   if (!res.ok) {
-    // SigV4 的拒绝响应会回显 credential scope，其中嵌着 access key id，所以要在这条
-    // 消息进入日志之前把它抹掉。先脱敏再截断：反过来的话，key 正好横跨 500 字节边界时
-    // 会残留半截。
-    const detail = (await res.text()).replaceAll(client.accessKeyId, "[redacted]").slice(0, 500);
-    throw new Error(`Lightsail ${operation} failed: HTTP ${res.status} ${detail}`);
+    // 响应体会原样进入日志，所以两个凭据都要先抹掉。
+    //
+    // access key id 是必须的：SigV4 的拒绝响应会回显 credential scope，里面就嵌着它。
+    // secret 按理不会被任何 AWS 响应回显 —— 但「按理不会」不是把它排除在外的理由。
+    // 这里原先只抹了 access key id，也就是只抹了当初想到的那一个；性质测试正是从这个
+    // 缺口切进来的。脱敏应当是把**已知的全部凭据**都过一遍，而不是列举我记得的那些。
+    //
+    // 先脱敏再截断：反过来的话，凭据正好横跨 500 字节边界时会残留半截。
+    let detail = await res.text();
+    for (const secret of [client.accessKeyId, client.secretAccessKey]) {
+      if (secret) detail = detail.replaceAll(secret, "[redacted]");
+    }
+    throw new Error(`Lightsail ${operation} failed: HTTP ${res.status} ${detail.slice(0, 500)}`);
   }
   return res;
 }
@@ -302,7 +319,22 @@ async function sumMetric(client, config, metricName, range, period) {
   let bytes = 0;
   let newest = null;
   for (const point of points) {
-    bytes += point.sum ?? 0;
+    if (point === null || typeof point !== "object") {
+      throw new Error(`GetInstanceMetricData returned a non-object data point for ${metricName}`);
+    }
+
+    // `sum` 缺席是允许的（那个桶没有这个统计量，按零算）；但只要它出现，就必须是一个
+    // 有限的非负数字。这里不是洁癖：`bytes += "500"` 会走字符串拼接，两个 500 GiB 的桶
+    // 会被读成 0.005 GiB —— 少报几个数量级，而少报正是唯一会让看门狗什么都不做的方向。
+    // 负数同理。读不懂就抛错，与本函数其余部分保持同一种姿态。
+    const sum = point.sum ?? 0;
+    if (typeof sum !== "number" || !Number.isFinite(sum) || sum < 0) {
+      throw new Error(
+        `GetInstanceMetricData returned an unusable sum for ${metricName}: ${JSON.stringify(point.sum)}`,
+      );
+    }
+    bytes += sum;
+
     // 时间戳走 Unix 秒。非数字就当没有，绝不让一个读不懂的时间戳污染延迟读数。
     if (typeof point.timestamp === "number" && (newest === null || point.timestamp > newest)) {
       newest = point.timestamp;
@@ -368,13 +400,13 @@ async function stopOverLimit(client, config, usedGib, reason) {
  */
 async function burstCheck(client, config, monthRange, usedBytes) {
   const { endTime } = monthRange;
-  const startTime = Math.max(monthRange.startTime, endTime - BURST_WINDOW_SECONDS);
 
-  // 跨月后的头几分钟，窗口会短于一个数据点，测不出速率。那时月度用量也必然离额度极远。
-  const blank = { reason: null, lagSeconds: null, bytesPerSecond: null, secondsToQuota: null, stale: false };
-  if (endTime - startTime < BURST_PERIOD_SECONDS) return blank;
-
-  const range = { startTime, endTime };
+  // 窗口**不**钳到月初。速率是个物理量，没有理由尊重月份边界：跨过 00:00 UTC 的那一刻，
+  // 实例并没有变慢。早先这里跟着月度窗口一起钳到了月初，代价是每个月头 5 分钟闸门凑不
+  // 满一个数据桶、完全失明 —— 而那恰恰是额度刚重置、最可能有人开始猛跑的时候。
+  // 上个月的流量落进窗口不会造成误停：剩余额度用的是**本月**的 usedBytes，跨月后它接近
+  // 满额，再高的速率也撑得过反应视野。
+  const range = { startTime: endTime - BURST_WINDOW_SECONDS, endTime };
   const [recentIn, recentOut] = await Promise.all([
     sumMetric(client, config, "NetworkIn", range, BURST_PERIOD_SECONDS),
     sumMetric(client, config, "NetworkOut", range, BURST_PERIOD_SECONDS),
