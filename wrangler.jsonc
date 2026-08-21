@@ -19,7 +19,7 @@
   // 改这个间隔时，必须同步复核 src/index.js 里的 REACTION_HORIZON_SECONDS ——
   // 那个视野是按「cron 间隔 + 指标落库延迟 + 停机生效时间」定的。
   "triggers": {
-    "crons": ["*/2 * * * *"]
+    "crons": ["*/10 * * * *"]
   },
 
   "vars": {
