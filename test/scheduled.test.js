@@ -24,12 +24,31 @@ const STOP_LINE_GIB = 819.2;
 /** 用来在停机线两侧各取一点的偏移量，1 MiB —— 远大于浮点误差，也远小于任何真实用量。 */
 const MIB = 1024 ** 2;
 
+/** 与 src/index.js 里的常量对应：月度查询按天，突发窗口按 5 分钟。 */
+const MONTH_PERIOD = 86400;
+const BURST_PERIOD = 300;
+
 /**
  * 打桩 `globalThis.fetch`，记录每一次 Lightsail 操作。
+ *
+ * 指标查询按 `period` 分流：86400 是「月初至今」，300 是突发闸门那一小时的窗口。两者
+ * 必须能分别给量，否则「本月用了 800 GiB」会被当成「最近一小时烧了 800 GiB」，突发闸门
+ * 在每个测试里都会误触发。
+ *
  * `state` 可以传数组，每次 GetInstanceState 调用消费一项，用来模拟状态在两次调用之间
  * 发生变化的实例。
  */
-function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}) {
+function stubAws({
+  state = "running",
+  networkIn = 0,
+  networkOut = 0,
+  recentIn = 0,
+  recentOut = 0,
+  recentPoints = 12,
+  malformedMetrics = false,
+  unreadableState = false,
+  fail,
+} = {}) {
   const calls = [];
   const states = Array.isArray(state) ? [...state] : null;
   const original = globalThis.fetch;
@@ -51,10 +70,26 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
 
     switch (operation) {
       case "GetInstanceState": {
+        if (unreadableState) return Response.json({ state: {} });
         const name = states ? (states.shift() ?? "running") : state;
         return Response.json({ state: { code: name === "running" ? 16 : 80, name } });
       }
       case "GetInstanceMetricData": {
+        // 200 但读不懂：`metricData` 整个字段缺席。
+        if (malformedMetrics) return Response.json({ metricName: body.metricName });
+
+        if (body.period === BURST_PERIOD) {
+          const total = body.metricName === "NetworkIn" ? recentIn : recentOut;
+          return Response.json({
+            metricName: body.metricName,
+            metricData: Array.from({ length: recentPoints }, (_, i) => ({
+              sum: total / recentPoints,
+              timestamp: 1.7540064e9 + i * BURST_PERIOD,
+              unit: "Bytes",
+            })),
+          });
+        }
+
         const total = body.metricName === "NetworkIn" ? networkIn : networkOut;
         // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
         // 不保证。
@@ -80,7 +115,7 @@ function stubAws({ state = "running", networkIn = 0, networkOut = 0, fail } = {}
 
 /** 在一个固定时刻运行 handler。 */
 async function run(iso, env, mock) {
-  const controller = { scheduledTime: Date.parse(iso), cron: "*/10 * * * *", noRetry() {} };
+  const controller = { scheduledTime: Date.parse(iso), cron: "*/2 * * * *", noRetry() {} };
   try {
     await worker.scheduled(controller, env);
   } finally {
@@ -89,6 +124,10 @@ async function run(iso, env, mock) {
 }
 
 const opsOf = (calls) => calls.map((c) => c.operation);
+
+/** 只保留指标查询里属于突发窗口的那些。 */
+const burstCalls = (calls) =>
+  calls.filter((c) => c.operation === "GetInstanceMetricData" && c.body.period === BURST_PERIOD);
 
 /** 收集一次运行里写出的所有日志行（log 与 error 合并），用来断言单位与数值。 */
 async function capturingLogs(fn) {
@@ -120,7 +159,8 @@ test("just under the 819.2 GiB stop line the instance is left running", async ()
   const mock = stubAws({ networkIn: STOP_LINE_GIB * GIB - MIB, networkOut: 0 });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+  // 两次月度查询 + 两次突发窗口查询，没有任何状态查询或动作。
+  assert.deepEqual(opsOf(mock.calls), new Array(4).fill("GetInstanceMetricData"));
 });
 
 test("just over the 819.2 GiB stop line the instance is stopped", async () => {
@@ -131,14 +171,22 @@ test("just over the 819.2 GiB stop line the instance is stopped", async () => {
   assert.match(lines.at(-1), /STOPPED at 819\.201 GiB month-to-date, over the 819\.200 GiB stop threshold \(1024 GiB quota x 0\.8\)/);
 });
 
-test("under the threshold it checks usage and does nothing else", async () => {
-  const mock = stubAws({ networkIn: 100 * GIB, networkOut: 200 * GIB });
+test("crossing the static line short-circuits the burst check", async () => {
+  // 已经确认要停，就没必要再花两次调用去问速率。
+  const mock = stubAws({ networkIn: 900 * GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+  assert.deepEqual(burstCalls(mock.calls), []);
+});
+
+test("under the threshold it checks usage and the recent rate, and nothing else", async () => {
+  const mock = stubAws({ networkIn: 100 * GIB, networkOut: 200 * GIB, recentIn: GIB });
+  await run("2026-08-15T12:00:00Z", baseEnv, mock);
+
+  assert.deepEqual(opsOf(mock.calls), new Array(4).fill("GetInstanceMetricData"));
   assert.deepEqual(
     mock.calls.map((c) => c.body.metricName).sort(),
-    ["NetworkIn", "NetworkOut"],
+    ["NetworkIn", "NetworkIn", "NetworkOut", "NetworkOut"],
   );
 });
 
@@ -156,11 +204,24 @@ test("metric queries use the documented request shape", async () => {
     "endTime", "instanceName", "metricName", "period", "startTime", "statistics", "unit",
   ]);
   assert.equal(metric.body.instanceName, "my-blog");
-  assert.equal(metric.body.period, 86400);
+  assert.equal(metric.body.period, MONTH_PERIOD);
   assert.equal(metric.body.unit, "Bytes");
   assert.deepEqual(metric.body.statistics, ["Sum"]);
   assert.equal(metric.body.startTime, Date.parse("2026-08-01T00:00:00Z") / 1000);
   assert.equal(metric.body.endTime, Date.parse("2026-08-15T12:00:00Z") / 1000);
+});
+
+test("the burst window is the trailing hour at 300-second granularity", async () => {
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
+  await run("2026-08-15T12:00:00Z", baseEnv, mock);
+
+  const now = Date.parse("2026-08-15T12:00:00Z") / 1000;
+  for (const call of burstCalls(mock.calls)) {
+    assert.equal(call.body.period, BURST_PERIOD);
+    assert.equal(call.body.endTime, now);
+    assert.equal(call.body.startTime, now - 3600);
+  }
+  assert.deepEqual(burstCalls(mock.calls).map((c) => c.body.metricName).sort(), ["NetworkIn", "NetworkOut"]);
 });
 
 test("both directions count toward the allowance", async () => {
@@ -205,6 +266,64 @@ test("a stop is not repeated while the instance is still stopping", async () => 
   assert.equal(opsOf(mock.calls).filter((op) => op === "StopInstance").length, 1);
 });
 
+// --- 突发闸门 -----------------------------------------------------------------
+
+test("a burst that would blow the quota before the next reaction stops the instance", async () => {
+  // 月度 700 GiB 远在 819.2 的静态线之下，但最近一小时烧掉了 690 GiB —— 按这个速率，
+  // 剩下的 324 GiB 撑不到半小时。静态线在这里毫无用处，因为它要等总量先越线。
+  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 690 * GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.deepEqual(opsOf(mock.calls), [
+    "GetInstanceMetricData",
+    "GetInstanceMetricData",
+    "GetInstanceMetricData",
+    "GetInstanceMetricData",
+    "GetInstanceState",
+    "StopInstance",
+  ]);
+  assert.match(lines.at(-1), /STOPPED at 700\.000 GiB month-to-date, burning 1646\.4 Mbps/);
+  assert.match(lines.at(-1), /324\.000 GiB of quota left = 28 min to overage, inside the 30 min reaction horizon/);
+});
+
+test("ordinary traffic at the same month-to-date total does not trip the gate", async () => {
+  // 同样是 700 GiB 月度用量，但最近一小时只有 10 GiB：按这个速率还能跑一天多。
+  const mock = stubAws({ networkIn: 700 * GIB, recentIn: 10 * GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"));
+  assert.deepEqual(lines, [
+    "my-blog: 700.000 GiB used month-to-date, under the 819.200 GiB stop threshold",
+  ]);
+});
+
+test("the burst rate divides by the data that landed, not by the window length", async () => {
+  // 指标有几分钟落库延迟，一小时的窗口里常常只有一部分数据点。300 GiB 落在 6 个点
+  // （半小时）里，真实速率是拿 1800 秒去除；用整个 3600 秒窗口去除会把它算成一半，
+  // 于是这次突发就被放过了 —— 而算低速率正是不安全的那个方向。
+  const mock = stubAws({ networkIn: 800 * GIB, recentIn: 300 * GIB, recentPoints: 6 });
+  await run("2026-08-15T12:00:00Z", baseEnv, mock);
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"), "half-covered window must still be read at full rate");
+});
+
+test("an idle instance with no recent data points is not treated as a burst", async () => {
+  // 最近一小时一个数据点都没有：速率无从谈起，绝不能因此停机。
+  const mock = stubAws({ networkIn: 800 * GIB, recentPoints: 0 });
+  await run("2026-08-15T12:00:00Z", baseEnv, mock);
+
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"));
+});
+
+test("zero month-to-date usage skips the burst check entirely", async () => {
+  const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
+  await run("2026-09-01T12:00:00Z", baseEnv, mock);
+
+  assert.deepEqual(burstCalls(mock.calls), []);
+});
+
+// --- 重启 ---------------------------------------------------------------------
+
 test("a reset allowance starts a stopped instance", async () => {
   // 新的计费月：月初至今归零，而实例还停在上个月那次停机的状态里。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
@@ -246,7 +365,7 @@ test("a stopped instance with traffic on the meter is left alone", async () => {
   const mock = stubAws({ state: "stopped", networkIn: 120 * GIB, networkOut: 80 * GIB });
   await run("2026-08-20T09:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+  assert.deepEqual(opsOf(mock.calls), new Array(4).fill("GetInstanceMetricData"));
 });
 
 test("zero usage on a running instance costs one state check and nothing else", async () => {
@@ -273,7 +392,14 @@ test("MANUAL_HOLD suppresses the start without suppressing the stop", async () =
   const stop = stubAws({ state: "running", networkIn: 900 * GIB });
   await run("2026-08-15T12:00:00Z", held, stop);
   assert.ok(opsOf(stop.calls).includes("StopInstance"));
+
+  // 突发闸门同样不受 hold 影响。
+  const burst = stubAws({ state: "running", networkIn: 700 * GIB, recentIn: 690 * GIB });
+  await run("2026-08-15T12:00:00Z", held, burst);
+  assert.ok(opsOf(burst.calls).includes("StopInstance"));
 });
+
+// --- 失败方向 -----------------------------------------------------------------
 
 test("an AWS failure throws, with the access key id scrubbed", async () => {
   const mock = stubAws({ fail: "GetInstanceMetricData" });
@@ -298,21 +424,64 @@ test("a failure on the stop call itself is not swallowed", async () => {
   );
 });
 
-test("an unreadable instance state throws rather than skipping the stop", async () => {
-  const mock = stubAws({ networkIn: 900 * GIB });
+test("an unreadable metric response throws instead of reading as zero traffic", async () => {
+  // 200 但没有 metricData。把它折算成 0 字节就等于报告「本月没用流量」——
+  // 那是唯一会让看门狗什么都不做的读数，指标侧一次降级就能让它一边报平安一边放任超额。
+  const mock = stubAws({ malformedMetrics: true });
+
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    /GetInstanceMetricData returned no metricData array for Network(In|Out)/,
+  );
+});
+
+test("an empty metricData array is still a legitimate zero", async () => {
+  // 跨月之后本来就没有数据点。严格化不能把这条正常路径一起拦掉，否则每月 1 号
+  // 那次重启永远发不出去。
+  const mock = stubAws({ state: "stopped" });
+  mock.calls.length = 0;
   const inner = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     const req = input instanceof Request ? input : new Request(input, init);
-    if (req.headers.get("X-Amz-Target")?.endsWith("GetInstanceState")) {
-      return Response.json({ state: {} });
+    if (req.headers.get("X-Amz-Target")?.endsWith("GetInstanceMetricData")) {
+      await inner(input.clone?.() ?? input, init); // 仍然记账
+      return Response.json({ metricData: [] });
     }
     return inner(input, init);
   };
 
+  await run("2026-09-01T00:00:00Z", baseEnv, mock);
+  assert.ok(opsOf(mock.calls).includes("StartInstance"));
+});
+
+test("an unreadable instance state still stops an over-limit instance", async () => {
+  // 已经确认越线了。此时 GetInstanceState 读不出状态，旧实现会让整轮抛异常结束 ——
+  // 一次已经确认的越线就这样漏掉一个 cron 周期。停机路径上的不确定性必须向「停」倾斜。
+  const mock = stubAws({ networkIn: 900 * GIB, unreadableState: true });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"));
+  assert.match(lines.join("\n"), /instance state unreadable .*GetInstanceState returned no state name.*erring toward the stop/);
+});
+
+test("a failing state check still stops an over-limit instance", async () => {
+  // 同一件事，但失败发生在 HTTP 层（凭据被轮换、IAM 策略被改）。
+  const mock = stubAws({ networkIn: 900 * GIB, fail: "GetInstanceState" });
+  await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"));
+});
+
+test("an unreadable instance state on the restart path throws rather than starting", async () => {
+  // 与停机路径相反：少启动一次只是站点晚几分钟回来，误启动一台操作者刻意停下的实例
+  // 则会开始烧流量。所以这个方向上的异常不接管。
+  const mock = stubAws({ networkIn: 0, networkOut: 0, unreadableState: true });
+
   await assert.rejects(
-    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    () => run("2026-09-01T00:00:00Z", baseEnv, mock),
     /GetInstanceState returned no state name/,
   );
+  assert.ok(!opsOf(mock.calls).includes("StartInstance"));
 });
 
 test("misconfiguration throws before any AWS call is made", async () => {

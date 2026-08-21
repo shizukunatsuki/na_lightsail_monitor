@@ -4,10 +4,26 @@ import { AwsClient } from "aws4fetch";
 const API_TARGET = "Lightsail_20161128";
 
 /**
- * 每个指标数据点的秒数。取一天，可以把「月初至今」的查询控制在每个指标约 31 个
- * 数据点；若改成按小时，会返回约 744 个，光是解析 JSON 就会撑爆 10ms 的 CPU 预算。
+ * 「月初至今」查询的数据点秒数。取一天，可以把这个查询控制在每个指标约 31 个数据点；
+ * 若改成按小时，会返回约 744 个，光是解析 JSON 就会撑爆 10ms 的 CPU 预算。
  */
 const METRIC_PERIOD_SECONDS = 86400;
+
+/**
+ * 突发闸门的观察窗口与粒度：最近一小时，300 秒一个点，每个指标最多 13 个数据点。
+ * 300 秒是 Lightsail 的原生上报粒度，取得再细也不会有更多信息。
+ */
+const BURST_WINDOW_SECONDS = 3600;
+const BURST_PERIOD_SECONDS = 300;
+
+/**
+ * 反应视野：按当前速率剩余额度撑不过这么久，就立刻停机，不等月度总量越过 THRESHOLD。
+ *
+ * 这个数必须覆盖一整个检测回路 —— cron 间隔（`wrangler.jsonc` 里是 2 分钟）＋ 指标落库
+ * 延迟（几分钟）＋ StopInstance 真正断流的时间（约一分钟）。取 30 分钟，是三者之和的
+ * 两倍有余。**改动 cron 间隔时必须回来重新审视这个数。**
+ */
+const REACTION_HORIZON_SECONDS = 1800;
 
 /** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
 const PLACEHOLDER = "CHANGE_ME";
@@ -41,9 +57,9 @@ export function readConfig(env) {
     if (!env[name]) throw new Error(`Missing required binding ${name}`);
   }
 
-  // 仓库自带的占位值是非空的，所以上面那道检查会放行它，之后每次触发都会在
-  // Lightsail 侧失败。留在日志里的就是每天 144 条干巴巴的 404，很难让人立刻意识到
-  //「你压根没填实例名」。所以在这里直接把话说清楚。
+  // 上面那道检查只看非空，所以 fork 本仓库、把这两项换成占位串却忘了真正填写的人能一路
+  // 放行，之后每次触发都在 Lightsail 侧失败。留在日志里的就是每天几百条干巴巴的 404，
+  // 很难让人立刻意识到「你压根没填实例名」。所以在这里直接把话说清楚。
   //
   // 刻意使用精确比较：真有实例就叫 `change_me_later`，那是别人正经的实例名，不能拦。
   for (const name of ["AWS_REGION", "INSTANCE_NAME"]) {
@@ -131,8 +147,9 @@ async function lightsail(client, config, operation, body) {
 
   if (!res.ok) {
     // SigV4 的拒绝响应会回显 credential scope，其中嵌着 access key id，所以要在这条
-    // 消息进入日志之前把它抹掉。
-    const detail = (await res.text()).slice(0, 500).replaceAll(client.accessKeyId, "[redacted]");
+    // 消息进入日志之前把它抹掉。先脱敏再截断：反过来的话，key 正好横跨 500 字节边界时
+    // 会残留半截。
+    const detail = (await res.text()).replaceAll(client.accessKeyId, "[redacted]").slice(0, 500);
     throw new Error(`Lightsail ${operation} failed: HTTP ${res.status} ${detail}`);
   }
   return res;
@@ -141,8 +158,9 @@ async function lightsail(client, config, operation, body) {
 /**
  * 实例当前的状态名，例如 "running" / "stopped"。
  *
- * 响应无法识别时抛错，而不是返回 undefined：停机路径把「不是 running」当作无事可做，
- * 所以一个悄悄缺失的状态会导致此后每一次触发都放任实例超额运行下去。
+ * 响应无法识别时抛错，而不是返回 undefined：重启路径把「不是 stopped」当作无事可做，
+ * 而停机路径把「不是 running」当作无事可做 —— 一个悄悄缺失的状态在两边都会被读成
+ * 「什么都不用做」。谁来承接这个异常，由调用方按方向决定：见 `stopOverLimit`。
  *
  * @param {AwsClient} client
  * @param {Config} config
@@ -161,18 +179,23 @@ async function getInstanceState(client, config) {
 }
 
 /**
- * 单个指标的月初至今总量，单位字节。
+ * 单个指标在给定窗口内的总量（字节），以及实际落库的数据点个数。
+ *
+ * `points` 不是调试信息，突发闸门要用它当速率的分母：指标有几分钟落库延迟，窗口尾部
+ * 通常还是空的，拿窗口长度去除会把速率算低 —— 而算低正是不安全的那个方向。
+ *
  * @param {AwsClient} client
  * @param {Config} config
  * @param {"NetworkIn" | "NetworkOut"} metricName
  * @param {{ startTime: number, endTime: number }} range
- * @returns {Promise<number>}
+ * @param {number} period
+ * @returns {Promise<{ bytes: number, points: number }>}
  */
-async function sumMetric(client, config, metricName, range) {
+async function sumMetric(client, config, metricName, range, period) {
   const res = await lightsail(client, config, "GetInstanceMetricData", {
     instanceName: config.instanceName,
     metricName,
-    period: METRIC_PERIOD_SECONDS,
+    period,
     startTime: range.startTime,
     endTime: range.endTime,
     unit: "Bytes",
@@ -181,11 +204,97 @@ async function sumMetric(client, config, metricName, range) {
 
   const { metricData } = await res.json();
 
+  // 严格要求它是个数组。成功响应里 `metricData` 一定存在，没有数据时是空数组；字段缺失
+  // 或不是数组意味着这份响应读不懂 —— 把它折算成 0 字节，就等于报告「本月没用流量」，
+  // 而那是唯一会让看门狗什么都不做的读数。指标侧一次降级，就能让它一边报平安一边放任
+  // 实例烧到超额。读不懂就响亮地失败，与 getInstanceState 保持同一种姿态。
+  if (!Array.isArray(metricData)) {
+    throw new Error(`GetInstanceMetricData returned no metricData array for ${metricName}`);
+  }
+
   // 数据点既不保证有序也不保证连续，所以要累加而不是按下标取值。求总量与顺序无关；
   // 缺口本身就代表那段时间没有流量。
-  let total = 0;
-  for (const point of metricData ?? []) total += point.sum ?? 0;
-  return total;
+  let bytes = 0;
+  for (const point of metricData) bytes += point.sum ?? 0;
+  return { bytes, points: metricData.length };
+}
+
+/**
+ * 停机。调用它就意味着「已经确认必须停」，所以这里的每一个不确定性都向「停」倾斜。
+ *
+ * 先查状态是为了幂等 —— 不对一个已经停下（或正在停）的实例重复发停机。但那次查询本身
+ * 会失败，而让它的失败中断整轮，等于让一次已经确认的越线白白漏掉一个 cron 周期。所以
+ * 状态读不到时照停不误：重复停机的代价是一条错误日志，漏停的代价是账单。
+ *
+ * （状态读不到而实例其实已经停了，这里发出的 StopInstance 可能被 Lightsail 拒绝，于是
+ * 整轮以异常结束 —— 那是响亮的，而且只会发生在 GetInstanceState 本就坏掉的时候，本来
+ * 就该有人去看一眼。）
+ *
+ * @param {AwsClient} client
+ * @param {Config} config
+ * @param {number} usedGib
+ * @param {string} reason 触发停机的原因，会原样进入日志
+ */
+async function stopOverLimit(client, config, usedGib, reason) {
+  const state = await getInstanceState(client, config).catch((err) => {
+    console.error(`${config.instanceName}: instance state unreadable (${err.message}); erring toward the stop`);
+    return null;
+  });
+
+  if (state !== null && state !== "running") {
+    console.log(
+      `${config.instanceName}: ${usedGib.toFixed(3)} GiB used, ${reason}, but instance is "${state}"; nothing to do`,
+    );
+    return;
+  }
+
+  await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
+  console.error(`${config.instanceName}: STOPPED at ${usedGib.toFixed(3)} GiB month-to-date, ${reason}`);
+}
+
+/**
+ * 速率闸门。月初至今是个滞后的总量，它看不出「最近一小时正在以 2 Gbps 烧」。
+ *
+ * 默认的 20% 余量（1024 GiB × (1 − 0.8) = 204.8 GiB）在 1 Gbps 下只够烧 29 分钟，
+ * 2 Gbps 下 15 分钟 —— 并不比一个检测回路长多少。所以除了「总量越线」这条静态线，还要
+ * 问一个动态问题：按现在的速率，剩余额度还能撑多久？撑不过一个反应视野就现在停。
+ *
+ * 比较的目标是**整份额度**而不是 THRESHOLD 那条保守的早停线：这道闸门问的是「会不会在
+ * 下一次能反应过来之前冲过配额」，而配额才是开始计费的地方。
+ *
+ * @param {AwsClient} client
+ * @param {Config} config
+ * @param {{ startTime: number, endTime: number }} monthRange
+ * @param {number} usedBytes 月初至今总量，字节
+ * @returns {Promise<string | null>} 需要停机时返回原因，否则 null
+ */
+async function burstCheck(client, config, monthRange, usedBytes) {
+  const { endTime } = monthRange;
+  const startTime = Math.max(monthRange.startTime, endTime - BURST_WINDOW_SECONDS);
+
+  // 跨月后的头几分钟，窗口会短于一个数据点，测不出速率。那时月度用量也必然离额度极远。
+  if (endTime - startTime < BURST_PERIOD_SECONDS) return null;
+
+  const range = { startTime, endTime };
+  const [recentIn, recentOut] = await Promise.all([
+    sumMetric(client, config, "NetworkIn", range, BURST_PERIOD_SECONDS),
+    sumMetric(client, config, "NetworkOut", range, BURST_PERIOD_SECONDS),
+  ]);
+
+  // 分母取「实际落库的点数 × 粒度」，理由见 sumMetric 里 points 的说明。
+  const covered = Math.max(recentIn.points, recentOut.points) * BURST_PERIOD_SECONDS;
+  const bytesPerSecond = covered > 0 ? (recentIn.bytes + recentOut.bytes) / covered : 0;
+  if (bytesPerSecond <= 0) return null;
+
+  const remainingBytes = config.quotaGib * BYTES_PER_GIB - usedBytes;
+  const secondsToQuota = remainingBytes / bytesPerSecond;
+  if (secondsToQuota >= REACTION_HORIZON_SECONDS) return null;
+
+  const mbps = (bytesPerSecond * 8) / 1e6;
+  return (
+    `burning ${mbps.toFixed(1)} Mbps with ${(remainingBytes / BYTES_PER_GIB).toFixed(3)} GiB of quota left` +
+    ` = ${Math.round(secondsToQuota / 60)} min to overage, inside the ${REACTION_HORIZON_SECONDS / 60} min reaction horizon`
+  );
 }
 
 export default {
@@ -208,7 +317,7 @@ export default {
       secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
       service: "lightsail",
       region: config.region,
-      // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在十分钟后，这个次数足够了，
+      // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在两分钟后，这个次数足够了，
       // 同时也能让故障及时暴露出来。
       retries: 2,
     });
@@ -218,9 +327,9 @@ export default {
     const now = new Date(controller.scheduledTime ?? Date.now());
 
     const range = usageWindow(now);
-    const [inBytes, outBytes] = await Promise.all([
-      sumMetric(client, config, "NetworkIn", range),
-      sumMetric(client, config, "NetworkOut", range),
+    const [monthIn, monthOut] = await Promise.all([
+      sumMetric(client, config, "NetworkIn", range, METRIC_PERIOD_SECONDS),
+      sumMetric(client, config, "NetworkOut", range, METRIC_PERIOD_SECONDS),
     ]);
 
     // 虽然只有出向超量才计费，但两个方向都在消耗额度。
@@ -228,25 +337,28 @@ export default {
     // 按 2^30 换算，使单位体系与 Lightsail `GetBundles` 的 `transferPerMonthInGb` 对齐：
     // 该字段把「1 TB」记为 1024，同一响应里的 `ramSizeInGb: 0.5` 也只可能是 512 MiB，
     // 两处一致地指向 GiB。于是 QUOTA_GIB 可以直接填那个数字，不需要任何换算。
-    // 安全裕度不再来自单位错配，改由 THRESHOLD 单独提供。
-    const usedGib = (inBytes + outBytes) / BYTES_PER_GIB;
+    // 安全裕度不再来自单位错配，改由 THRESHOLD 与突发闸门共同提供。
+    const usedBytes = monthIn.bytes + monthOut.bytes;
+    const usedGib = usedBytes / BYTES_PER_GIB;
     const limitGib = config.quotaGib * config.threshold;
 
     if (usedGib >= limitGib) {
-      // 越线了。先查状态，这样第二次触发绝不会对一个已停机的实例再发一次停机。
-      const state = await getInstanceState(client, config);
-      if (state !== "running") {
-        console.log(
-          `${config.instanceName}: ${usedGib.toFixed(3)} GiB used, over threshold but instance is "${state}"; nothing to do`,
-        );
-        return;
-      }
-
-      await lightsail(client, config, "StopInstance", { instanceName: config.instanceName });
-      console.error(
-        `${config.instanceName}: STOPPED at ${usedGib.toFixed(3)} GiB month-to-date, over the ${limitGib.toFixed(3)} GiB stop threshold (${config.quotaGib} GiB quota x ${config.threshold})`,
+      await stopOverLimit(
+        client,
+        config,
+        usedGib,
+        `over the ${limitGib.toFixed(3)} GiB stop threshold (${config.quotaGib} GiB quota x ${config.threshold})`,
       );
       return;
+    }
+
+    // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
+    if (usedBytes > 0) {
+      const burst = await burstCheck(client, config, range, usedBytes);
+      if (burst) {
+        await stopOverLimit(client, config, usedGib, burst);
+        return;
+      }
     }
 
     console.log(
@@ -261,8 +373,8 @@ export default {
     // 「恰好零字节」是查询状态的闸门。运行中的实例几分钟内必然产生*某些*流量 —— DNS、
     // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
     // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
-    // 约 4300 次调用。
-    if (inBytes + outBytes > 0) return;
+    // 约两万次调用。
+    if (usedBytes > 0) return;
 
     if (config.manualHold) {
       console.log(
@@ -271,6 +383,9 @@ export default {
       return;
     }
 
+    // 这里不接管 getInstanceState 的异常：与停机路径相反，重启路径上的不确定性应该向
+    // 「什么都不做」倾斜 —— 少启动一次只是站点晚几分钟回来，误启动一台操作者刻意停下的
+    // 实例则会开始烧流量。
     const state = await getInstanceState(client, config);
     if (state !== "stopped") {
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
@@ -279,6 +394,8 @@ export default {
     }
 
     await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
-    console.log(`${config.instanceName}: transfer allowance has reset, instance started`);
+    // 只陈述观察到的事实：handler 知道的是「月初至今为零且实例是 stopped」，它并没有
+    // 独立核实过额度重置这件事。
+    console.log(`${config.instanceName}: no transfer recorded this month and instance was stopped; started`);
   },
 };

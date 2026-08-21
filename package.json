@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
-    "deploy": "npx wrangler deploy",
+    "deploy": "npm test && npx wrangler deploy",
     "test": "node --test"
   },
   "dependencies": {
@@ -14,5 +14,8 @@
   },
   "devDependencies": {
     "wrangler": "^4.123.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

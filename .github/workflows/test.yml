@@ -1,0 +1,21 @@
+# 测试闸门。Cloudflare Workers Builds 在 push 到 main 时独立地构建部署，它不会等这个
+# workflow —— 真正拦住坏部署的是 package.json 里 `deploy` 脚本前置的 `npm test`。
+# 这里的作用是让失败在 PR 和 commit 上可见，而不必去翻 Cloudflare 的构建日志。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm test
