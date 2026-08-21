@@ -46,7 +46,11 @@ function scenario(r, stratum) {
     // 注入 AWS 侧失败与畸形响应。不生成这些，整个错误处理路径就从未被探索过 ——
     // 变异测试正是在这里漏掉了「去掉脱敏」和「去掉畸形 metricData 检查」两个缺陷。
     failOp: stratum === "failure" || r() < 0.15 ? OPS[Math.floor(r() * OPS.length)] : null,
-    failStatus: r() < 0.5 ? 400 : 500,
+    // 400 / 403 / 500 三档都要生成。Lightsail 的两份文档对 AccessDeniedException 给的
+    // 状态码并不一致（按操作那份写 400，Common Errors 那份写 403），而重试只认 5xx 和
+    // 429 —— 400 与 403 都是终局失败，500 会被重试三次。此前只生成 400/500，等于把 403
+    // 那条路径整个排除在外。
+    failStatus: [400, 403, 500][Math.floor(r() * 3)],
     badShape:
       r() < 0.12
         ? ["notArray", "unrelated", "stringSum", "negativeSum"][Math.floor(r() * 4)]
