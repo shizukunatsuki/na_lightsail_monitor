@@ -12,27 +12,19 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
-  BURST_WINDOW_SECONDS,
+  ASSUMED_LAG_SECONDS,
+  BUCKET_CLOSE_SECONDS,
   BURST_PERIOD_SECONDS,
-  REACTION_HORIZON_SECONDS,
+  BURST_WINDOW_SECONDS,
+  CRON_INTERVAL_SECONDS,
+  DETECTION_LOOP_SECONDS,
+  MAX_DATAPOINTS_PER_QUERY,
   MAX_TOLERABLE_LAG_SECONDS,
   METRIC_PERIOD_SECONDS,
-} from "../src/index.js";
-
-/**
- * 设计假设：指标落库延迟按 10 分钟的悲观值取。
- *
- * **实测（2026-08-22，ap-northeast-1，5 次独立采样跨指标跨窗口）：约 0.9 分钟**，比这个
- * 悲观值快一个数量级。这里刻意**不**跟着调小 —— 一次采样不等于分布，而参数按悲观值定
- * 意味着真实情况下余量更大，方向是安全的。日志里的 `meter ... behind` 会持续校准它。
- */
-const ASSUMED_LAG_SECONDS = 600;
-
-/** 桶必须先关闭才可能被查到，最坏是一整个粒度。 */
-const BUCKET_CLOSE_SECONDS = BURST_PERIOD_SECONDS;
-
-/** StopInstance 发出到真正断流。 */
-const STOP_PROPAGATION_SECONDS = 60;
+  METRIC_UNIT,
+  REACTION_HORIZON_SECONDS,
+  STOP_PROPAGATION_SECONDS,
+} from "../src/tuning.js";
 
 function cronIntervalSeconds() {
   const config = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
@@ -43,9 +35,15 @@ function cronIntervalSeconds() {
   return Number(every[1]) * 60;
 }
 
+test("the declared cron interval matches wrangler.jsonc", () => {
+  // CRON_INTERVAL_SECONDS 住在 src/tuning.js 里，只是一份**声明** —— 真身是
+  // wrangler.jsonc 的 triggers.crons。所有视野和门槛都从那份声明推导，所以两边一旦
+  // 走散，推导出来的每一个余量都是假的。这条把它们钉在一起。
+  assert.equal(CRON_INTERVAL_SECONDS, cronIntervalSeconds());
+});
+
 test("the reaction horizon covers the whole detection loop with margin", () => {
-  const loop =
-    BUCKET_CLOSE_SECONDS + ASSUMED_LAG_SECONDS + cronIntervalSeconds() + STOP_PROPAGATION_SECONDS;
+  const loop = DETECTION_LOOP_SECONDS;
   const margin = REACTION_HORIZON_SECONDS / loop;
 
   assert.ok(
@@ -59,7 +57,7 @@ test("the lag alarm fires before the burst gate stops being able to keep up", ()
   // 告警必须挂在**检测回路**上（及时性），不能挂在观察窗口上（分辨率）—— 两者会在改
   // cron 时朝不同方向走。这里的判据是：延迟容忍上限必须严格小于「视野减去回路里除延迟
   // 之外的部分」，也就是延迟吃光余量之前就得响。
-  const fixedLoop = BUCKET_CLOSE_SECONDS + cronIntervalSeconds() + STOP_PROPAGATION_SECONDS;
+  const fixedLoop = BUCKET_CLOSE_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS;
   const lagBudget = REACTION_HORIZON_SECONDS / 2 - fixedLoop;
 
   assert.ok(
@@ -92,4 +90,56 @@ test("both metric queries stay inside what the API accepts", () => {
   }
   // 300 秒是 Lightsail 的原生上报粒度，突发窗口取得再细也不会有更多信息。
   assert.equal(BURST_PERIOD_SECONDS, 300);
+});
+
+test("the lag alarm's real trip point survives bucket quantisation", () => {
+  // 延迟只能按整桶观测：日志读到的是「最新一个完整的桶结束了多久」，取值只能是
+  // 0、300、600 … 而且总不小于真实延迟。所以门槛真正的跳变点，是它下面最近的那一档 ——
+  // 门槛 720 秒意味着「真实延迟超过 600 秒就告警」，而不是超过 720。
+  //
+  // 这条差别必须朝安全的方向：真正跳变的那个真实延迟，仍要落在预算之内。
+  const step = BURST_PERIOD_SECONDS;
+  const trip = Math.floor((MAX_TOLERABLE_LAG_SECONDS - 1) / step) * step;
+  const budget =
+    REACTION_HORIZON_SECONDS / 2 - (BUCKET_CLOSE_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS);
+  assert.ok(
+    trip <= budget,
+    `量化之后，真实延迟要到 ${trip / 60} 分钟才告警，已经超过 ${(budget / 60).toFixed(1)} 分钟的预算`,
+  );
+});
+
+test("the burst window is a whole number of buckets", () => {
+  // 不是整数倍时，窗口尾部会出现一个只覆盖了一部分 period 的桶，而它带回来的是整桶的
+  // 字节。速率分母已经改成按实际覆盖秒数算，所以即便破坏这条也不会失守 —— 但没有理由
+  // 先把它破坏掉，而且 `win N/M` 那个分母也只有在整数倍时才读得通。
+  assert.equal(BURST_WINDOW_SECONDS % BURST_PERIOD_SECONDS, 0);
+});
+
+test("the requested metric unit is the one the byte maths assumes", () => {
+  // unit 传错时 AWS 回 HTTP 200 + metricName 正确回显 + 空数组（2026-08-22 实测，
+  // Bits / Count / Percent / Seconds / Megabytes 五种都是这个结果），响应侧完全无从分辨。
+  // 整套换算都按字节做，所以这个值只能是 Bytes。
+  assert.equal(METRIC_UNIT, "Bytes");
+});
+
+test("ASSUMED_LAG_SECONDS stays observable at the burst granularity", () => {
+  // 设计假设的延迟必须大于一个桶，否则它连一次观测都撑不满，`meter` 那个字段就没有
+  // 任何校准价值。
+  assert.ok(ASSUMED_LAG_SECONDS >= BURST_PERIOD_SECONDS);
+  assert.equal(DETECTION_LOOP_SECONDS,
+    BUCKET_CLOSE_SECONDS + ASSUMED_LAG_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS);
+});
+
+test("both configured queries stay under the API's datapoint cap", () => {
+  // 上限实测是 1440，而**超限不报错**：HTTP 200、metricName 正常回显、metricData 空数组，
+  // 落地就是 0 字节。所以这条不是性能优化，是防止整个看门狗静默失效。
+  //
+  // 月度查询按最长的月份（31 天）算最坏情况。
+  const monthWorstCase = Math.ceil((31 * 86400) / METRIC_PERIOD_SECONDS);
+  assert.ok(
+    monthWorstCase <= MAX_DATAPOINTS_PER_QUERY,
+    `月度查询最坏要 ${monthWorstCase} 个数据点，超过上限 ${MAX_DATAPOINTS_PER_QUERY}，会静默读到 0 字节`,
+  );
+  const burstPoints = Math.ceil(BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS);
+  assert.ok(burstPoints <= MAX_DATAPOINTS_PER_QUERY, `突发查询要 ${burstPoints} 个数据点，超过上限`);
 });

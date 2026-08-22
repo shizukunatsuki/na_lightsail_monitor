@@ -1,113 +1,39 @@
 import { AwsClient } from "aws4fetch";
 
-/** Lightsail JSON-RPC 的 target 前缀，操作名形如 `${API_TARGET}.${Operation}`。 */
-const API_TARGET = "Lightsail_20161128";
+// 全部调参常量集中在 src/tuning.js —— 每个数的推导、实测出处和相互约束都写在那里。
+// 本文件只 import，不就地定义，也不内联新的魔数：没有名字的数字既不会被复核，也没法
+// 被 test/tuning.test.js 那样的关系检查引用。
+import {
+  API_TARGET,
+  AWS_RETRIES,
+  BURST_PERIOD_SECONDS,
+  BURST_WINDOW_SECONDS,
+  BYTES_PER_GIB,
+  DURATION_CEILING_SECONDS,
+  DURATION_HOURS_CUTOFF_SECONDS,
+  MAX_QUOTA_GIB,
+  MAX_DATAPOINTS_PER_QUERY,
+  MAX_TIMESTAMP_SKEW_SECONDS,
+  MAX_TOLERABLE_LAG_SECONDS,
+  METRIC_PERIOD_SECONDS,
+  METRIC_UNIT,
+  MIN_WINDOW_SECONDS,
+  MONTH_BEHIND_TOLERANCE_SECONDS,
+  PLACEHOLDER,
+  PROJECTION_MIN_ELAPSED,
+  REACTION_HORIZON_SECONDS,
+  ZERO_READING_GRACE_SECONDS,
+} from "./tuning.js";
 
 /**
- * 「月初至今」查询的数据点秒数。取一天，每个指标约 31 个数据点。
+ * 这个状态下计量表**应该**看得见流量：跑着的实例几分钟内必然产生 DNS、NTP、后台扫描
+ * 之类的字节，读不到数据只可能是量的那一侧出了问题。状态读不出来（null）时也按「应该
+ * 看得见」处理 —— 宁可多喊一声，不要把一次真的失明藏进沉默里。
  *
- * **实测（2026-08-22，ap-northeast-1）：这个粒度不存在「当天盲区」。** API 会为尚未结束
- * 的今天返回一个部分聚合的桶 —— 查询返回的最新桶起点就是今天 00:00 UTC，`sum` 是今天
- * 到此刻为止的量。所以「桶必须关闭后才可查」这条只适用于 300 秒那一档，不适用于这里。
- * 下面 `scheduled` 里那两条月度读数新鲜度告警仍然保留：零成本，而且能在 AWS 哪天改变
- * 这个行为时立刻响。
- *
- * 至于为什么不用 3600：只是数据点少、解析便宜，**不是**因为 744 个点会撑爆 CPU 预算 ——
- * 那个说法曾经写在这里，是错的。线上实测每次触发的 CPU 时间 P50 1.68 ms、P99 2.57 ms
- * （免费版上限 10 ms），余量充足；拿本机的 JSON.parse 耗时去推断 Workers 运行时没有意义。
+ * 两处判断共用它：突发窗口零数据点、月度读数恰为零。这两处问的是同一个问题，此前各写
+ * 各的，其中一处还完全没有问。
  */
-export const METRIC_PERIOD_SECONDS = 86400;
-
-/**
- * 突发闸门的观察窗口与粒度：最近半小时，300 秒一个点。300 秒是 Lightsail 的原生上报
- * 粒度，取得再细也不会有更多信息。
- *
- * 窗口长度是被**稀释**和**落库延迟**两头夹出来的，不是随手取的整数：
- *
- * - 太长会稀释。速率是窗口内的平均值，所以一场刚开始 5 分钟的突发，在一小时的窗口里
- *   只显出真实速率的十二分之一。跳闸时的剩余余量（λ = 有效可见延迟）：
- *     `T >= W`（不再被稀释）：余量 = `H - λ`，与速率和窗口都无关；
- *     `T < W`（仍在稀释区）：余量 = `t_exh*H/(H+W-λ) - λ`。
- *   数值模拟验证过。W=60 分钟、5 Gbps 时余量实测是**负值**（配额烧完之后才跳闸），
- *   W=30 分钟约 +12 分钟 —— 这才是取 30 而不是 60 的实际依据。
- *
- *   （这里曾经写着「余量 = t_exh*H/(H+W-L)，与速率无关，W=60 时还剩 7 分钟」。那个式子
- *   漏掉了「月度用量读数本身也滞后 λ」，六组算例全部对不上；那个「7 分钟余量」实测是
- *   负的 —— 把失败写成了「还有余量」。README 早已更正，这段注释一度没跟上。）
- * - 太短会瞎。窗口整个落在落库延迟的阴影里就一个数据点都没有，闸门直接失效。W=20 分钟
- *   在延迟 20 分钟时归零；W=30 分钟即便延迟到 20 分钟仍有 2 个点。
- *
- * 30 分钟是这两条曲线的交点。**它只影响反应快慢，不影响灵敏度**——跳闸判据
- * `速率 > 剩余额度 / 视野` 里没有 W，所以缩短窗口不会让闸门更容易误报。
- */
-export const BURST_WINDOW_SECONDS = 1800;
-export const BURST_PERIOD_SECONDS = 300;
-
-/**
- * 反应视野：按当前速率剩余额度撑不过这么久，就立刻停机，不等月度总量越过 THRESHOLD。
- *
- * **实测校正（2026-08-22）**：300 秒桶在**关闭那一刻就已经是终值**，不需要额外等待落库；
- * 尚未关闭的桶也会被返回（内容按约每分钟一档增长）。所以回路里「落库延迟」那一项在实测
- * 条件下接近零，真实回路约 16 分钟而不是下面按悲观值算的 26 分钟。参数不跟着调小 ——
- * 按悲观值定意味着真实余量更大，方向是安全的。
- *
- * 这个数必须覆盖一整个检测回路 —— 桶必须先关闭（≤ 300 秒）＋ 指标落库延迟 ＋ cron 间隔
- * （`wrangler.jsonc` 里是 10 分钟）＋ StopInstance 真正断流的时间（约一分钟）。按落库延迟
- * 10 分钟算，回路是 26 分钟，取 60 分钟得到 2.3 倍余量。
- *
- * **改动 cron 间隔时必须回来重新审视这个数。** cron 是回路里最大的一项：两分钟一次时
- * 回路只有 18 分钟，30 分钟的视野就够了；改成十分钟一次之后回路变成 26 分钟，同样的
- * 30 分钟只剩 1.15 倍余量，而落库延迟一旦到 15 分钟就直接跌破 1.0 —— 额度会在闸门能
- * 动手之前烧完。（cron 表达式不写在这里：`*` 加 `/` 会把这段块注释提前闭合。）
- *
- * 它同时是闸门唯一的灵敏度旋钮：跳闸判据等价于 `速率 > 剩余额度 / 视野`，所以调大它
- * 会线性地降低触发所需的速率。60 分钟意味着空表时要约 2.4 Gbps、用到 800 GiB 时约
- * 534 Mbps 才跳闸 —— 对一台个人站实例，这两个数仍然远在正常业务之上。想更保守就继续
- * 调大这个数（代价是可能掐掉一次合法的大流量传输），不要去动 BURST_WINDOW_SECONDS。
- */
-export const REACTION_HORIZON_SECONDS = 3600;
-
-/**
- * 指标落库延迟的容忍上限。超过它就报警 —— 此时突发闸门已经追不上一场满速突发了。
- *
- * **这个数是从检测回路推出来的，不是从观察窗口推出来的。** 两者管的是不同的事：窗口管
- * 分辨率（够不够几个数据点算速率），回路管及时性（跳闸时还剩多少额度）。
- *
- * 推导用的是和视野同一条规则 —— 回路必须留在视野的一半以内（即 2 倍余量）：回路里除
- * 延迟之外的固定部分是 桶关闭 300 + cron 600 + 停机生效 60 = 960 秒，于是延迟上限是
- * 3600/2 − 960 = 840 秒。取 12 分钟，比这个上限再早一点，也比「5 Gbps 下真的守不住」
- * 的经验临界点（16 分钟）早四分钟。`test/tuning.test.js` 会把这条关系钉住。
- *
- * 早先这个门槛写成 `BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS`（20 分钟）。cron 是
- * 两分钟一次时临界点在 25 分钟，20 分钟的告警是**提前**的，没问题；cron 放宽到十分钟
- * 之后临界点降到 16 分钟，同一个 20 分钟就变成了**迟到四分钟**的告警 —— 延迟落在
- * [16, 20) 分钟这一段时，设计已经失效而没有任何提示。所以它必须跟着 cron 和视野一起
- * 复核，而不能挂在窗口上。
- */
-export const MAX_TOLERABLE_LAG_SECONDS = 720;
-
-/**
- * 时间戳与查询终点之间允许的最大偏离，超过就当这个时间戳不可用。
- *
- * 防的是「是数字，但量级错了」——例如毫秒而不是 Unix 秒。此前唯一的检查是
- * `typeof === "number"`，于是毫秒时间戳会让 `endTime − (newest + 300)` 变成一个巨大的
- * 负数，被 `Math.max(0, …)` 钳到 0：**staleness 检测整体失效，而日志还宣称数据很新鲜**。
- * 这与本项目已经修过的静默失明是同一类（读数存在、但语义错误），而 README 自己就写着
- * 「多乘或少乘一个 1000 是这里的经典 bug」—— 当时只防了「不是数字」那一半。
- *
- * 取 400 天：比最长的查询窗口（一个月）宽得多，也覆盖了 3600 秒粒度 455 天的保留期，
- * 不会误伤任何真实时间戳；而毫秒时间戳会偏离约五万年，隔着几个数量级。
- */
-const MAX_TIMESTAMP_SKEW_SECONDS = 400 * 86400;
-
-/** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
-const PLACEHOLDER = "CHANGE_ME";
-
-/**
- * 一个 GiB 的字节数（2^30）。整套单位体系都以它为基准，与 Lightsail `GetBundles` 返回的
- * `transferPerMonthInGb` 对齐 —— 详见下面 `scheduled` 里的换算注释。
- */
-const BYTES_PER_GIB = 1024 ** 3;
+const meterShouldSeeTraffic = (state) => state === "running" || state === null;
 
 /**
  * @typedef {object} Config
@@ -144,13 +70,8 @@ export function readConfig(env) {
     }
   }
 
-  // 上界不是随手定的：超过它之后 `quotaGib * BYTES_PER_GIB` 就落到 Number 的安全整数
-  // 范围之外，字节比较开始丢精度；再大一点直接溢出成 Infinity，于是停机线变成一个永远
-  // 够不到的数 —— 一个看起来在跑、实际上什么都不做的看门狗。这正是 THRESHOLD 那条上界
-  // 要防的东西，QUOTA_GIB 此前却没有对应的防护。
-  //
-  // 8 PiB/月大约是 Lightsail 最大套餐的四千倍，不会误伤任何真实配置。
-  const MAX_QUOTA_GIB = Number.MAX_SAFE_INTEGER / BYTES_PER_GIB;
+  // 上界的推导见 tuning.js 里 MAX_QUOTA_GIB 的说明：越过它之后字节比较开始丢精度，
+  // 停机线会变成一个永远够不到的数。
   const quotaGib = Number(env.QUOTA_GIB);
   if (!Number.isFinite(quotaGib) || quotaGib <= 0 || quotaGib > MAX_QUOTA_GIB) {
     throw new Error(
@@ -209,12 +130,6 @@ export function monthElapsedFraction(now) {
 }
 
 /**
- * 月初的头几个小时里，「月初至今」的样本太短，外推出来的整月用量会剧烈跳动。
- * 走过这个比例（约 15 小时）之前不给预测，宁可少一个字段也不给一个会误导人的数。
- */
-const PROJECTION_MIN_ELAPSED = 0.02;
-
-/**
  * 人可读的时长。日志是给人扫的，不是给机器解析的。
  *
  * 导出只为了能直接做单元测试：它唯一的调用点是正常那一行，而那一行只在
@@ -228,9 +143,8 @@ const PROJECTION_MIN_ELAPSED = 0.02;
 export function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return "never";
   if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
-  if (seconds < 48 * 3600) return `${(seconds / 3600).toFixed(1)} h`;
-  // 超过 90 天就没有区分意义了 —— 额度每月都会重置，「还能撑 5317 天」只是噪音。
-  if (seconds > 90 * 86400) return "> 90 d";
+  if (seconds < DURATION_HOURS_CUTOFF_SECONDS) return `${(seconds / 3600).toFixed(1)} h`;
+  if (seconds > DURATION_CEILING_SECONDS) return "> 90 d";
   return `${(seconds / 86400).toFixed(1)} d`;
 }
 
@@ -258,7 +172,7 @@ function formatUsage(config, usedGib) {
  */
 export function usageWindow(now) {
   const startTime = Math.floor(monthStartMs(now) / 1000);
-  const endTime = Math.max(Math.floor(now.getTime() / 1000), startTime + 60);
+  const endTime = Math.max(Math.floor(now.getTime() / 1000), startTime + MIN_WINDOW_SECONDS);
   return { startTime, endTime };
 }
 
@@ -342,15 +256,30 @@ async function getInstanceState(client, config) {
  * @param {{ startTime: number, endTime: number }} range
  * @param {number} period
  * @returns {Promise<{ bytes: number, points: number, newest: number | null }>}
+ *
+ * 导出只为了能直接测那道数据点上限检查：当前两个查询离 1440 都很远，从 handler 那头
+ * 根本走不到它，而它防的恰恰是「有人把粒度改小」这种以后才会发生的事。同 `formatDuration`。
  */
-async function sumMetric(client, config, metricName, range, period) {
+export async function sumMetric(client, config, metricName, range, period) {
+  // 上游对单次查询的数据点数有硬上限，而**超限不报错**：HTTP 200、metricName 正常回显、
+  // metricData 空数组（实测 1440 → 1440 个点，1441 → 0 个）。落地就是 0 字节，正好是唯一
+  // 会让看门狗什么都不做的读数。当前两个查询离上限都很远，这道检查防的是调参把窗口和粒度
+  // 改成一个会超限的组合 —— 那种失效在日志里没有任何痕迹。
+  const wanted = Math.ceil((range.endTime - range.startTime) / period);
+  if (wanted > MAX_DATAPOINTS_PER_QUERY) {
+    throw new Error(
+      `GetInstanceMetricData for ${metricName} would ask for ${wanted} data points,` +
+        ` past the ${MAX_DATAPOINTS_PER_QUERY} the API silently truncates to an empty array`,
+    );
+  }
+
   const res = await lightsail(client, config, "GetInstanceMetricData", {
     instanceName: config.instanceName,
     metricName,
     period,
     startTime: range.startTime,
     endTime: range.endTime,
-    unit: "Bytes",
+    unit: METRIC_UNIT,
     statistics: ["Sum"],
   });
 
@@ -386,6 +315,10 @@ async function sumMetric(client, config, metricName, range, period) {
   // 缺口本身就代表那段时间没有流量。
   let bytes = 0;
   let newest = null;
+  let oldest = null;
+  // 窗口内被数据点真正覆盖到的秒数，用作速率分母。见函数返回值里 coveredSeconds 的说明。
+  let coveredSeconds = 0;
+  let timestamped = 0;
   for (const point of points) {
     if (point === null || typeof point !== "object") {
       throw new Error(`GetInstanceMetricData returned a non-object data point for ${metricName}`);
@@ -409,6 +342,15 @@ async function sumMetric(client, config, metricName, range, period) {
         `GetInstanceMetricData returned an unusable sum for ${metricName}: ${String(point.sum)}`,
       );
     }
+    // 单位必须是我们请求的那一个。**字段缺席不算错**：这个仓库已经因为「把合法的字段
+    // 缺失当成畸形响应」栽过一次（空 metricData 被读成错误，停机中的实例整月发不出重启），
+    // 不能在同一个地方栽第二次。但只要它出现且不一致，这个 sum 就不是我们以为的那个数 ——
+    // 把 Bits 当 Bytes 累加会少报八倍，而少报是唯一会让看门狗放行的方向。
+    if (point.unit != null && point.unit !== METRIC_UNIT) {
+      throw new Error(
+        `GetInstanceMetricData returned ${metricName} in ${String(point.unit)}, expected ${METRIC_UNIT}`,
+      );
+    }
     bytes += sum;
 
     // 时间戳走 Unix 秒。不是数字、或者量级明显不对（毫秒），都当没有 —— 绝不让一个
@@ -417,11 +359,38 @@ async function sumMetric(client, config, metricName, range, period) {
       typeof point.timestamp === "number" &&
       Number.isFinite(point.timestamp) &&
       Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;
-    if (usable && (newest === null || point.timestamp > newest)) {
-      newest = point.timestamp;
+    if (usable) {
+      timestamped += 1;
+      if (newest === null || point.timestamp > newest) newest = point.timestamp;
+      if (oldest === null || point.timestamp < oldest) oldest = point.timestamp;
+
+      // 这个桶落在查询窗口内的秒数。桶的相位不是绝对时间轴上的整点，而是跟着查询的
+      // startTime 走 —— 实测（2026-08-22，ap-northeast-1）相位 = `floor(startTime / 60) * 60`，
+      // 之后按 period 步进：startTime 对 300 取余 47 / 123 / 250 时，返回的桶起点取余
+      // 分别是 0 / 120 / 240，四组窗口全部吻合。
+      //
+      // 于是窗口两端各可能有一个桶只有一部分落在窗口里，而它带回来的是**整桶**的字节。
+      // 拿桶的个数乘以 period 当分母就会把这段多出来的时间也算进去，速率报低 —— 少报是
+      // 唯一会让看门狗放行的方向。按实际覆盖秒数算，无论窗口怎么对齐都不会失守。
+      //
+      // （独立审计给的修法是把 endTime 向下取整到 period 的整数倍。那个方向是错的：
+      // 它会把最近最多 299 秒的数据从窗口里扔掉，而看门狗最不能丢的就是新鲜度。）
+      coveredSeconds += Math.max(
+        0,
+        Math.min(point.timestamp + period, range.endTime) - Math.max(point.timestamp, range.startTime),
+      );
     }
   }
-  return { bytes, points: points.length, newest };
+  return {
+    bytes,
+    points: points.length,
+    newest,
+    oldest,
+    // 只有当**每一个**数据点都带着可用时间戳时才交出覆盖秒数。缺几个时间戳就意味着覆盖
+    // 被少算，分母偏小、速率偏大 —— 那个方向虽然安全，但会凭空造出误停。宁可退回
+    // `points * period` 这个保守分母，也不要拿一个残缺的覆盖去驱动停机决策。
+    coveredSeconds: timestamped === points.length && coveredSeconds > 0 ? coveredSeconds : null,
+  };
 }
 
 /**
@@ -513,11 +482,10 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
   if (recentIn.points === 0 && recentOut.points === 0) {
     // 「指标看不见」和「实例本来就没在跑」在指标上长得一模一样 —— 所以不猜，直接用这一轮
     // 已经查到的真实状态来分辨。
-    const state = instanceState;
-    if (state === "running" || state === null) {
+    if (meterShouldSeeTraffic(instanceState)) {
       console.error(
         `${config.label} BLIND | no metric data points in the last ${BURST_WINDOW_SECONDS / 60} min` +
-          ` | instance is ${state === null ? "of unreadable state" : `"${state}"`}, so the meter is blind, not idle` +
+          ` | instance is ${instanceState === null ? "of unreadable state" : `"${instanceState}"`}, so the meter is blind, not idle` +
           ` | the burst gate cannot measure a rate this run`,
       );
     }
@@ -529,13 +497,16 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
       secondsToQuota: null,
       stale: false,
       unmeasurable: true,
-      instanceState: state,
+      instanceState,
       windowPoints: 0,
     };
   }
 
-  const rateOf = (metric) =>
-    metric.points > 0 ? metric.bytes / (metric.points * BURST_PERIOD_SECONDS) : 0;
+  const rateOf = (metric) => {
+    if (metric.points === 0) return 0;
+    // 分母优先用实测覆盖秒数（见 sumMetric），拿不到时退回「桶数 × 粒度」。
+    return metric.bytes / (metric.coveredSeconds ?? metric.points * BURST_PERIOD_SECONDS);
+  };
   const bytesPerSecond = rateOf(recentIn) + rateOf(recentOut);
 
   // 实测落库延迟：最新那个桶覆盖 [newest, newest + 300)，它已经能查到，所以延迟就是
@@ -623,9 +594,7 @@ export default {
       secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
       service: "lightsail",
       region: config.region,
-      // 首次尝试之外再重试两次（仅限 5xx 和 429）。下一次触发在十分钟后，这个次数足够了，
-      // 同时也能让故障及时暴露出来。
-      retries: 2,
+      retries: AWS_RETRIES,
     });
 
     // 用调度时间而非墙上时钟：它精确落在 cron 的时间格上，所以即便调用被延迟或重试，
@@ -673,6 +642,16 @@ export default {
     // 生产环境里自己跑，第一天就有结论。
     // 同样取最旧的那一个，理由见 burstCheck 里 oldestNewest 的说明。
     const monthWithPoints = [monthIn, monthOut].filter((m) => m.points > 0);
+    // 覆盖的**起点**。既有的 monthBehindSeconds 只看最新那一头，另一头从来没人看过 ——
+    // 而少掉月初几天同样会让静态线看到一个偏小的总量，方向是漏停。
+    //
+    // 不为此告警：同一个形状至少有三种成因 —— 实例在本月内才创建（创建之前没有任何指标
+    // 历史）、那几天实例没在跑（不产生数据点）、指标真的丢了数据。光看指标分不出它们，
+    // 而为前两种误报的代价是让第三种淹没在噪音里。所以只把事实摆进日志。
+    const monthOldest =
+      monthWithPoints.length > 0 && monthWithPoints.every((m) => m.oldest !== null)
+        ? Math.min(...monthWithPoints.map((m) => m.oldest))
+        : null;
     const monthNewest =
       monthWithPoints.length > 0 && monthWithPoints.every((m) => m.newest !== null)
         ? Math.min(...monthWithPoints.map((m) => m.newest))
@@ -713,7 +692,7 @@ export default {
     const monthBehindSeconds = Number.isFinite(monthNewest)
       ? range.endTime - (monthNewest + METRIC_PERIOD_SECONDS)
       : null;
-    if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD_SECONDS) {
+    if (monthBehindSeconds !== null && monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS) {
       console.error(
         `${config.label} BLIND | month-to-date reading only covers through ${new Date(monthNewest * 1000).toISOString().slice(0, 10)}` +
           ` (${(monthBehindSeconds / 3600).toFixed(1)} h behind) | today's traffic is invisible to the static line`,
@@ -767,6 +746,12 @@ export default {
     const daysElapsed = Math.ceil((range.endTime - range.startTime) / METRIC_PERIOD_SECONDS);
     common.push(`days ${Math.max(monthIn.points, monthOut.points)}/${daysElapsed}`);
 
+    // 读数没从月初起算时，把真正的起点写出来。`days 16/22` 只说少了六天，不说少的是哪
+    // 六天 —— 而「少的是月初连续的六天」和「中间零散缺六天」是完全不同的两件事。
+    if (monthOldest !== null && monthOldest > range.startTime) {
+      common.push(`covers from ${new Date(monthOldest * 1000).toISOString().slice(0, 10)}`);
+    }
+
     if (burst && burst.lagSeconds !== null) {
       common.push(`meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`);
     }
@@ -796,14 +781,26 @@ export default {
     // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
     // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
     // 约 4300 次调用。
-    // 这条告警只依赖「月份已过 N 小时、读数仍恰为零」，与实例状态无关，所以必须在
-    // MANUAL_HOLD 之前发出。此前它被写在状态查询之后，于是设了 HOLD 就连它一起吞掉 ——
-    // 维护期设了 hold 又忘记撤销，就同时失去了「静默失明」的唯一兜底，而 HOLD 那行字面上
-    // 还在说一切按计划。措辞不再断言实例在跑（这里还没查过状态）。
-    if (range.endTime - range.startTime > 2 * 3600) {
+    // 「月初至今恰为零」有两种成因，此前分不开，于是这条告警只能挂在时间上，把两种都喊：
+    //
+    //   实例没在跑 —— 这正是零字节闸门的前提，重启路径要的就是它。操作者月中自己停机时，
+    //     旧写法会从第 2 小时起每一次触发都误报一次，一直报到月末。
+    //   量的那一侧坏了 —— 例如 unit 传错。实测（2026-08-22）：unit 传成 Bits / Count /
+    //     Percent / Seconds / Megabytes 中任意一个，AWS 都回 HTTP 200、metricName 正确
+    //     回显、metricData 是空数组。sumMetric 的双信号校验对它完全无感，用量读成干净的
+    //     0 字节 —— 而 0 是唯一会让看门狗什么都不做的读数。
+    //
+    // 有了每轮实测的实例状态就不用猜了：跑着的实例几分钟内必然产生流量，所以「running
+    // 而读数为零」在物理上不成立，只可能是管道坏了。误报没了，真故障反而被喊得更准。
+    //
+    // 位置仍在 MANUAL_HOLD 之前：维护期设了 hold 又忘记撤销时，这条兜底不能跟着被吞掉。
+    const monthAgeSeconds = range.endTime - range.startTime;
+    if (monthAgeSeconds > ZERO_READING_GRACE_SECONDS && meterShouldSeeTraffic(instanceState)) {
       console.error(
-        `${config.label} BLIND | ${((range.endTime - range.startTime) / 3600).toFixed(1)} h into the month,` +
-          ` month-to-date reads exactly zero | the zero-byte gate's premise does not hold here`,
+        `${config.label} BLIND | ${(monthAgeSeconds / 3600).toFixed(1)} h into the month, month-to-date reads exactly zero` +
+          ` while the instance is ${instanceState === null ? "of unreadable state" : `"${instanceState}"`}` +
+          ` | a running instance always moves some bytes, so the metric pipeline is what is broken` +
+          ` (a wrong unit returns HTTP 200 with an empty array)`,
       );
     }
 
@@ -817,14 +814,13 @@ export default {
     // 实例则会开始烧流量。
     // 复用这一轮开头查到的状态。读不出来时不启动 —— 重启路径上的不确定性向「什么都不做」
     // 倾斜，误启动一台被刻意停下的实例会开始烧流量。
-    const state = instanceState;
-    if (state === null) {
+    if (instanceState === null) {
       console.log([`${config.label} NOOP`, ...common, "instance state unreadable, not starting"].join(" | "));
       return;
     }
-    if (state !== "stopped") {
+    if (instanceState !== "stopped") {
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
-      console.log([`${config.label} NOOP`, ...common, `instance is "${state}", nothing to do`].join(" | "));
+      console.log([`${config.label} NOOP`, ...common, `instance is "${instanceState}", nothing to do`].join(" | "));
       return;
     }
 

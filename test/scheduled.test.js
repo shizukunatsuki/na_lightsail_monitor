@@ -3,7 +3,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import worker from "../src/index.js";
+import { AwsClient } from "aws4fetch";
+
+import worker, { sumMetric } from "../src/index.js";
 
 const ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
 const SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -18,6 +20,41 @@ const baseEnv = {
 };
 
 const GIB = 1024 ** 3;
+
+/**
+ * 按真实 API 的行为铺突发窗口里的桶。
+ *
+ * 实测（2026-08-22，ap-northeast-1）：桶的相位是 `floor(startTime / 60) * 60`，之后按
+ * period 步进 —— startTime 对 300 取余 47 / 123 / 250 时，返回的桶起点取余分别是
+ * 0 / 120 / 240。而 300 秒桶「在关闭那一刻就已经是终值」，所以落库延迟按「还没完整落库
+ * 的桶根本不出现」建模：返回的每个桶都是完整的，延迟表现为**尾部的桶还没出现**。
+ *
+ * 于是可观测的延迟是被量化到 300 秒一档的（0、300、600 …），而且总是**不小于**真实延迟：
+ * 真实延迟 720 秒时，最新一个完整的桶结束在 900 秒之前，日志里读到的就是 900 秒。
+ * 这个方向是保守的 —— 告警只会更早，不会更晚。
+ * 旧夹具是后者，它造出过两种真实 API 绝不会返回的东西：起点落在 startTime 之前的桶；
+ * 以及「6 个点 + 5 分钟延迟」这种组合 —— 30 分钟的窗口里有 5 分钟延迟时最多只能有 5 个桶。
+ * 后者曾是这个文件的**默认值**，`win 6/6 | meter 5.0 min behind` 因此写进了一大批断言。
+ *
+ * 要的点数超过物理上能有的数量时直接抛错，不静默截断：一个悄悄给少了的夹具，会让断言
+ * 看起来在描述一件根本没发生的事。
+ */
+function burstBuckets({ startTime, endTime }, lagSeconds, want) {
+  const grid = Math.floor(startTime / 60) * 60;
+  const visible = [];
+  for (let k = 0; ; k++) {
+    const start = grid + k * BURST_PERIOD;
+    if (start >= endTime) break;
+    if (start + BURST_PERIOD > endTime - lagSeconds) break;
+    visible.push(start);
+  }
+  if (want !== undefined && want > visible.length) {
+    throw new Error(
+      `夹具要 ${want} 个数据点，但延迟 ${lagSeconds} 秒时窗口里最多只有 ${visible.length} 个`,
+    );
+  }
+  return want === undefined ? visible : visible.slice(visible.length - want);
+}
 
 /** 默认配置下的停机线：1024 GiB × 0.8。 */
 const STOP_LINE_GIB = 819.2;
@@ -45,10 +82,10 @@ function stubAws({
   networkOut = 0,
   recentIn = 0,
   recentOut = 0,
-  recentPoints = 6,
+  recentPoints,
   recentInPoints,
   recentOutPoints,
-  recentLagSeconds = 300,
+  recentLagSeconds = 0,
   recentInLagSeconds,
   recentOutLagSeconds,
   metricShape,
@@ -100,6 +137,13 @@ function stubAws({
         return Response.json({ state: { code: name === "running" ? 16 : 80, name } });
       }
       case "GetInstanceMetricData": {
+        // 请求的单位不对时，AWS 不报错 —— 实测（2026-08-22，ap-northeast-1）它回
+        // HTTP 200、metricName 正确回显、metricData 空数组，Bits / Count / Percent /
+        // Seconds / Megabytes 五种都是这个结果。打桩必须照这个来，否则「把请求单位改错」
+        // 这个缺陷在测试里根本不可见。
+        if (body.unit !== "Bytes") {
+          return Response.json({ metricName: body.metricName, metricData: [] });
+        }
         // 指标响应的几种形状。`omitted` 是**合法**的：AWS 允许在没有数据时省掉空集合。
         if (metricShape === "omitted") return Response.json({ metricName: body.metricName });
         if (metricShape === "notArray") return Response.json({ metricName: body.metricName, metricData: "oops" });
@@ -124,15 +168,13 @@ function stubAws({
           const total = isIn ? recentIn : recentOut;
           // 两个方向的落库进度可以不同 —— 真实 API 不保证它们同步。
           const n = (isIn ? recentInPoints : recentOutPoints) ?? recentPoints;
-          // 时间戳锚定到请求的 endTime：最新那个桶覆盖 [newest, newest + 300)，而它比
-          // 「此刻」早了 recentLagSeconds —— 这就是被模拟的落库延迟。
           const lagFor = (isIn ? recentInLagSeconds : recentOutLagSeconds) ?? recentLagSeconds;
-          const newest = body.endTime - lagFor - BURST_PERIOD;
+          const stamps = burstBuckets(body, lagFor, n);
           return Response.json({
             metricName: body.metricName,
-            metricData: Array.from({ length: n }, (_, i) => ({
-              sum: n ? total / n : 0,
-              timestamp: newest - (n - 1 - i) * BURST_PERIOD,
+            metricData: stamps.map((timestamp) => ({
+              sum: stamps.length ? total / stamps.length : 0,
+              timestamp,
               unit: "Bytes",
             })),
           });
@@ -181,6 +223,12 @@ async function run(iso, env, mock) {
 
 const opsOf = (calls) => calls.map((c) => c.operation);
 
+/**
+ * 只保留指标查询。三次查询并发发出，落进 calls 的顺序不定，所以任何针对查询窗口的断言
+ * 都必须按操作名挑，不能按下标取。
+ */
+const metricCalls = (calls) => calls.filter((c) => c.operation === "GetInstanceMetricData");
+
 /** 只保留指标查询里属于突发窗口的那些。 */
 const burstCalls = (calls) =>
   calls.filter((c) => c.operation === "GetInstanceMetricData" && c.body.period === BURST_PERIOD);
@@ -226,7 +274,7 @@ test("bytes are converted on a 2^30 basis", async () => {
   // 一次触发只写一行，行首是可 grep 的状态标记，字段全部是这一轮已经算出来的东西。
   assert.deepEqual(lines, [
     "example-instance@ap-northeast-1 OK | used 1.000 GiB (0.1% of 1024) | stop at 819.200 GiB" +
-      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | win 6/6 | days 3/15 | meter 5.0 min behind",
+      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | win 6/6 | days 3/15 | covers from 2026-08-13 | meter 0.0 min behind",
   ]);
 });
 
@@ -273,7 +321,8 @@ test("metric queries use the documented request shape", async () => {
   const mock = stubAws();
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
-  const [metric] = mock.calls;
+  // 同样按操作名挑：三次查询并发发出，calls[0] 可能是那次状态查询。
+  const [metric] = metricCalls(mock.calls);
   assert.equal(metric.url, "https://lightsail.ap-northeast-1.amazonaws.com/");
   assert.equal(metric.headers.get("Content-Type"), "application/x-amz-json-1.1");
   assert.match(metric.headers.get("X-Amz-Target"), /^Lightsail_20161128\.GetInstanceMetricData$/);
@@ -371,7 +420,7 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
   // 额度——这正是这个字段存在的意义：静态线还没碰到，但趋势已经写在脸上了。
   assert.match(
     lines[0],
-    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| win 6\/6 \| days 3\/15 \| meter 5\.0 min behind$/,
+    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| win 6\/6 \| days 3\/15 \| covers from 2026-08-13 \| meter 0\.0 min behind$/,
   );
 });
 
@@ -390,10 +439,14 @@ test("the burst rate divides by the data that landed, not by the window length",
 test("the metric lag is measured from the newest bucket and reported every run", async () => {
   // AWS 不公开落库延迟，而整套余量标定都建立在它之上 —— 所以只能自己量，并且让它每次
   // 都出现在正常那一行里，而不是留作一个假设。
+  //
+  // 读数被量化到一整个桶：桶要完整落库才会出现，所以真实延迟 12 分钟时，最新一个可见的
+  // 桶结束在 15 分钟之前，日志读到的就是 15.0 分钟。方向是保守的（读数 >= 真实延迟），
+  // 告警只会更早不会更晚。窗口里的桶数同步掉到 3/6 —— 那才是分辨率真正的指示器。
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 12 * 60 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
-  assert.match(lines.at(-1), /meter 12\.0 min behind$/);
+  assert.match(lines.at(-1), /win 3\/6 \| days \d+\/\d+ \| covers from [\d-]+ \| meter 15\.0 min behind$/);
 });
 
 test("one metric's pipeline stalling is not masked by the other", async () => {
@@ -420,12 +473,12 @@ test("one metric's pipeline stalling is not masked by the other", async () => {
 
 test("a lag past the tolerance is called out loudly", async () => {
   // 延迟超过容忍上限后，突发闸门已经追不上一场满速突发，此刻真正在守账单的只剩静态线。
-  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 22 * 60, recentPoints: 1 });
+  const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 25 * 60 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.match(
     lines.join("\n"),
-    /^\S+ BLIND \| newest metric bucket is 22\.0 min old, past the 12 min tolerance \|/m,
+    /^\S+ BLIND \| newest metric bucket is 25\.0 min old, past the 12 min tolerance \|/m,
   );
   // 措辞只陈述观察到的事实：光看指标分不出「指标侧延迟」和「实例没在跑」。
   assert.match(lines.join("\n"), /meter lagging, or the instance is not running/);
@@ -497,14 +550,19 @@ test("the lag alarm fires before the design stops holding, not after", async () 
   // 延迟 25 分钟才守不住，20 分钟的告警是提前的；cron 放宽到 10 分钟后临界点降到 16 分钟，
   // 同一个 20 分钟就变成了迟到四分钟 —— 延迟落在 [16, 20) 分钟时设计已经失效而没有任何
   // 提示。门槛必须挂在回路上，且留出提前量。
-  for (const minutes of [12, 14, 16, 19]) {
-    const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: minutes * 60, recentPoints: 3 });
+  //
+  // 边界不是 12 分钟整。延迟只能按**整桶**观测 —— 日志读到的是「最新一个完整的桶结束了
+  // 多久」，取值只能落在 0 / 5 / 10 / 15 … 分钟这些档上，而且总是不小于真实延迟。于是
+  // 12 分钟的门槛真正的跳变点是「真实延迟超过 10 分钟」（那时读数跳到 15 分钟）。
+  // 方向是保守的：告警比设计预算（14 分钟）更早，不会更晚。
+  for (const minutes of [11, 12, 14, 16, 19]) {
+    const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: minutes * 60 });
     const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
     assert.match(lines.join("\n"), /BLIND \|/, `延迟 ${minutes} 分钟必须告警`);
   }
 
   // 容忍上限之内不该有任何噪音。
-  for (const minutes of [5, 8, 11]) {
+  for (const minutes of [0, 5, 10]) {
     const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: minutes * 60 });
     const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
     assert.ok(!lines.join("\n").includes("BLIND"), `延迟 ${minutes} 分钟不该告警`);
@@ -554,12 +612,16 @@ test("a month reading that covers today raises no alarm", async () => {
 
 test("a running instance reading exactly zero hours into the month is reported", async () => {
   // 零字节闸门的全部前提是「运行中的实例几分钟内必然产生某些流量」。月份已经走了几小时、
-  // 实例还在跑、读数却仍是零 —— 这个前提在此刻不成立，多半说明月度读数没覆盖到今天。
+  // 实例还在跑、读数却仍是零 —— 这个前提在此刻不成立，问题一定在量的那一侧。
+  //
+  // 这也是 unit 传错的唯一可观测形状：实测 AWS 会回 HTTP 200、metricName 正确回显、
+  // metricData 空数组，双信号校验完全放行，用量读成干净的 0 字节。
   const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
 
   assert.match(lines.join("\n"), /BLIND \| 9\.0 h into the month, month-to-date reads exactly zero/);
-  assert.match(lines.join("\n"), /the zero-byte gate's premise does not hold here/);
+  assert.match(lines.join("\n"), /while the instance is "running"/);
+  assert.match(lines.join("\n"), /the metric pipeline is what is broken/);
 });
 
 test("the same zero reading in the first minutes of a month is normal", async () => {
@@ -589,7 +651,7 @@ test("after the burst gate stops it, the steady state says DOWN, not OK", async 
   // 满足 used < limit，走的是「正常」那一支 —— 此前它无脑写 OK，结果是**站点已经下线，
   // 而 `grep -v " OK | "` 里什么都没有**。两条停机路径的稳态现在收敛到同一个可 grep 的词。
   for (const [label, opts] of [
-    ["数据变旧", { recentLagSeconds: 25 * 60, recentPoints: 3 }],
+    ["数据变旧", { recentLagSeconds: 25 * 60 }],
     ["数据全没", { emptyBurstWindow: true }],
   ]) {
     const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "stopped", ...opts });
@@ -602,7 +664,7 @@ test("after the burst gate stops it, the steady state says DOWN, not OK", async 
 
 test("stale data on a running instance is still BLIND, not DOWN", async () => {
   // 对照：实例确实在跑而数据变旧 —— 那才是指标侧的问题，必须是 BLIND。
-  const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "running", recentLagSeconds: 25 * 60, recentPoints: 3 });
+  const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "running", recentLagSeconds: 25 * 60 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
   assert.match(lines.join("\n"), /BLIND \| newest metric bucket is 25\.0 min old/);
   assert.match(lines.at(-1), /^\S+ OK \|/);
@@ -618,15 +680,26 @@ test("MANUAL_HOLD does not swallow the zero-reading alarm", async () => {
   // HOLD 的定义是「抑制所有 StartInstance」。此前它写在状态查询之后，于是连
   // 「月份已过数小时、读数仍恰为零」那条告警一起吞掉 —— 维护期设了 hold 又忘记撤销，
   // 就同时失去了静默失明的唯一兜底，而 HOLD 那行字面上还在说一切按计划。
-  const held = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
+  //
+  // hold 与实例状态是两件事：hold 只挡启动，它自己并不停机。所以「设了 hold 而实例还在
+  // 跑」是常见的维护姿态，也正是这条兜底必须活着的场景。
+  const held = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
   const heldLines = await capturingLogs(() =>
     run("2026-09-01T09:00:00Z", { ...baseEnv, MANUAL_HOLD: "true" }, held),
   );
   assert.match(heldLines.join("\n"), /BLIND \| 9\.0 h into the month, month-to-date reads exactly zero/);
   assert.match(heldLines.at(-1), /^\S+ HOLD \|/);
+});
 
-  // 告警措辞不再断言实例在跑 —— 这条路径上还没查过状态。
-  assert.ok(!heldLines.join("\n").includes("instance is running, yet"));
+test("a legitimately stopped instance reading zero is not alarmed about", async () => {
+  // 对照，也是这次改动删掉的一个真实误报：实例被合法停着（看门狗停的，或操作者自己停的），
+  // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。旧写法只看「月份已过几小时」，
+  // 于是从当月第 2 小时起每一次触发都报一次 BLIND，一直报到实例被拉起来为止。
+  const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
+  const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
+
+  assert.ok(!lines.join("\n").includes("BLIND"), "合法停机的零读数不该告警");
+  assert.match(lines.at(-1), /^\S+ STARTED \|/);
 });
 
 test("a month reading with no usable timestamp is reported", async () => {
@@ -785,7 +858,12 @@ test("a reset allowance starts a stopped instance", async () => {
   ]);
   assert.deepEqual(mock.calls.at(-1).body, { instanceName: "example-instance" });
   // 窗口取的是新月份，而不是那个用量导致停机的月份。
-  assert.equal(mock.calls[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
+  //
+  // 按操作名挑，不按下标取：三次查询是并发发出的（两次指标 + 一次状态），谁先落进
+  // calls 由微任务调度决定。写死 calls[0] 会得到一个**偶发**失败的测试 —— 上一次改动
+  // 把状态查询并进 Promise.all 之后，这里就有大约五分之一的概率读到状态查询的 body、
+  // 拿到 undefined 的 startTime，而它整整绿了一轮。
+  assert.equal(metricCalls(mock.calls)[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });
 
 test("the restart is retried on every later run, not just at the rollover", async () => {
@@ -941,6 +1019,85 @@ test("a missing sum is still a legitimate zero", async () => {
   assert.match(lines.at(-1), /used 0\.000 GiB/);
 });
 
+test("a query that would exceed the API's datapoint cap throws", async () => {
+  // 实测（2026-08-22，ap-northeast-1）：单次查询的上限正好是 1440 个数据点，**超限不报错**
+  // —— 1440 个拿回 1440 个，1441 个拿回 0 个，HTTP 仍是 200、metricName 照常回显。落地就是
+  // 0 字节，唯一会让看门狗什么都不做的读数。
+  //
+  // 当前两个查询离上限很远（月度 31、突发 6），所以从 handler 那头走不到这里 —— 它防的是
+  // 以后有人把 METRIC_PERIOD_SECONDS 从 86400 改成 900：月度查询要 2976 个点，于是每一轮
+  // 都读到 0 字节，而日志一片祥和。所以直接测这个函数。
+  const mock = stubAws();
+  const client = new AwsClient({
+    accessKeyId: ACCESS_KEY_ID, secretAccessKey: SECRET, service: "lightsail", region: "ap-northeast-1",
+  });
+  const config = { region: "ap-northeast-1", instanceName: "example-instance", label: "x" };
+  const range = { startTime: 0, endTime: 1441 * 300 };
+  try {
+    await assert.rejects(
+      () => sumMetric(client, config, "NetworkOut", range, 300),
+      /would ask for 1441 data points, past the 1440/,
+    );
+    // 正好卡在上限上要放行 —— 边界写成 >= 会把一个合法查询挡掉。
+    await sumMetric(client, config, "NetworkOut", { startTime: 0, endTime: 1440 * 300 }, 300);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a month reading that starts after the month does say so", async () => {
+  // 打桩的月度数据只有三个天桶，最老的那个远晚于月初 —— 读数没覆盖到月初这件事必须
+  // 出现在日志里。`days 16/22` 只说少了六天，不说少的是哪六天，而「月初连续少六天」
+  // 和「中间零散少六天」是完全不同的两件事。
+  const mock = stubAws({ networkIn: GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  assert.match(lines.at(-1), /days 3\/15 \| covers from 2026-08-13 \|/);
+});
+
+test("a data point in the wrong unit throws instead of being summed", async () => {
+  // unit 传错时 AWS 回 HTTP 200 + 空数组，响应侧完全分辨不了 —— 那一侧由零读数告警承接。
+  // 但如果哪天返回的桶**带着**另一个单位，那就是响应自己说清楚了：把 Bits 当 Bytes 累加
+  // 会少报八倍，而少报是唯一会让看门狗放行的方向。这一条必须响亮地失败。
+  const mock = stubAws({ badPoints: [{ sum: 8 * GIB, timestamp: 1.754e9, unit: "Bits" }] });
+
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    /returned Network(In|Out) in Bits, expected Bytes/,
+  );
+});
+
+test("a data point with no unit field is still accepted", async () => {
+  // 刻意的不对称，也是这个仓库付过学费的那一课：把**合法的字段缺失**当成畸形响应，
+  // 曾经让停机中的实例整月发不出重启。缺席按「没说」处理，出现且不一致才算错。
+  const mock = stubAws({ badPoints: [{ sum: GIB, timestamp: 1.754e9 }] });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  assert.match(lines.at(-1), /used 2\.000 GiB/);
+});
+
+test("the rate denominator follows the seconds actually covered, not the bucket count", async () => {
+  // 桶的相位跟着 startTime 走（实测：`floor(startTime / 60) * 60`），所以 startTime 不落在
+  // 整分钟上时，第一个桶会有一部分露在窗口之外 —— 它带回来的却是整桶的字节。
+  // 拿「桶数 × 粒度」当分母就把那段多出来的时间也算了进去，速率报低，而报低是唯一会让
+  // 看门狗放行的方向。
+  //
+  // 生产里 cron 落在整点格上，两个分母完全相等，这条只在时钟没对齐时才分得开 ——
+  // 而 `controller.scheduledTime` 缺席退回 Date.now() 时就是这种情况。
+  const aligned = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
+  const alignedLines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, aligned));
+
+  const skewed = stubAws({ networkIn: 10 * GIB, recentIn: GIB });
+  const skewedLines = await capturingLogs(() => run("2026-08-15T12:00:37Z", baseEnv, skewed));
+
+  const rate = (line) => Number(line.match(/now ([\d.]+) Mbps/)[1]);
+  assert.ok(
+    rate(skewedLines.at(-1)) > rate(alignedLines.at(-1)),
+    `未对齐时分母应当更小、速率更高，实际 ${rate(skewedLines.at(-1))} vs ${rate(alignedLines.at(-1))}`,
+  );
+  // 少覆盖的那 37 秒占 1800 秒的 2%，速率相应抬高约 2%，不该是数量级的跳变。
+  const ratio = rate(skewedLines.at(-1)) / rate(alignedLines.at(-1));
+  assert.ok(ratio > 1 && ratio < 1.05, `抬高幅度 ${ratio.toFixed(4)} 超出预期`);
+});
+
 test("a metricData that is present but not an array always throws", async () => {
   const mock = stubAws({ metricShape: "notArray" });
 
@@ -1014,7 +1171,7 @@ test("a controller without scheduledTime falls back to the wall clock", async ()
 
   const now = new Date();
   assert.equal(
-    mock.calls[0].body.startTime,
+    metricCalls(mock.calls)[0].body.startTime,
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000,
     "窗口仍然要落在当前 UTC 月份的月初",
   );

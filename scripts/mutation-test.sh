@@ -50,14 +50,19 @@ detect() {
   [ "${failed:-0}" -gt 0 ]
 }
 
+# 调参常量搬到 src/tuning.js 之后，变异目标就跨了两个文件。默认打 src/index.js，
+# `--in <路径>` 换到别的源文件。每次都从原始 src 整目录恢复 —— 只恢复一个文件的话，
+# 上一轮打在另一个文件上的变异会残留到下一轮，于是「谁抓到了什么」全部作废。
 mutate() {
-  cp "$ROOT/src/index.js" src/index.js
+  local file="src/index.js"
+  if [ "$1" = "--in" ]; then file="$2"; shift 2; fi
+  cp -R "$ROOT/src/." src/
   if ! python3 -c "
 import sys, pathlib
-p = pathlib.Path('src/index.js'); s = p.read_text()
+p = pathlib.Path(sys.argv[3]); s = p.read_text()
 n = s.count(sys.argv[1])
 assert n == 1, 'mutation site matched %d times' % n
-p.write_text(s.replace(sys.argv[1], sys.argv[2]))" "$1" "$2" 2>/dev/null; then
+p.write_text(s.replace(sys.argv[1], sys.argv[2]))" "$1" "$2" "$file" 2>/dev/null; then
     echo "  ?? 变异未应用  $3"; SURVIVORS=$((SURVIVORS + 1)); return
   fi
   detect; local r=$?
@@ -68,7 +73,7 @@ p.write_text(s.replace(sys.argv[1], sys.argv[2]))" "$1" "$2" 2>/dev/null; then
   esac
 }
 
-cp "$ROOT/src/index.js" src/index.js
+cp -R "$ROOT/src/." src/
 detect; CONTROL=$?
 if [ "$CONTROL" -eq 2 ]; then echo "对照组：测试跑不起来，检测器不可信"; exit 1; fi
 if [ "$CONTROL" -eq 0 ]; then echo "对照组失败：干净的代码也报红"; exit 1; fi
@@ -103,22 +108,23 @@ mutate "lagSeconds >= MAX_TOLERABLE_LAG_SECONDS" \
        "lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS" \
        "延迟告警门槛退回按窗口推导（迟到）"
 # 调参常量之间的耦合断裂 —— 代码照样跑、行为照样对，只是防线悄悄变薄
-mutate "export const REACTION_HORIZON_SECONDS = 3600;" "export const REACTION_HORIZON_SECONDS = 1800;" \
+mutate --in src/tuning.js "export const REACTION_HORIZON_SECONDS = 3600;" "export const REACTION_HORIZON_SECONDS = 1800;" \
        "视野调回 30 分钟（与十分钟的 cron 不再匹配）"
-mutate "export const MAX_TOLERABLE_LAG_SECONDS = 720;" "export const MAX_TOLERABLE_LAG_SECONDS = 1200;" \
+mutate --in src/tuning.js "export const MAX_TOLERABLE_LAG_SECONDS = 720;" "export const MAX_TOLERABLE_LAG_SECONDS = 1200;" \
        "延迟容忍退回按窗口推导的旧值"
-mutate "export const BURST_WINDOW_SECONDS = 1800;" "export const BURST_WINDOW_SECONDS = 900;" \
+mutate --in src/tuning.js "export const BURST_WINDOW_SECONDS = 1800;" "export const BURST_WINDOW_SECONDS = 900;" \
        "窗口缩到 15 分钟（容忍延迟下凑不出两个数据点）"
 # 独立审计翻出来的那一类：静默失明。变异测试本身抓不到「缺失的代码」，
 # 但代码补上之后，它能防止这段代码被改回去。
 mutate "if (recentIn.points === 0 && recentOut.points === 0) {" "if (false) {" \
        "去掉「窗口零数据点」的失明检测（F1 回归）"
-mutate 'if (state === "running" || state === null) {' 'if (state === "running") {' \
+mutate "const meterShouldSeeTraffic = (state) => state === \"running\" || state === null;" \
+       'const meterShouldSeeTraffic = (state) => state === "running";' \
        "状态读不出时不再报失明"
 # 跨模型审计翻出来的：月度读数覆盖范围 / 时间戳量级
-mutate "if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD_SECONDS) {" "if (false) {" \
+mutate "if (monthBehindSeconds !== null && monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS) {" "if (false) {" \
        "去掉「月度读数落后过久」的检测"
-mutate "if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD_SECONDS) {" \
+mutate "if (monthBehindSeconds !== null && monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS) {" \
        "if (Number.isFinite(monthNewest) && monthNewest < Math.floor(range.endTime / 86400) * 86400) {" \
        "月度新鲜度判据改回「不是今天」（每天 00:00 UTC 误报）"
 mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(...withPoints.map((m) => m.newest))" \
@@ -137,8 +143,12 @@ mutate 'const down = typeof instanceState === "string" && instanceState !== "run
 mutate '      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
        '      `${config.label} NOOP | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
        "静态线停机的稳态退回 NOOP（两条路径不再收敛）"
-mutate "    if (range.endTime - range.startTime > 2 * 3600) {" "    if (false) {" \
+mutate "    if (monthAgeSeconds > ZERO_READING_GRACE_SECONDS && meterShouldSeeTraffic(instanceState)) {" \
+       "    if (false) {" \
        "去掉「月中读数恒为零」告警"
+mutate "monthAgeSeconds > ZERO_READING_GRACE_SECONDS && meterShouldSeeTraffic(instanceState)" \
+       "monthAgeSeconds > ZERO_READING_GRACE_SECONDS" \
+       "零读数告警丢掉状态条件（合法停机期每轮误报一次）"
 mutate "    if (monthWithPoints.length > 0 && !Number.isFinite(monthNewest)) {" "    if (false) {" \
        "去掉月度读数「没有可用时间戳」告警"
 mutate "  if (lagSeconds === null) {" "  if (false) {" \
@@ -147,6 +157,24 @@ mutate 'detail = detail.replaceAll(secret, "[redacted]");' 'detail = detail.repl
        "脱敏只替换第一处出现（F6）"
 mutate '${String(point.sum)}' '${JSON.stringify(point.sum)}' \
        "非有限 sum 的错误消息退回 JSON.stringify（会读作 null，F7）"
+# F3：unit 传错时 AWS 回 200 + 空数组，响应侧分辨不了 —— 两侧防线都要能被抓到
+mutate "    if (point.unit != null && point.unit !== METRIC_UNIT) {" "    if (false) {" \
+       "去掉数据点的单位校验（把 Bits 当 Bytes 累加会少报八倍）"
+mutate --in src/tuning.js 'export const METRIC_UNIT = "Bytes";' 'export const METRIC_UNIT = "Bits";' \
+       "请求的单位改错（上游静默回空数组，用量恒为零）"
+# F7：速率分母必须跟着实际覆盖的秒数走
+mutate "    return metric.bytes / (metric.coveredSeconds ?? metric.points * BURST_PERIOD_SECONDS);" \
+       "    return metric.bytes / (metric.points * BURST_PERIOD_SECONDS);" \
+       "分母退回「桶数 × 粒度」（窗口未对齐时速率报低）"
+# 上游的数据点上限：超限不报错，静默回空数组
+mutate "  if (wanted > MAX_DATAPOINTS_PER_QUERY) {" "  if (false) {" \
+       "去掉数据点上限检查（改小粒度后每轮静默读到 0 字节）"
+mutate --in src/tuning.js "export const MAX_DATAPOINTS_PER_QUERY = 1440;" \
+       "export const MAX_DATAPOINTS_PER_QUERY = 100000;" \
+       "上限放大到失效（等于没有这道检查）"
+# 月度读数的覆盖起点
+mutate "    if (monthOldest !== null && monthOldest > range.startTime) {" "    if (false) {" \
+       "不再说明月度读数是从哪天起算的"
 # 模块级缓存 —— 无状态承诺一旦破掉，「失败的触发不需要对账」就不再成立
 mutate "export function monthStartMs(now) {" \
        "let _cache = null;\nexport function monthStartMs(now) {\n  if (_cache !== null) return _cache;\n  _cache = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);\n  return _cache;" \
