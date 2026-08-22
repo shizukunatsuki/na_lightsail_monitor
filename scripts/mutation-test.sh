@@ -121,11 +121,20 @@ mutate "if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD
        "月度新鲜度判据改回「不是今天」（每天 00:00 UTC 误报）"
 mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(...withPoints.map((m) => m.newest))" \
        "新鲜度取两个指标里最新的那个（一个方向停摆会被掩盖）"
-mutate 'if (state === "running" && range.endTime - range.startTime > 2 * 3600) {' 'if (false) {' \
-       "去掉「月中读数恒为零而实例在跑」的检测（A1 的月初分支）"
 mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;" \
        "      true;" \
        "去掉时间戳量级检查（毫秒可静默绕过 staleness，A3）"
+# 第三轮审计（带 AWS 权限）翻出来的可观测性问题
+mutate 'const down = typeof burst?.instanceState === "string" && burst.instanceState !== "running";' \
+       "const down = false;" \
+       "停机后的稳态退回写 OK（站点下线而过滤器里什么都没有）"
+mutate '      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
+       '      `${config.label} NOOP | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
+       "静态线停机的稳态退回 NOOP（两条路径不再收敛）"
+mutate "    if (range.endTime - range.startTime > 2 * 3600) {" "    if (false) {" \
+       "去掉「月中读数恒为零」告警"
+mutate "    if (monthWithPoints.length > 0 && !Number.isFinite(monthNewest)) {" "    if (false) {" \
+       "去掉月度读数「没有可用时间戳」告警"
 mutate "  if (lagSeconds === null) {" "  if (false) {" \
        "时间戳读不出时不再报失明（同一条静默路径的另一个入口）"
 mutate 'detail = detail.replaceAll(secret, "[redacted]");' 'detail = detail.replace(secret, "[redacted]");' \

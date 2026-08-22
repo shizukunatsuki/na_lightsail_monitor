@@ -53,6 +53,7 @@ function stubAws({
   recentOutLagSeconds,
   metricShape,
   monthCoversOnlyThrough,
+  monthTimestampsUnusable = false,
   badPoints,
   rawMetricBody,
   emptyBurstWindow = false,
@@ -145,14 +146,15 @@ function stubAws({
         // 另一种语义。
         const today = Math.floor(body.endTime / 86400) * 86400;
         const newestDay = monthCoversOnlyThrough === "yesterday" ? today - 86400 : today;
+        const stamp = (t) => (monthTimestampsUnusable ? new Date(t * 1000).toISOString() : t);
         // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
         // 不保证。
         return Response.json({
           metricName: body.metricName,
           metricData: [
-            { sum: total * 0.25, timestamp: newestDay, unit: "Bytes" },
-            { timestamp: newestDay - 86400, unit: "Bytes" },
-            { sum: total * 0.75, timestamp: newestDay - 2 * 86400, unit: "Bytes" },
+            { sum: total * 0.25, timestamp: stamp(newestDay), unit: "Bytes" },
+            { timestamp: stamp(newestDay - 86400), unit: "Bytes" },
+            { sum: total * 0.75, timestamp: stamp(newestDay - 2 * 86400), unit: "Bytes" },
           ],
         });
       }
@@ -224,7 +226,7 @@ test("bytes are converted on a 2^30 basis", async () => {
   // 一次触发只写一行，行首是可 grep 的状态标记，字段全部是这一轮已经算出来的东西。
   assert.deepEqual(lines, [
     "example-instance@ap-northeast-1 OK | used 1.000 GiB (0.1% of 1024) | stop at 819.200 GiB" +
-      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | meter 5.0 min behind",
+      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | win 6/6 | days 3/15 | meter 5.0 min behind",
   ]);
 });
 
@@ -372,7 +374,7 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
   // 额度——这正是这个字段存在的意义：静态线还没碰到，但趋势已经写在脸上了。
   assert.match(
     lines[0],
-    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| meter 5\.0 min behind$/,
+    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| win 6\/6 \| days 3\/15 \| meter 5\.0 min behind$/,
   );
 });
 
@@ -559,7 +561,7 @@ test("a running instance reading exactly zero hours into the month is reported",
   const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
 
-  assert.match(lines.join("\n"), /BLIND \| 9\.0 h into the month, instance is running, yet month-to-date reads exactly zero/);
+  assert.match(lines.join("\n"), /BLIND \| 9\.0 h into the month, month-to-date reads exactly zero/);
   assert.match(lines.join("\n"), /the zero-byte gate's premise does not hold here/);
 });
 
@@ -570,6 +572,60 @@ test("the same zero reading in the first minutes of a month is normal", async ()
 
   assert.ok(!lines.join("\n").includes("into the month"), "月初头几分钟不该告警");
   assert.match(lines.at(-1), /NOOP \|.*instance is "running"/);
+});
+
+test("after the burst gate stops it, the steady state says DOWN, not OK", async () => {
+  // 突发闸门可以在用量还没到静态线时就跳闸。停机后用量不再增长，于是此后每一次触发都
+  // 满足 used < limit，走的是「正常」那一支 —— 此前它无脑写 OK，结果是**站点已经下线，
+  // 而 `grep -v " OK | "` 里什么都没有**。两条停机路径的稳态现在收敛到同一个可 grep 的词。
+  for (const [label, opts] of [
+    ["数据变旧", { recentLagSeconds: 25 * 60, recentPoints: 3 }],
+    ["数据全没", { emptyBurstWindow: true }],
+  ]) {
+    const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "stopped", ...opts });
+    const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+    assert.match(lines.at(-1), /^\S+ DOWN \|/, `${label}：实例已停，稳态必须写 DOWN`);
+    assert.match(lines.at(-1), /instance is "stopped"/);
+    assert.ok(!lines.at(-1).startsWith("example-instance@ap-northeast-1 OK"), `${label}：不能写 OK`);
+  }
+});
+
+test("stale data on a running instance is still BLIND, not DOWN", async () => {
+  // 对照：实例确实在跑而数据变旧 —— 那才是指标侧的问题，必须是 BLIND。
+  const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "running", recentLagSeconds: 25 * 60, recentPoints: 3 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  assert.match(lines.join("\n"), /BLIND \| newest metric bucket is 25\.0 min old/);
+  assert.match(lines.at(-1), /^\S+ OK \|/);
+});
+
+test("the static-line stop also says DOWN", async () => {
+  const mock = stubAws({ networkIn: 900 * GIB, state: "stopped" });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  assert.match(lines.at(-1), /^\S+ DOWN \|.*over the 819\.200 GiB stop threshold.*instance is "stopped"$/);
+});
+
+test("MANUAL_HOLD does not swallow the zero-reading alarm", async () => {
+  // HOLD 的定义是「抑制所有 StartInstance」。此前它写在状态查询之后，于是连
+  // 「月份已过数小时、读数仍恰为零」那条告警一起吞掉 —— 维护期设了 hold 又忘记撤销，
+  // 就同时失去了静默失明的唯一兜底，而 HOLD 那行字面上还在说一切按计划。
+  const held = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
+  const heldLines = await capturingLogs(() =>
+    run("2026-09-01T09:00:00Z", { ...baseEnv, MANUAL_HOLD: "true" }, held),
+  );
+  assert.match(heldLines.join("\n"), /BLIND \| 9\.0 h into the month, month-to-date reads exactly zero/);
+  assert.match(heldLines.at(-1), /^\S+ HOLD \|/);
+
+  // 告警措辞不再断言实例在跑 —— 这条路径上还没查过状态。
+  assert.ok(!heldLines.join("\n").includes("instance is running, yet"));
+});
+
+test("a month reading with no usable timestamp is reported", async () => {
+  // 突发路径早就有这条；月度路径此前没有，于是覆盖范围检测会整段静默而这一轮看起来正常。
+  const mock = stubAws({ networkIn: 600 * GIB, recentIn: GIB, monthTimestampsUnusable: true });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| month-to-date has \d+ data points but no usable timestamp/);
+  assert.match(lines.join("\n"), /cannot tell whether the reading covers today/);
 });
 
 test("an empty burst window on a running instance is reported, never read as zero traffic", async () => {
@@ -822,7 +878,7 @@ test("an omitted metricData field is a legitimate zero, not an error", async () 
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
   assert.ok(opsOf(mock.calls).includes("StartInstance"), "省掉 metricData 必须读作零，而不是抛错");
-  assert.match(lines.at(-1), /^\S+ STARTED \| used 0\.000 GiB \(0\.0% of 1024\) \| stop at 819\.200 GiB \| allowance reads empty and the instance was stopped$/);
+  assert.match(lines.at(-1), /^\S+ STARTED \| used 0\.000 GiB \(0\.0% of 1024\) \| stop at 819\.200 GiB \|.*\| allowance reads empty and the instance was stopped$/);
 });
 
 test("an empty metricData array is also a legitimate zero", async () => {

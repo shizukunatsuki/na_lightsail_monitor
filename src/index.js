@@ -25,9 +25,15 @@ export const METRIC_PERIOD_SECONDS = 86400;
  * 窗口长度是被**稀释**和**落库延迟**两头夹出来的，不是随手取的整数：
  *
  * - 太长会稀释。速率是窗口内的平均值，所以一场刚开始 5 分钟的突发，在一小时的窗口里
- *   只显出真实速率的十二分之一。可以证明闸门会在「距离额度耗尽还剩 H/(H+W−L)」处跳闸
- *   （W 窗口、H 视野、L 落库延迟），与速率无关：W=60 分钟时要等耗尽进度走完 63% 才跳，
- *   5 Gbps 下只剩 7 分钟余量；W=30 分钟时 40% 就跳，余量 11.6 分钟。
+ *   只显出真实速率的十二分之一。跳闸时的剩余余量（λ = 有效可见延迟）：
+ *     `T >= W`（不再被稀释）：余量 = `H - λ`，与速率和窗口都无关；
+ *     `T < W`（仍在稀释区）：余量 = `t_exh*H/(H+W-λ) - λ`。
+ *   数值模拟验证过。W=60 分钟、5 Gbps 时余量实测是**负值**（配额烧完之后才跳闸），
+ *   W=30 分钟约 +12 分钟 —— 这才是取 30 而不是 60 的实际依据。
+ *
+ *   （这里曾经写着「余量 = t_exh*H/(H+W-L)，与速率无关，W=60 时还剩 7 分钟」。那个式子
+ *   漏掉了「月度用量读数本身也滞后 λ」，六组算例全部对不上；那个「7 分钟余量」实测是
+ *   负的 —— 把失败写成了「还有余量」。README 早已更正，这段注释一度没跟上。）
  * - 太短会瞎。窗口整个落在落库延迟的阴影里就一个数据点都没有，闸门直接失效。W=20 分钟
  *   在延迟 20 分钟时归零；W=30 分钟即便延迟到 20 分钟仍有 2 个点。
  *
@@ -39,6 +45,11 @@ export const BURST_PERIOD_SECONDS = 300;
 
 /**
  * 反应视野：按当前速率剩余额度撑不过这么久，就立刻停机，不等月度总量越过 THRESHOLD。
+ *
+ * **实测校正（2026-08-22）**：300 秒桶在**关闭那一刻就已经是终值**，不需要额外等待落库；
+ * 尚未关闭的桶也会被返回（内容按约每分钟一档增长）。所以回路里「落库延迟」那一项在实测
+ * 条件下接近零，真实回路约 16 分钟而不是下面按悲观值算的 26 分钟。参数不跟着调小 ——
+ * 按悲观值定意味着真实余量更大，方向是安全的。
  *
  * 这个数必须覆盖一整个检测回路 —— 桶必须先关闭（≤ 300 秒）＋ 指标落库延迟 ＋ cron 间隔
  * （`wrangler.jsonc` 里是 10 分钟）＋ StopInstance 真正断流的时间（约一分钟）。按落库延迟
@@ -428,16 +439,24 @@ async function sumMetric(client, config, metricName, range, period) {
  * @param {Config} config
  * @param {number} usedGib
  * @param {string} reason 触发停机的原因，会原样进入日志
+ * @param {string | null | undefined} [knownState] 这一轮已经查过的实例状态。
+ *   `undefined` 表示没查过（这里会自己查）；`null` 表示查过但读不出来（不再重试）
  */
-async function stopOverLimit(client, config, usedGib, reason) {
-  const state = await getInstanceState(client, config).catch((err) => {
-    console.error(`${config.label} DEGRADED | instance state unreadable (${err.message}) | erring toward the stop`);
-    return null;
-  });
+async function stopOverLimit(client, config, usedGib, reason, knownState = undefined) {
+  const state =
+    knownState !== undefined
+      ? knownState
+      : await getInstanceState(client, config).catch((err) => {
+          console.error(`${config.label} DEGRADED | instance state unreadable (${err.message}) | erring toward the stop`);
+          return null;
+        });
 
   if (state !== null && state !== "running") {
+    // DOWN 而不是 NOOP：这是「看门狗把实例停下了、它现在还停着」的稳态。它会每个 cron
+    // 周期重复，可能连刷数周 —— 但那正是需要一个**专属且可 grep 的词**的理由，而不是把它
+    // 混进 NOOP，更不是让另一条停机路径写成 OK（那样站点下线时过滤器里什么都没有）。
     console.log(
-      `${config.label} NOOP | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}", nothing to do`,
+      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,
     );
     return;
   }
@@ -517,6 +536,8 @@ async function burstCheck(client, config, monthRange, usedBytes) {
       secondsToQuota: null,
       stale: false,
       unmeasurable: true,
+      instanceState: state,
+      windowPoints: 0,
     };
   }
 
@@ -562,7 +583,16 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   // 读法都写进去。操作者月中自己停机时这条会连报几次直到那个桶滑出窗口，这是可以接受
   // 的代价：漏掉一次真的指标失明要糟糕得多。
   const stale = lagSeconds !== null && lagSeconds >= MAX_TOLERABLE_LAG_SECONDS;
-  if (stale) {
+
+  // 数据变旧最常见的原因不是「指标坏了」，而是**实例已经不在跑了**（看门狗自己停的、
+  // 或操作者停的）—— 桶不再产生，最新的那个就越来越旧。这是一条异常路径，多花一次
+  // 状态查询把这两件事分开是值得的：知道实例停着，日志才能写出 DOWN 而不是 OK。
+  // undefined = 这一轮没查过；null = 查了但读不出来；字符串 = 已知状态。
+  // 三者必须分开：查过但失败时不该在同一轮里再试一次（fail-closed 的逻辑本来就把 null
+  // 当成「照停」处理），否则一次 5xx 会被重试两遍共六次。
+  const instanceState = stale ? await getInstanceState(client, config).catch(() => null) : undefined;
+
+  if (stale && instanceState === "running") {
     console.error(
       `${config.label} BLIND | newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, past the ${MAX_TOLERABLE_LAG_SECONDS / 60} min tolerance | the burst gate can no longer outrun a full-rate burst this run (meter lagging, or the instance is not running)`,
     );
@@ -571,7 +601,10 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   const remainingBytes = config.quotaGib * BYTES_PER_GIB - usedBytes;
   // 速率为零时「还能撑多久」是无穷 —— formatDuration 会把它写成 never，那正是实情。
   const secondsToQuota = bytesPerSecond > 0 ? remainingBytes / bytesPerSecond : Infinity;
-  const telemetry = { lagSeconds, bytesPerSecond, secondsToQuota, stale, unmeasurable: false };
+  const telemetry = {
+    lagSeconds, bytesPerSecond, secondsToQuota, stale, unmeasurable: false, instanceState,
+    windowPoints: Math.max(recentIn.points, recentOut.points),
+  };
 
   if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };
 
@@ -665,6 +698,15 @@ export default {
     // 一边报告落后零小时。噪音与真实故障同形，是最坏的一种。
     //
     // 换成落后时长之后：00:00 那一格算出来是 0，不响；真出问题时是几小时，照响。
+    // 有数据点、却一个可用时间戳都没有 —— 覆盖范围检测整段静默，而这一轮看起来完全正常。
+    // 突发路径早就有这条告警，月度路径此前没有。
+    if (monthWithPoints.length > 0 && !Number.isFinite(monthNewest)) {
+      console.error(
+        `${config.label} BLIND | month-to-date has ${monthIn.points + monthOut.points} data points but no usable timestamp` +
+          ` | cannot tell whether the reading covers today`,
+      );
+    }
+
     const monthBehindSeconds = Number.isFinite(monthNewest)
       ? range.endTime - (monthNewest + METRIC_PERIOD_SECONDS)
       : null;
@@ -680,7 +722,8 @@ export default {
     if (usedBytes > 0) {
       burst = await burstCheck(client, config, range, usedBytes);
       if (burst.reason) {
-        await stopOverLimit(client, config, usedGib, burst.reason);
+        // 突发闸门在数据变旧时已经查过状态，别再查第二次。
+        await stopOverLimit(client, config, usedGib, burst.reason, burst.instanceState);
         return;
       }
     }
@@ -711,12 +754,31 @@ export default {
       common.push(`month ${(elapsed * 100).toFixed(0)}% elapsed, projected ${(usedGib / elapsed).toFixed(0)} GiB`);
     }
 
+    // 突发窗口实际拿到几个桶。这是 `meter` 真正的替代品：`meter` 量化到一整个 300 秒桶，
+    // 而生产的 endTime 恰好落在桶边界上，所以它几乎恒为 0；桶数则一掉就掉一格，有分辨率。
+    if (burst && burst.windowPoints !== null) {
+      common.push(`win ${burst.windowPoints}/${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}`);
+    }
+
+    // 月度读数拿到几个天桶 vs 本月已过几天。差值有正当解释（实例合法停机的日子没有桶），
+    // 所以只记录不告警 —— 但月中缺一整天时，至少有人能看见。
+    const daysElapsed = Math.ceil((range.endTime - range.startTime) / METRIC_PERIOD_SECONDS);
+    common.push(`days ${Math.max(monthIn.points, monthOut.points)}/${daysElapsed}`);
+
     if (burst && burst.lagSeconds !== null) {
       common.push(`meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`);
     }
 
     if (usedBytes > 0) {
-      console.log([`${config.label} OK`, ...common].join(" | "));
+      // 突发闸门可以在用量还没到静态线时就跳闸。停机之后用量不再增长，于是此后每一次
+      // 触发都满足 `used < limit`，走的正是这一支 —— 如果无脑写 OK，就会出现「站点已经
+      // 下线，而 `grep -v " OK | "` 里什么都没有」。凡是这一轮**确知**实例没在跑的时候
+      // （突发闸门在数据变旧或消失时查过状态），就写 DOWN，与静态线停机后的稳态收敛到
+      // 同一个可 grep 的词上。
+      const down = typeof burst?.instanceState === "string" && burst.instanceState !== "running";
+      const token = down ? "DOWN" : "OK";
+      const tail = down ? [...common, `instance is "${burst.instanceState}"`] : common;
+      console.log([`${config.label} ${token}`, ...tail].join(" | "));
       return;
     }
 
@@ -732,6 +794,17 @@ export default {
     // NTP、后台扫描 —— 所以月初至今总量为零就意味着它没起来。没有这道闸门，handler 就得
     // 在每个正常日子的每一次触发里都去问一次 GetInstanceState，为了一次重启每月多花
     // 约 4300 次调用。
+    // 这条告警只依赖「月份已过 N 小时、读数仍恰为零」，与实例状态无关，所以必须在
+    // MANUAL_HOLD 之前发出。此前它被写在状态查询之后，于是设了 HOLD 就连它一起吞掉 ——
+    // 维护期设了 hold 又忘记撤销，就同时失去了「静默失明」的唯一兜底，而 HOLD 那行字面上
+    // 还在说一切按计划。措辞不再断言实例在跑（这里还没查过状态）。
+    if (range.endTime - range.startTime > 2 * 3600) {
+      console.error(
+        `${config.label} BLIND | ${((range.endTime - range.startTime) / 3600).toFixed(1)} h into the month,` +
+          ` month-to-date reads exactly zero | the zero-byte gate's premise does not hold here`,
+      );
+    }
+
     if (config.manualHold) {
       console.log([`${config.label} HOLD`, ...common, "MANUAL_HOLD is set, leaving the instance alone"].join(" | "));
       return;
@@ -742,23 +815,6 @@ export default {
     // 实例则会开始烧流量。
     const state = await getInstanceState(client, config);
     if (state !== "stopped") {
-      // 「运行中的实例几分钟内必然产生某些流量」是零字节闸门的全部前提。月份已经走过
-      // 好几个小时、实例还在跑、读数却仍然是零 —— 这个前提在此刻不成立。
-      //
-      // 实测（2026-08-22）确认了前提的两头：运行中的实例 300 秒桶连续无缺口、每桶至少
-      // 几百 KB；实例不在跑时则**一个数据点都没有**（不是 sum=0 的点）。所以「在跑 + 读数
-      // 恒零」确实是异常，值得响一声。
-      //
-      // 已知的误报窗口：实例从 stopped 转为 running 之后，要等桶关闭（≤5 分钟）加落库
-      // （约 1 分钟）读数才会转正，这 ≤6 分钟里若正好落进一格 cron，会多写一行。代价是
-      // 一行日志，只在月中手动启动实例时可能出现一次 —— 相对「静默放过一台在跑却读不到
-      // 流量的实例」，这个方向是对的。
-      if (state === "running" && range.endTime - range.startTime > 2 * 3600) {
-        console.error(
-          `${config.label} BLIND | ${((range.endTime - range.startTime) / 3600).toFixed(1)} h into the month,` +
-            ` instance is running, yet month-to-date reads exactly zero | the zero-byte gate's premise does not hold here`,
-        );
-      }
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
       console.log([`${config.label} NOOP`, ...common, `instance is "${state}", nothing to do`].join(" | "));
       return;

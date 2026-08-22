@@ -128,7 +128,7 @@ function stub(sc) {
   return calls;
 }
 
-const TOKENS = ["OK", "STOPPED", "STARTED", "NOOP", "HOLD"];
+const TOKENS = ["OK", "STOPPED", "STARTED", "NOOP", "HOLD", "DOWN"];
 
 async function runScenario(sc, at) {
   const calls = stub(sc);
