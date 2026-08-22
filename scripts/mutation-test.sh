@@ -114,8 +114,13 @@ mutate "if (recentIn.points === 0 && recentOut.points === 0) {" "if (false) {" \
 mutate 'if (state === "running" || state === null) {' 'if (state === "running") {' \
        "状态读不出时不再报失明"
 # 跨模型审计翻出来的：月度读数覆盖范围 / 时间戳量级
-mutate "if (Number.isFinite(monthNewest) && monthNewest < todayStartUtc) {" "if (false) {" \
-       "去掉「月度读数没覆盖到今天」的检测（A1）"
+mutate "if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD_SECONDS) {" "if (false) {" \
+       "去掉「月度读数落后过久」的检测"
+mutate "if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD_SECONDS) {" \
+       "if (Number.isFinite(monthNewest) && monthNewest < Math.floor(range.endTime / 86400) * 86400) {" \
+       "月度新鲜度判据改回「不是今天」（每天 00:00 UTC 误报）"
+mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(...withPoints.map((m) => m.newest))" \
+       "新鲜度取两个指标里最新的那个（一个方向停摆会被掩盖）"
 mutate 'if (state === "running" && range.endTime - range.startTime > 2 * 3600) {' 'if (false) {' \
        "去掉「月中读数恒为零而实例在跑」的检测（A1 的月初分支）"
 mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;" \

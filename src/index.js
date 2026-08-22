@@ -526,7 +526,19 @@ async function burstCheck(client, config, monthRange, usedBytes) {
 
   // 实测落库延迟：最新那个桶覆盖 [newest, newest + 300)，它已经能查到，所以延迟就是
   // 「此刻」减去那个桶的结束时刻。桶还开着时会算出负数，钳到 0 —— 那表示数据是新鲜的。
-  const newest = Math.max(recentIn.newest ?? -Infinity, recentOut.newest ?? -Infinity);
+  // 取**最旧**的那一个，不是最新的。速率刻意按每个指标各算各的，理由就写在上面
+  // （「两个指标的落库进度并不保证同步」）—— 那么新鲜度也必须按同一个前提来判断。
+  // 取 max 会让「NetworkOut 的管道停摆、NetworkIn 照常」这种情形报告一切新鲜：不响
+  // BLIND、不标 (stale)、meter 报 0，而速率里有一半是二十多分钟前的数据。半瞎的计量表
+  // 被读作全新鲜，方向是漏停。
+  //
+  // 只看有数据点的指标：某个方向零点时它贡献不了新鲜度信息，不该把整体拖成 null。
+  const withPoints = [recentIn, recentOut].filter((m) => m.points > 0);
+  const oldestNewest =
+    withPoints.length > 0 && withPoints.every((m) => m.newest !== null)
+      ? Math.min(...withPoints.map((m) => m.newest))
+      : -Infinity;
+  const newest = oldestNewest;
   const lagSeconds = Number.isFinite(newest)
     ? Math.max(0, endTime - (newest + BURST_PERIOD_SECONDS))
     : null;
@@ -624,8 +636,12 @@ export default {
     //   只返回已关闭的天桶 -> newest 停在昨天，从今天 00:00 起越来越旧，必然触发。
     // 也就是说，它既是修复，又是那个「一次 API 调用就能分辨」的实验 —— 只不过实验在
     // 生产环境里自己跑，第一天就有结论。
-    const monthNewest = Math.max(monthIn.newest ?? -Infinity, monthOut.newest ?? -Infinity);
-    const todayStartUtc = Math.floor(range.endTime / 86400) * 86400;
+    // 同样取最旧的那一个，理由见 burstCheck 里 oldestNewest 的说明。
+    const monthWithPoints = [monthIn, monthOut].filter((m) => m.points > 0);
+    const monthNewest =
+      monthWithPoints.length > 0 && monthWithPoints.every((m) => m.newest !== null)
+        ? Math.min(...monthWithPoints.map((m) => m.newest))
+        : -Infinity;
 
     const usedBytes = monthIn.bytes + monthOut.bytes;
     const usedGib = usedBytes / BYTES_PER_GIB;
@@ -641,13 +657,21 @@ export default {
       return;
     }
 
-    // 月度读数没有覆盖到今天，而突发窗口却证明实例正在产生流量 —— 两者直接矛盾，说明
-    // 静态线看的是一份过期的用量。必须响亮。
-    if (Number.isFinite(monthNewest) && monthNewest < todayStartUtc) {
-      const behindHours = (range.endTime - (monthNewest + METRIC_PERIOD_SECONDS)) / 3600;
+    // 月度读数落后得超出了它可能合理落后的程度，说明静态线看的是一份过期的用量。
+    //
+    // 判据是「落后多久」，**不是**「最新的桶是不是今天」。后者曾经是这里的写法，结果每天
+    // 00:00 UTC 那一格必定误报一次：那一刻今天才过了 0 秒，今天的桶当然还不存在，最新的
+    // 必然是昨天 —— 而它自己算出来的 behindHours 恰好是 0.0，一边宣布「今天的流量不可见」
+    // 一边报告落后零小时。噪音与真实故障同形，是最坏的一种。
+    //
+    // 换成落后时长之后：00:00 那一格算出来是 0，不响；真出问题时是几小时，照响。
+    const monthBehindSeconds = Number.isFinite(monthNewest)
+      ? range.endTime - (monthNewest + METRIC_PERIOD_SECONDS)
+      : null;
+    if (monthBehindSeconds !== null && monthBehindSeconds > 2 * BURST_PERIOD_SECONDS) {
       console.error(
         `${config.label} BLIND | month-to-date reading only covers through ${new Date(monthNewest * 1000).toISOString().slice(0, 10)}` +
-          ` (${behindHours.toFixed(1)} h behind) | today's traffic is invisible to the static line`,
+          ` (${(monthBehindSeconds / 3600).toFixed(1)} h behind) | today's traffic is invisible to the static line`,
       );
     }
 

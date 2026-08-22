@@ -49,6 +49,8 @@ function stubAws({
   recentInPoints,
   recentOutPoints,
   recentLagSeconds = 300,
+  recentInLagSeconds,
+  recentOutLagSeconds,
   metricShape,
   monthCoversOnlyThrough,
   badPoints,
@@ -123,7 +125,8 @@ function stubAws({
           const n = (isIn ? recentInPoints : recentOutPoints) ?? recentPoints;
           // 时间戳锚定到请求的 endTime：最新那个桶覆盖 [newest, newest + 300)，而它比
           // 「此刻」早了 recentLagSeconds —— 这就是被模拟的落库延迟。
-          const newest = body.endTime - recentLagSeconds - BURST_PERIOD;
+          const lagFor = (isIn ? recentInLagSeconds : recentOutLagSeconds) ?? recentLagSeconds;
+          const newest = body.endTime - lagFor - BURST_PERIOD;
           return Response.json({
             metricName: body.metricName,
             metricData: Array.from({ length: n }, (_, i) => ({
@@ -394,6 +397,28 @@ test("the metric lag is measured from the newest bucket and reported every run",
   assert.match(lines.at(-1), /meter 12\.0 min behind$/);
 });
 
+test("one metric's pipeline stalling is not masked by the other", async () => {
+  // 速率刻意按每个指标各算各的，理由是「两个指标的落库进度并不保证同步」。那么新鲜度
+  // 也必须按同一个前提判断。此前这里取的是两者中**更新鲜**的那一个，于是「NetworkOut
+  // 管道停摆、NetworkIn 照常」会被报告成一切新鲜：不响 BLIND、不标 (stale)、meter 报 0,
+  // 而速率里有一半是二十多分钟前的数据 —— 半瞎的计量表被读作全新鲜，方向是漏停。
+  //
+  // 既有的「自我评价随延迟单调不减」那条不变量看不见它，因为它的打桩把两个指标的延迟
+  // 一起推移。这正是本项目踩过不止一次的「缺失的不变量」形状。
+  const mock = stubAws({
+    networkIn: 300 * GIB,
+    recentIn: 5 * GIB,
+    recentOut: 5 * GIB,
+    recentInLagSeconds: 60,        // 新鲜
+    recentOutLagSeconds: 25 * 60,  // 停摆，远超 12 分钟容忍上限
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| newest metric bucket is 25\.0 min old/);
+  assert.match(lines.at(-1), /\(stale\)/);
+  assert.match(lines.at(-1), /meter 25\.0 min behind/);
+});
+
 test("a lag past the tolerance is called out loudly", async () => {
   // 延迟超过容忍上限后，突发闸门已经追不上一场满速突发，此刻真正在守账单的只剩静态线。
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 22 * 60, recentPoints: 1 });
@@ -485,6 +510,22 @@ test("the lag alarm fires before the design stops holding, not after", async () 
     const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
     assert.ok(!lines.join("\n").includes("BLIND"), `延迟 ${minutes} 分钟不该告警`);
     assert.ok(!lines.at(-1).includes("(stale)"), `延迟 ${minutes} 分钟不该标 stale`);
+  }
+});
+
+test("the daily UTC rollover does not raise a month-staleness alarm", async () => {
+  // 判据一度写成「最新的天桶不是今天」。在 00:00 UTC 那一格，今天才过了 0 秒，今天的桶
+  // 当然还不存在，最新的必然是昨天 —— 于是每天必定误报一行 error，而它自己算出来的
+  // 落后时长恰好是 0.0 小时。噪音与真实故障同形，是最坏的一种。
+  //
+  // 用真实 API 复现过：连续三天的 00:00 UTC 全部误报。判据必须是「落后多久」。
+  for (const at of ["2026-08-22T00:00:00Z", "2026-08-22T00:05:00Z", "2026-09-01T00:00:00Z"]) {
+    const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthCoversOnlyThrough: "yesterday" });
+    const lines = await capturingLogs(() => run(at, baseEnv, mock));
+    assert.ok(
+      !lines.join("\n").includes("month-to-date reading only covers"),
+      `${at}：跨日那一格不该告警，实际写了 ${lines.find((l) => l.includes("BLIND"))}`,
+    );
   }
 });
 
