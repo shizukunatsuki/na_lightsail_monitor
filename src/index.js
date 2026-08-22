@@ -66,6 +66,20 @@ export const REACTION_HORIZON_SECONDS = 3600;
  */
 export const MAX_TOLERABLE_LAG_SECONDS = 720;
 
+/**
+ * 时间戳与查询终点之间允许的最大偏离，超过就当这个时间戳不可用。
+ *
+ * 防的是「是数字，但量级错了」——例如毫秒而不是 Unix 秒。此前唯一的检查是
+ * `typeof === "number"`，于是毫秒时间戳会让 `endTime − (newest + 300)` 变成一个巨大的
+ * 负数，被 `Math.max(0, …)` 钳到 0：**staleness 检测整体失效，而日志还宣称数据很新鲜**。
+ * 这与本项目已经修过的静默失明是同一类（读数存在、但语义错误），而 README 自己就写着
+ * 「多乘或少乘一个 1000 是这里的经典 bug」—— 当时只防了「不是数字」那一半。
+ *
+ * 取 400 天：比最长的查询窗口（一个月）宽得多，也覆盖了 3600 秒粒度 455 天的保留期，
+ * 不会误伤任何真实时间戳；而毫秒时间戳会偏离约五万年，隔着几个数量级。
+ */
+const MAX_TIMESTAMP_SKEW_SECONDS = 400 * 86400;
+
 /** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
 const PLACEHOLDER = "CHANGE_ME";
 
@@ -357,7 +371,12 @@ async function sumMetric(client, config, metricName, range, period) {
       throw new Error(`GetInstanceMetricData returned a non-object data point for ${metricName}`);
     }
 
-    // `sum` 缺席是允许的（那个桶没有这个统计量，按零算）；但只要它出现，就必须是一个
+    // `sum` 缺席**或显式为 null** 都按零算 —— 这是一个明确的产品决定，不是隐式行为：
+    // CloudWatch 家族的 Datapoint 各统计量字段本就可空，而「这个周期没有这个统计量」
+    // 与「这个周期没有流量」在我们的用途下同义。折算方向确实是漏停方向，但真实响应里
+    // 一个存在的数据点带着 null 的 Sum（我们明确请求了 Sum）尚未被观察到，暂按零处理。
+    //
+    // 但只要它出现且不是 null，就必须是一个
     // 有限的非负数字。这里不是洁癖：`bytes += "500"` 会走字符串拼接，两个 500 GiB 的桶
     // 会被读成 0.005 GiB —— 少报几个数量级，而少报正是唯一会让看门狗什么都不做的方向。
     // 负数同理。读不懂就抛错，与本函数其余部分保持同一种姿态。
@@ -372,8 +391,13 @@ async function sumMetric(client, config, metricName, range, period) {
     }
     bytes += sum;
 
-    // 时间戳走 Unix 秒。非数字就当没有，绝不让一个读不懂的时间戳污染延迟读数。
-    if (typeof point.timestamp === "number" && (newest === null || point.timestamp > newest)) {
+    // 时间戳走 Unix 秒。不是数字、或者量级明显不对（毫秒），都当没有 —— 绝不让一个
+    // 读不懂的时间戳污染延迟读数，那会让 staleness 检测在「看起来很新鲜」的假象下失效。
+    const usable =
+      typeof point.timestamp === "number" &&
+      Number.isFinite(point.timestamp) &&
+      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;
+    if (usable && (newest === null || point.timestamp > newest)) {
       newest = point.timestamp;
     }
   }
@@ -579,6 +603,21 @@ export default {
     // 该字段把「1 TB」记为 1024，同一响应里的 `ramSizeInGb: 0.5` 也只可能是 512 MiB，
     // 两处一致地指向 GiB。于是 QUOTA_GIB 可以直接填那个数字，不需要任何换算。
     // 安全裕度不再来自单位错配，改由 THRESHOLD 与突发闸门共同提供。
+    // 月度读数的覆盖范围。`sumMetric` 一直在算 newest，此前只有突发窗口用它 ——
+    // 但月度查询用的是 period: 86400，桶是一整天。跨模型审计指出：那五条管道假设
+    // （尤其「桶必须关闭 + 落库延迟后才可查」）从来只被应用在 300 秒窗口上，从没推广到
+    // 月度查询。如果 Lightsail 沿用「只返回已完成周期」的语义，月度读数就对**今天**的
+    // 流量全盲，盲区最长 24 小时 —— 比处处精心标定的「10 分钟落库延迟」大两个数量级，
+    // 而且此前在日志里零痕迹。
+    //
+    // 这个检查在两种语义下都正确，而且零额外调用：
+    //   返回当天部分聚合 -> newest 就是今天的桶起点，永远不触发；
+    //   只返回已关闭的天桶 -> newest 停在昨天，从今天 00:00 起越来越旧，必然触发。
+    // 也就是说，它既是修复，又是那个「一次 API 调用就能分辨」的实验 —— 只不过实验在
+    // 生产环境里自己跑，第一天就有结论。
+    const monthNewest = Math.max(monthIn.newest ?? -Infinity, monthOut.newest ?? -Infinity);
+    const todayStartUtc = Math.floor(range.endTime / 86400) * 86400;
+
     const usedBytes = monthIn.bytes + monthOut.bytes;
     const usedGib = usedBytes / BYTES_PER_GIB;
     const limitGib = config.quotaGib * config.threshold;
@@ -591,6 +630,16 @@ export default {
         `over the ${limitGib.toFixed(3)} GiB stop threshold (${config.quotaGib} GiB quota x ${config.threshold})`,
       );
       return;
+    }
+
+    // 月度读数没有覆盖到今天，而突发窗口却证明实例正在产生流量 —— 两者直接矛盾，说明
+    // 静态线看的是一份过期的用量。必须响亮。
+    if (Number.isFinite(monthNewest) && monthNewest < todayStartUtc) {
+      const behindHours = (range.endTime - (monthNewest + METRIC_PERIOD_SECONDS)) / 3600;
+      console.error(
+        `${config.label} BLIND | month-to-date reading only covers through ${new Date(monthNewest * 1000).toISOString().slice(0, 10)}` +
+          ` (${behindHours.toFixed(1)} h behind) | today's traffic is invisible to the static line`,
+      );
     }
 
     // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
@@ -660,6 +709,15 @@ export default {
     // 实例则会开始烧流量。
     const state = await getInstanceState(client, config);
     if (state !== "stopped") {
+      // 「运行中的实例几分钟内必然产生某些流量」是零字节闸门的全部前提。月份已经走过
+      // 好几个小时、实例还在跑、读数却仍然是零 —— 这个前提在此刻不成立，多半是月度读数
+      // 根本没覆盖到今天（见上面那段）。零字节此时不再等价于「它没起来」。
+      if (state === "running" && range.endTime - range.startTime > 2 * 3600) {
+        console.error(
+          `${config.label} BLIND | ${((range.endTime - range.startTime) / 3600).toFixed(1)} h into the month,` +
+            ` instance is running, yet month-to-date reads exactly zero | the zero-byte gate's premise does not hold here`,
+        );
+      }
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
       console.log([`${config.label} NOOP`, ...common, `instance is "${state}", nothing to do`].join(" | "));
       return;

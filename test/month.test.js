@@ -1,6 +1,9 @@
 // 整个套件都跑在一个与 UTC 有明显时差的时区里。下面每一条断言都是针对精确的 epoch
 // 值写的，所以它在任何时区下都成立 —— 但一个改用本地时间辅助函数的实现，在 TZ=UTC
 // 下会碰巧通过。正是这个时差让这些测试具备鉴别力。
+// 注意：运行时设置 process.env.TZ 只在 POSIX 上生效。Windows 的 Node 会忽略它，本文件
+// 在那里等于跑在 UTC 下 —— 断言本身设计成时区无关所以仍然全绿，但下面说的那种鉴别力
+// 会静默失去。CI 跑在 Linux 上，不受影响。
 process.env.TZ = "America/Los_Angeles";
 
 import { test } from "node:test";

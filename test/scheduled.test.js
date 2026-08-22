@@ -50,6 +50,7 @@ function stubAws({
   recentOutPoints,
   recentLagSeconds = 300,
   metricShape,
+  monthCoversOnlyThrough,
   badPoints,
   rawMetricBody,
   emptyBurstWindow = false,
@@ -134,14 +135,21 @@ function stubAws({
         }
 
         const total = body.metricName === "NetworkIn" ? networkIn : networkOut;
+        // 时间戳按天对齐、最新的一个是**今天**的桶。此前这里用的是三个固定的历史时间戳，
+        // 等于对月度查询的覆盖范围完全没有建模 —— 跨模型审计正是从这个维度切进来的：
+        // period 86400 的桶是一整天，如果 API 只返回已关闭的天桶，月度读数就对今天全盲。
+        // 打桩按「返回当天部分聚合」（解释 A）建模；`monthCoversOnlyThrough` 可以切到
+        // 另一种语义。
+        const today = Math.floor(body.endTime / 86400) * 86400;
+        const newestDay = monthCoversOnlyThrough === "yesterday" ? today - 86400 : today;
         // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
         // 不保证。
         return Response.json({
           metricName: body.metricName,
           metricData: [
-            { sum: total * 0.25, timestamp: 1.7540064e9, unit: "Bytes" },
-            { timestamp: 1.7531424e9, unit: "Bytes" },
-            { sum: total * 0.75, timestamp: 1.7522784e9, unit: "Bytes" },
+            { sum: total * 0.25, timestamp: newestDay, unit: "Bytes" },
+            { timestamp: newestDay - 86400, unit: "Bytes" },
+            { sum: total * 0.75, timestamp: newestDay - 2 * 86400, unit: "Bytes" },
           ],
         });
       }
@@ -480,6 +488,49 @@ test("the lag alarm fires before the design stops holding, not after", async () 
   }
 });
 
+test("a month-to-date reading that does not cover today is reported", async () => {
+  // 跨模型审计的头号发现。月度查询用 period: 86400，桶是一整天。如果 Lightsail 沿用
+  // 「只返回已完成周期」的语义，月度读数就只覆盖到昨天 —— 今天的流量对静态线完全不可见，
+  // 盲区最长 24 小时，比处处标定的「10 分钟落库延迟」大两个数量级，而此前日志里零痕迹。
+  //
+  // 这个检查在两种语义下都正确：返回当天部分聚合时永不触发；只返回已关闭天桶时必然触发。
+  // 也就是说它既是防线，也是那个「一次 API 调用才能分辨」的实验 —— 上线第一天就有结论。
+  const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthCoversOnlyThrough: "yesterday" });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| month-to-date reading only covers through 2026-08-14/);
+  assert.match(lines.join("\n"), /12\.0 h behind/);
+  assert.match(lines.join("\n"), /today's traffic is invisible to the static line/);
+});
+
+test("a month reading that covers today raises no alarm", async () => {
+  // 对照：正常语义下这条告警一次都不该出现，否则它就是纯噪音。
+  for (const at of ["2026-08-15T12:00:00Z", "2026-08-01T00:30:00Z", "2026-08-31T23:50:00Z"]) {
+    const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB });
+    const lines = await capturingLogs(() => run(at, baseEnv, mock));
+    assert.ok(!lines.join("\n").includes("month-to-date reading only covers"), `${at} 不该告警`);
+  }
+});
+
+test("a running instance reading exactly zero hours into the month is reported", async () => {
+  // 零字节闸门的全部前提是「运行中的实例几分钟内必然产生某些流量」。月份已经走了几小时、
+  // 实例还在跑、读数却仍是零 —— 这个前提在此刻不成立，多半说明月度读数没覆盖到今天。
+  const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
+  const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| 9\.0 h into the month, instance is running, yet month-to-date reads exactly zero/);
+  assert.match(lines.join("\n"), /the zero-byte gate's premise does not hold here/);
+});
+
+test("the same zero reading in the first minutes of a month is normal", async () => {
+  // 对照：跨月头几分钟读数为零是完全正常的，不该告警。
+  const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
+  const lines = await capturingLogs(() => run("2026-09-01T00:20:00Z", baseEnv, mock));
+
+  assert.ok(!lines.join("\n").includes("into the month"), "月初头几分钟不该告警");
+  assert.match(lines.at(-1), /NOOP \|.*instance is "running"/);
+});
+
 test("an empty burst window on a running instance is reported, never read as zero traffic", async () => {
   // 独立审计发现的最严重缺陷（F1）。可观测延迟有天花板：窗口 30 分钟 − 粒度 5 分钟
   // = 25 分钟。越过它之后窗口里一个点都落不进来，于是 newest 为 null、延迟算不出来、
@@ -496,6 +547,27 @@ test("an empty burst window on a running instance is reported, never read as zer
   assert.match(lines.at(-1), /now unknown \(no data points in window\)/);
   // 按产品决定：报警但不停机 —— 零数据点也可能只是实例没在跑。
   assert.ok(!opsOf(mock.calls).includes("StopInstance"));
+});
+
+test("a millisecond timestamp is rejected, not silently trusted as fresh", async () => {
+  // 跨模型审计的 A3。此前唯一的检查是 `typeof === "number"`，于是毫秒时间戳会让
+  // endTime − (newest + 300) 变成巨大的负数、被 Math.max(0, …) 钳到 0 —— staleness 检测
+  // 整体失效，而日志还宣称「meter 0.0 min behind」数据很新鲜。真实落库延迟 20 分钟
+  // （已越过 12 分钟容忍线）时，秒时间戳会正常告警，毫秒时间戳则一声不吭。
+  //
+  // 讽刺的是 README「编码时的坑」自己就写着「多乘或少乘一个 1000 是这里的经典 bug」,
+  // 而当时只防了「不是数字」那一半。
+  const NOW = Date.parse("2026-08-15T12:00:00Z") / 1000;
+  const stale = NOW - 20 * 60 - BURST_PERIOD;
+  const mock = stubAws({
+    networkIn: 10 * GIB,
+    badPoints: [{ sum: 0.5 * GIB, timestamp: stale * 1000 }],
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| \d+ data points but no usable timestamp/);
+  assert.ok(!lines.at(-1).includes("meter 0.0 min behind"), "绝不能在时间戳不可用时宣称数据新鲜");
+  assert.ok(!lines.at(-1).includes("meter "), "算不出延迟时不该有 meter 字段");
 });
 
 test("data points with no usable timestamp are reported, not silently trusted", async () => {

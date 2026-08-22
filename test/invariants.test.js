@@ -105,6 +105,14 @@ function stub(sc) {
         ? (isIn ? sc.recentInGib : sc.recentOutGib) * GIB
         : (isIn ? sc.usedGib : 0) * GIB;
       const n = burst ? (isIn ? sc.inPoints : sc.outPoints) : 1;
+      // 月度桶按天对齐到今天，否则会误触发「月度读数没覆盖到今天」的告警。
+      if (!burst) {
+        const today = Math.floor(body.endTime / 86400) * 86400;
+        return Response.json({
+          metricName: body.metricName,
+          metricData: [{ sum: total, timestamp: today, unit: "Bytes" }],
+        });
+      }
       const newest = body.endTime - sc.lagSeconds - 300;
       return Response.json({
         metricName: body.metricName,
@@ -266,9 +274,11 @@ test("the watchdog's self-assessment is monotone in metric lag", async () => {
       if (op === "GetInstanceState") return Response.json({ state: { name: "running" } });
       if (op !== "GetInstanceMetricData") return Response.json({ operations: [] });
       if (body.period !== 300) {
+        // 月度桶按天对齐，最新的是今天（解释 A：API 为未完成的当天返回部分聚合）。
+        const today = Math.floor(body.endTime / 86400) * 86400;
         return Response.json({
           metricName: body.metricName,
-          metricData: [{ sum: body.metricName === "NetworkIn" ? 300 * GIB : 0, timestamp: body.startTime }],
+          metricData: [{ sum: body.metricName === "NetworkIn" ? 300 * GIB : 0, timestamp: today }],
         });
       }
       const points = [];

@@ -113,6 +113,14 @@ mutate "if (recentIn.points === 0 && recentOut.points === 0) {" "if (false) {" \
        "去掉「窗口零数据点」的失明检测（F1 回归）"
 mutate 'if (state === "running" || state === null) {' 'if (state === "running") {' \
        "状态读不出时不再报失明"
+# 跨模型审计翻出来的：月度读数覆盖范围 / 时间戳量级
+mutate "if (Number.isFinite(monthNewest) && monthNewest < todayStartUtc) {" "if (false) {" \
+       "去掉「月度读数没覆盖到今天」的检测（A1）"
+mutate 'if (state === "running" && range.endTime - range.startTime > 2 * 3600) {' 'if (false) {' \
+       "去掉「月中读数恒为零而实例在跑」的检测（A1 的月初分支）"
+mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;" \
+       "      true;" \
+       "去掉时间戳量级检查（毫秒可静默绕过 staleness，A3）"
 mutate "  if (lagSeconds === null) {" "  if (false) {" \
        "时间戳读不出时不再报失明（同一条静默路径的另一个入口）"
 mutate 'detail = detail.replaceAll(secret, "[redacted]");' 'detail = detail.replace(secret, "[redacted]");' \
