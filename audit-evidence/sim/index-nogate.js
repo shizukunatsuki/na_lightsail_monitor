@@ -364,10 +364,7 @@ async function sumMetric(client, config, metricName, range, period) {
     const sum = point.sum ?? 0;
     if (typeof sum !== "number" || !Number.isFinite(sum) || sum < 0) {
       throw new Error(
-        // 不能直接 JSON.stringify：`{"sum": 1e400}` 是合法 JSON，解析出来是 Infinity，
-        // 而 JSON.stringify(Infinity) 是 "null" —— 日志会写成「unusable sum: null」，
-        // 把人引向「字段缺失」这个完全错误的方向。
-        `GetInstanceMetricData returned an unusable sum for ${metricName}: ${String(point.sum)}`,
+        `GetInstanceMetricData returned an unusable sum for ${metricName}: ${JSON.stringify(point.sum)}`,
       );
     }
     bytes += sum;
@@ -454,39 +451,6 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   // 2 个时，用「较长的那个」当分母会把 Out 那 600 秒里的字节摊到 1800 秒上，速率报低
   // 三倍，一场 2 Gbps 的突发就这样被放行。用「较短的那个」也不行 —— 某个方向一个点
   // 都没有时分母归零，闸门直接失效。各算各的，两边都不会错。
-  // 窗口里一个数据点都没有 —— 速率**无从谈起**，这和「速率是零」必须分开。
-  //
-  // 可观测延迟有个天花板：窗口 30 分钟减去粒度 5 分钟 = 25 分钟。延迟越过它之后，任何
-  // 已经可查的桶其起点都落在窗口之外，于是 `newest` 为 null、延迟算不出来、下面那个失明
-  // 检测跟着一起失效。此前这条路径会把 `rateOf` 返回的 0 当成正常读数打进日志，反过来
-  // 断言「实例没有流量」—— 正是本项目明令禁止的那件事（0 是唯一会让看门狗什么都不做的
-  // 读数），只不过发生在速率路径而不是用量路径上。独立审计把它复现为：延迟 25 分钟时
-  // 报警并停机，26 分钟时静默放行并写下 `now 0 kbps`。
-  //
-  // 变异测试结构上抓不到这一类缺陷 —— 缺的是一整段代码，没有哪一行可以被变异成「不报警」。
-  if (recentIn.points === 0 && recentOut.points === 0) {
-    // 「指标看不见」和「实例本来就没在跑」在指标上长得一模一样，只能多花一次调用分辨。
-    // 不分辨的代价是：操作者月中手动停机后，这条告警会每个 cron 周期响一次直到月末。
-    // 这个分支很罕见，那一次调用付得起。
-    const state = await getInstanceState(client, config).catch(() => null);
-    if (state === "running" || state === null) {
-      console.error(
-        `${config.label} BLIND | no metric data points in the last ${BURST_WINDOW_SECONDS / 60} min` +
-          ` | instance is ${state === null ? "of unreadable state" : `"${state}"`}, so the meter is blind, not idle` +
-          ` | the burst gate cannot measure a rate this run`,
-      );
-    }
-    // 不因此停机：零数据点也可能只是实例没在跑，误停的代价实打实。静态线照常工作。
-    return {
-      reason: null,
-      lagSeconds: null,
-      bytesPerSecond: null,
-      secondsToQuota: null,
-      stale: false,
-      unmeasurable: true,
-    };
-  }
-
   const rateOf = (metric) =>
     metric.points > 0 ? metric.bytes / (metric.points * BURST_PERIOD_SECONDS) : 0;
   const bytesPerSecond = rateOf(recentIn) + rateOf(recentOut);
@@ -497,17 +461,6 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   const lagSeconds = Number.isFinite(newest)
     ? Math.max(0, endTime - (newest + BURST_PERIOD_SECONDS))
     : null;
-
-  // 有数据点、却一个可用时间戳都没有：速率算得出来（它不碰时间戳），但**数据有多新
-  // 完全无从判断**，于是下面的失明检测永久失效。这是 F1 那条静默路径的另一个入口 ——
-  // 如果 Lightsail 哪天把时间戳改成 ISO 字符串，症状一模一样：没有告警、没有 meter 字段，
-  // 而余量标定唯一的实测输入就此消失。沉默不是选项。
-  if (lagSeconds === null) {
-    console.error(
-      `${config.label} BLIND | ${recentIn.points + recentOut.points} data points but no usable timestamp` +
-        ` | cannot tell how stale the rate is; the staleness check is inoperative`,
-    );
-  }
 
   // 数据老到超过容忍上限时，突发闸门已经给不出它承诺的那个保证，这一轮真正在守账单的
   // 只剩静态线 —— 必须说出来。
@@ -526,7 +479,7 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   const remainingBytes = config.quotaGib * BYTES_PER_GIB - usedBytes;
   // 速率为零时「还能撑多久」是无穷 —— formatDuration 会把它写成 never，那正是实情。
   const secondsToQuota = bytesPerSecond > 0 ? remainingBytes / bytesPerSecond : Infinity;
-  const telemetry = { lagSeconds, bytesPerSecond, secondsToQuota, stale, unmeasurable: false };
+  const telemetry = { lagSeconds, bytesPerSecond, secondsToQuota, stale };
 
   if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };
 
@@ -596,7 +549,7 @@ export default {
     // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
     let burst = null;
     if (usedBytes > 0) {
-      burst = await burstCheck(client, config, range, usedBytes);
+      burst = { reason: null, lagSeconds: null, bytesPerSecond: null, secondsToQuota: null, stale: false };
       if (burst.reason) {
         await stopOverLimit(client, config, usedGib, burst.reason);
         return;
@@ -614,10 +567,7 @@ export default {
     //   meter             —— 上游数据有多新。整套余量标定唯一一个没有文档的输入。
     const common = [formatUsage(config, usedGib), `stop at ${limitGib.toFixed(3)} GiB`];
 
-    if (burst && burst.unmeasurable) {
-      // 绝不写成 `now 0 kbps` —— 那是在没有数据的情况下断言「没有流量」。
-      common.push("now unknown (no data points in window)");
-    } else if (burst && burst.bytesPerSecond !== null) {
+    if (burst && burst.bytesPerSecond !== null) {
       // 速率来自过旧的数据点时必须标出来 —— 上面刚写了一行 BLIND 说它不可信，这里就
       // 不能再把同一个数字摆得和正常读数一样。
       const mark = burst.stale ? " (stale)" : "";

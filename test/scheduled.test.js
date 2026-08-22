@@ -6,10 +6,11 @@ import assert from "node:assert/strict";
 import worker from "../src/index.js";
 
 const ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+const SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
 const baseEnv = {
   AWS_ACCESS_KEY_ID: ACCESS_KEY_ID,
-  AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  AWS_SECRET_ACCESS_KEY: SECRET,
   AWS_REGION: "ap-northeast-1",
   INSTANCE_NAME: "example-instance",
   QUOTA_GIB: "1024",
@@ -50,6 +51,8 @@ function stubAws({
   recentLagSeconds = 300,
   metricShape,
   badPoints,
+  rawMetricBody,
+  emptyBurstWindow = false,
   serviceErrors = 0,
   unreadableState = false,
   fail,
@@ -70,8 +73,12 @@ function stubAws({
       // 状态码用 400：Lightsail 把 AccessDenied / Unauthenticated / NotFound /
       // InvalidInput / OperationFailure 全部归为 HTTP 400，只有 ServiceException 是 500。
       // 这个区分很要紧 —— 签名客户端只对 5xx 和 429 重试，所以 400 是一次性的终局失败。
+      // 两个凭据各回显**两次**。只出现一次的话，`replaceAll` 和 `replace` 行为完全一样，
+      // 「必须替换全部出现」这条性质就没有任何测试能区分 —— 独立审计正是这样发现它没被
+      // 覆盖的（把 replaceAll 改成 replace，78 个用例全绿）。
       return new Response(
-        `{"__type":"InvalidSignatureException","message":"Credential should be scoped: ${ACCESS_KEY_ID}/20260815/ap-northeast-1/lightsail/aws4_request"}`,
+        `{"__type":"InvalidSignatureException","message":"Credential ${ACCESS_KEY_ID} should be scoped: ` +
+          `${ACCESS_KEY_ID}/20260815/ap-northeast-1/lightsail/aws4_request; secret ${SECRET} was echoed twice: ${SECRET}"}`,
         { status: 400 },
       );
     }
@@ -95,6 +102,18 @@ function stubAws({
         if (metricShape === "unrelated") return Response.json({ ok: true });
         if (metricShape === "wrongMetric") return Response.json({ metricName: "CPUUtilization", metricData: [] });
         if (badPoints) return Response.json({ metricName: body.metricName, metricData: badPoints });
+        // 直接发 JSON 文本。Response.json 内部走 JSON.stringify，会把 Infinity 变成 null,
+        // 于是根本测不到「非有限的 sum」这条路径 —— 这正是 JSON.stringify(Infinity) 的坑
+        // 在夹具这一侧的同一次显形。
+        if (rawMetricBody) {
+          return new Response(rawMetricBody.replace("METRIC", body.metricName), {
+            headers: { "Content-Type": "application/x-amz-json-1.1" },
+          });
+        }
+        // 窗口里一个数据点都没有：落库延迟超过「窗口 − 粒度」之后真实 API 就是这样。
+        if (emptyBurstWindow && body.period === BURST_PERIOD) {
+          return Response.json({ metricName: body.metricName, metricData: [] });
+        }
 
         if (body.period === BURST_PERIOD) {
           const isIn = body.metricName === "NetworkIn";
@@ -461,6 +480,105 @@ test("the lag alarm fires before the design stops holding, not after", async () 
   }
 });
 
+test("an empty burst window on a running instance is reported, never read as zero traffic", async () => {
+  // 独立审计发现的最严重缺陷（F1）。可观测延迟有天花板：窗口 30 分钟 − 粒度 5 分钟
+  // = 25 分钟。越过它之后窗口里一个点都落不进来，于是 newest 为 null、延迟算不出来、
+  // 失明检测跟着失效，而 rateOf 返回的 0 会被当成正常读数打进日志 —— 看门狗在没有任何
+  // 数据的情况下**主动断言实例没有流量**。这正是本项目明令禁止的那件事，只不过发生在
+  // 速率路径而不是用量路径上。
+  const mock = stubAws({ networkIn: 300 * GIB, emptyBurstWindow: true, state: "running" });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| no metric data points in the last 30 min/);
+  assert.match(lines.join("\n"), /the meter is blind, not idle/);
+  // 绝不能出现「0 kbps」这种在无数据时伪造出来的读数。
+  assert.ok(!lines.join("\n").includes("0 kbps"), "无数据时不得打印速率读数");
+  assert.match(lines.at(-1), /now unknown \(no data points in window\)/);
+  // 按产品决定：报警但不停机 —— 零数据点也可能只是实例没在跑。
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"));
+});
+
+test("data points with no usable timestamp are reported, not silently trusted", async () => {
+  // 速率算得出来（它不碰时间戳），但数据有多新无从判断 —— 失明检测就此永久失效。
+  // 这是同一条静默路径的另一个入口：Lightsail 哪天把时间戳改成 ISO 字符串就是这个症状。
+  const mock = stubAws({
+    networkIn: 10 * GIB,
+    badPoints: [{ sum: 0.5 * 1024 ** 3, timestamp: "2026-08-15T11:50:00Z" }],
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| \d+ data points but no usable timestamp/);
+  assert.match(lines.join("\n"), /the staleness check is inoperative/);
+  // 速率照常算出来，且不带 meter 字段（因为算不出延迟）。
+  assert.match(lines.at(-1), /\| now \S+ \S+, /);
+  assert.ok(!lines.at(-1).includes("meter "), "算不出延迟时不该有 meter 字段");
+});
+
+test("an empty burst window with an unreadable state still alarms", async () => {
+  // 窗口空、而状态又读不出来 —— 分辨不了「指标失明」和「实例没在跑」。这时必须**报警**：
+  // 对失明保持沉默的代价（放任一场看不见的突发）远大于多报一次的代价。
+  const mock = stubAws({ networkIn: 300 * GIB, emptyBurstWindow: true, fail: "GetInstanceState" });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| no metric data points/);
+  assert.match(lines.join("\n"), /instance is of unreadable state/);
+  assert.match(lines.at(-1), /now unknown \(no data points in window\)/);
+});
+
+test("an empty burst window on a stopped instance is not an alarm", async () => {
+  // 「指标失明」和「实例没在跑」在指标上长得一模一样，只能多花一次状态查询分辨。
+  // 不分辨的话，操作者月中手动停机后这条告警会每个 cron 周期响一次直到月末。
+  for (const state of ["stopped", "stopping"]) {
+    const mock = stubAws({ networkIn: 300 * GIB, emptyBurstWindow: true, state });
+    const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+    assert.ok(!lines.join("\n").includes("BLIND"), `实例 "${state}" 时不该告警`);
+    assert.match(lines.at(-1), /now unknown \(no data points in window\)/);
+  }
+});
+
+test("exactly on the stop line the instance is stopped", async () => {
+  // 819.2 GiB 恰好等于停机线。`>=` 改成 `>` 只在这一点上显形，而例子测试此前只在两侧
+  // 各取了一点（±1 MiB），于是这个变异只有性质测试的 boundary 分层能抓 —— 防线只有一层。
+  const mock = stubAws({ networkIn: STOP_LINE_GIB * GIB, networkOut: 0 });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("StopInstance"), "恰好落在线上必须停机");
+  assert.match(lines.at(-1), /STOPPED \| used 819\.200 GiB \(80\.0% of 1024\)/);
+});
+
+test("a non-finite sum throws, and says so readably", async () => {
+  // `{"sum": 1e400}` 是完全合法的 JSON，JSON.parse 出来是 Infinity。此前错误消息用
+  // JSON.stringify 序列化它，而 JSON.stringify(Infinity) 是 "null" —— 日志会写成
+  // 「unusable sum: null」，把人引向「字段缺失」这个完全错误的方向。
+  const mock = stubAws({
+    rawMetricBody: '{"metricName":"METRIC","metricData":[{"sum":1e400,"timestamp":1754006400,"unit":"Bytes"}]}',
+  });
+
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    (err) => {
+      assert.match(err.message, /returned an unusable sum for Network(In|Out): Infinity/);
+      assert.ok(!err.message.includes("null"), "Infinity 不能被写成 null");
+      return true;
+    },
+  );
+});
+
+test("every credential occurrence is scrubbed, not just the first", async () => {
+  // 失败夹具现在把两个凭据各回显两次。只回显一次的话 replaceAll 和 replace 无从区分。
+  const mock = stubAws({ fail: "GetInstanceMetricData" });
+
+  await assert.rejects(
+    () => run("2026-08-15T12:00:00Z", baseEnv, mock),
+    (err) => {
+      assert.ok(!err.message.includes(ACCESS_KEY_ID), "access key id 必须全部抹掉");
+      assert.ok(!err.message.includes(SECRET), "secret 必须全部抹掉");
+      assert.ok(err.message.split("[redacted]").length - 1 >= 3, "多处出现应当被逐一替换");
+      return true;
+    },
+  );
+});
+
 test("an idle instance with no recent data points is not treated as a burst", async () => {
   // 最近一小时一个数据点都没有：速率无从谈起，绝不能因此停机。
   const mock = stubAws({ networkIn: 800 * GIB, recentPoints: 0 });
@@ -619,7 +737,7 @@ test("a string sum throws instead of silently concatenating", async () => {
 
   await assert.rejects(
     () => run("2026-08-15T12:00:00Z", baseEnv, mock),
-    /returned an unusable sum for Network(In|Out): "500"/,
+    /returned an unusable sum for Network(In|Out): 500/,
   );
 });
 

@@ -245,6 +245,80 @@ test("the handler is stateless: the same tick decided twice gives the same answe
   }
 });
 
+test("the watchdog's self-assessment is monotone in metric lag", async () => {
+  // 这条是独立审计指出的**缺失的不变量**：数据越旧，看门狗对自己的评价不得越乐观。
+  //
+  // 违反它的正是 F1：可观测延迟有天花板（窗口 30 分钟 − 粒度 5 分钟 = 25 分钟），越过
+  // 之后窗口里一个点都落不进来，于是延迟算不出来、失明检测失效、速率被当成 0 —— 25 分钟
+  // 报警，26 分钟静默。变异测试结构上抓不到这类缺陷：缺的是一整段代码，没有哪一行可以被
+  // 变异成「不报警」。只有把两次运行按延迟排起来比才看得见。
+  //
+  // 这里的打桩按真实管道语义建模：桶起点 T 覆盖 [T, T+300)，在 T+300+L 才可查；
+  // 查询只返回起点落在窗口内的桶。
+  const NOW = Date.parse("2026-08-15T12:00:00Z") / 1000;
+
+  async function alarmed(lagSeconds) {
+    const lines = [];
+    globalThis.fetch = async (input, init) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      const op = req.headers.get("X-Amz-Target").split(".")[1];
+      const body = await req.json();
+      if (op === "GetInstanceState") return Response.json({ state: { name: "running" } });
+      if (op !== "GetInstanceMetricData") return Response.json({ operations: [] });
+      if (body.period !== 300) {
+        return Response.json({
+          metricName: body.metricName,
+          metricData: [{ sum: body.metricName === "NetworkIn" ? 300 * GIB : 0, timestamp: body.startTime }],
+        });
+      }
+      const points = [];
+      for (let t = Math.ceil(body.startTime / 300) * 300; t + 300 <= body.endTime; t += 300) {
+        if (t + 300 + lagSeconds > NOW) continue; // 还没可查
+        points.push({ sum: body.metricName === "NetworkIn" ? 2 * GIB : 0, timestamp: t, unit: "Bytes" });
+      }
+      return Response.json({ metricName: body.metricName, metricData: points });
+    };
+    const { log, error } = console;
+    console.log = (...a) => lines.push(a.join(" "));
+    console.error = (...a) => lines.push(a.join(" "));
+    try {
+      await worker.scheduled({ scheduledTime: NOW * 1000, cron: "*/10 * * * *", noRetry() {} }, {
+        AWS_ACCESS_KEY_ID: ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: SECRET,
+        AWS_REGION: "ap-northeast-1",
+        INSTANCE_NAME: "example-instance",
+        QUOTA_GIB: "1024",
+        THRESHOLD: "0.8",
+      });
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+    return { blind: lines.some((l) => l.includes(" BLIND ")), text: lines.join("\n") };
+  }
+
+  const ladder = [];
+  for (let min = 0; min <= 60; min += 2) ladder.push({ min, ...(await alarmed(min * 60)) });
+
+  // 对照：延迟很小时必须安静，否则这条探针恒为真、什么都证明不了。
+  assert.ok(!ladder[0].blind, "延迟 0 分钟不该告警（对照）");
+  assert.ok(ladder.some((r) => r.blind), "总得有告警的那一档（对照）");
+
+  // 单调：一旦开始告警，更旧的数据只能继续告警。
+  const first = ladder.findIndex((r) => r.blind);
+  const silentAfter = ladder.slice(first).filter((r) => !r.blind).map((r) => r.min);
+  assert.deepEqual(
+    silentAfter,
+    [],
+    `延迟 ${ladder[first].min} 分钟会告警，但更旧的 ${silentAfter.join("/")} 分钟反而不告警`,
+  );
+
+  // 而且任何一档都不许在没有数据的情况下伪造出一个速率读数。
+  for (const r of ladder) {
+    assert.ok(!r.text.includes("now 0 kbps"), `延迟 ${r.min} 分钟时打印了伪造的 0 kbps`);
+  }
+});
+
 test("invariants hold across randomised scenarios", async () => {
   const r = rng(20260821);
   const moments = ["2026-08-15T12:00:00Z", "2026-09-01T00:00:00Z", "2026-09-01T04:00:00Z", "2026-02-28T23:00:00Z"];

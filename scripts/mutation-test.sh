@@ -107,6 +107,18 @@ mutate "export const MAX_TOLERABLE_LAG_SECONDS = 720;" "export const MAX_TOLERAB
        "延迟容忍退回按窗口推导的旧值"
 mutate "export const BURST_WINDOW_SECONDS = 1800;" "export const BURST_WINDOW_SECONDS = 900;" \
        "窗口缩到 15 分钟（容忍延迟下凑不出两个数据点）"
+# 独立审计翻出来的那一类：静默失明。变异测试本身抓不到「缺失的代码」，
+# 但代码补上之后，它能防止这段代码被改回去。
+mutate "if (recentIn.points === 0 && recentOut.points === 0) {" "if (false) {" \
+       "去掉「窗口零数据点」的失明检测（F1 回归）"
+mutate 'if (state === "running" || state === null) {' 'if (state === "running") {' \
+       "状态读不出时不再报失明"
+mutate "  if (lagSeconds === null) {" "  if (false) {" \
+       "时间戳读不出时不再报失明（同一条静默路径的另一个入口）"
+mutate 'detail = detail.replaceAll(secret, "[redacted]");' 'detail = detail.replace(secret, "[redacted]");' \
+       "脱敏只替换第一处出现（F6）"
+mutate '${String(point.sum)}' '${JSON.stringify(point.sum)}' \
+       "非有限 sum 的错误消息退回 JSON.stringify（会读作 null，F7）"
 # 模块级缓存 —— 无状态承诺一旦破掉，「失败的触发不需要对账」就不再成立
 mutate "export function monthStartMs(now) {" \
        "let _cache = null;\nexport function monthStartMs(now) {\n  if (_cache !== null) return _cache;\n  _cache = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);\n  return _cache;" \
