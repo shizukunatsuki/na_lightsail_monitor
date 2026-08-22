@@ -78,12 +78,14 @@ mutate "if (usedGib >= limitGib) {" "if (usedGib > limitGib) {" "静态线 >= �
 mutate "const bytesPerSecond = rateOf(recentIn) + rateOf(recentOut);" \
        "const bytesPerSecond = (recentIn.bytes + recentOut.bytes) / (Math.max(recentIn.points, recentOut.points) * BURST_PERIOD_SECONDS);" \
        "速率改回共同分母（漏停）"
-mutate "      burst = await burstCheck(client, config, range, usedBytes);" \
+mutate "      burst = await burstCheck(client, config, range, usedBytes, instanceState);" \
        "      burst = { reason: null, lagSeconds: null, bytesPerSecond: null, secondsToQuota: null, stale: false };" \
        "整个跳过突发闸门"
 mutate 'if (state !== null && state !== "running") {' 'if (state !== null && state === "running") {' "反转停机的状态判断"
 mutate "if (config.manualHold) {" "if (false && config.manualHold) {" "去掉 MANUAL_HOLD 对启动的抑制"
-mutate "const state = await getInstanceState(client, config);" 'const state = "stopped";' "重启路径跳过状态查询"
+mutate "      getInstanceState(client, config).catch((err) => {" \
+       '      Promise.resolve("stopped").then((v) => v).catch((err) => {' \
+       "状态查询被换成写死的 stopped（重启路径会误启动）"
 mutate "const now = new Date(controller.scheduledTime ?? Date.now());" "const now = new Date(Date.now());" "忽略 scheduledTime 改用墙上时钟"
 mutate 'for (const secret of [client.accessKeyId, client.secretAccessKey]) {' \
        'for (const secret of [client.accessKeyId]) {' "只脱敏 access key id，漏掉 secret"
@@ -124,8 +126,12 @@ mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(
 mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;" \
        "      true;" \
        "去掉时间戳量级检查（毫秒可静默绕过 staleness，A3）"
+# 实例状态必须来自 API，不能靠推断
+mutate "      getInstanceState(client, config).catch((err) => {" \
+       "      Promise.resolve(\"running\").then((v) => v).catch((err) => {" \
+       "不查状态，直接假定实例在跑"
 # 第三轮审计（带 AWS 权限）翻出来的可观测性问题
-mutate 'const down = typeof burst?.instanceState === "string" && burst.instanceState !== "running";' \
+mutate 'const down = typeof instanceState === "string" && instanceState !== "running";' \
        "const down = false;" \
        "停机后的稳态退回写 OK（站点下线而过滤器里什么都没有）"
 mutate '      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \

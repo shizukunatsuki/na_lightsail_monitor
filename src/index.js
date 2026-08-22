@@ -439,17 +439,11 @@ async function sumMetric(client, config, metricName, range, period) {
  * @param {Config} config
  * @param {number} usedGib
  * @param {string} reason 触发停机的原因，会原样进入日志
- * @param {string | null | undefined} [knownState] 这一轮已经查过的实例状态。
- *   `undefined` 表示没查过（这里会自己查）；`null` 表示查过但读不出来（不再重试）
+ * @param {string | null} state 这一轮开头查到的实例状态；`null` 表示读不出来。
+ *   状态只有一个来源（每轮开头那次 `GetInstanceState`），这里不再自己查 —— 否则就会
+ *   出现「同一轮里两个可能不一致的答案」。
  */
-async function stopOverLimit(client, config, usedGib, reason, knownState = undefined) {
-  const state =
-    knownState !== undefined
-      ? knownState
-      : await getInstanceState(client, config).catch((err) => {
-          console.error(`${config.label} DEGRADED | instance state unreadable (${err.message}) | erring toward the stop`);
-          return null;
-        });
+async function stopOverLimit(client, config, usedGib, reason, state) {
 
   if (state !== null && state !== "running") {
     // DOWN 而不是 NOOP：这是「看门狗把实例停下了、它现在还停着」的稳态。它会每个 cron
@@ -487,7 +481,7 @@ async function stopOverLimit(client, config, usedGib, reason, knownState = undef
  *   否则闸门在正常运行里完全不可见，没人能确认它是不是还在正常工作。`stale` 表示这个
  *   速率是从过旧的数据点算出来的，日志里必须标出来，不能让它看起来和正常读数一样可信。
  */
-async function burstCheck(client, config, monthRange, usedBytes) {
+async function burstCheck(client, config, monthRange, usedBytes, instanceState) {
   const { endTime } = monthRange;
 
   // 窗口**不**钳到月初。速率是个物理量，没有理由尊重月份边界：跨过 00:00 UTC 的那一刻，
@@ -517,10 +511,9 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   //
   // 变异测试结构上抓不到这一类缺陷 —— 缺的是一整段代码，没有哪一行可以被变异成「不报警」。
   if (recentIn.points === 0 && recentOut.points === 0) {
-    // 「指标看不见」和「实例本来就没在跑」在指标上长得一模一样，只能多花一次调用分辨。
-    // 不分辨的代价是：操作者月中手动停机后，这条告警会每个 cron 周期响一次直到月末。
-    // 这个分支很罕见，那一次调用付得起。
-    const state = await getInstanceState(client, config).catch(() => null);
+    // 「指标看不见」和「实例本来就没在跑」在指标上长得一模一样 —— 所以不猜，直接用这一轮
+    // 已经查到的真实状态来分辨。
+    const state = instanceState;
     if (state === "running" || state === null) {
       console.error(
         `${config.label} BLIND | no metric data points in the last ${BURST_WINDOW_SECONDS / 60} min` +
@@ -584,14 +577,8 @@ async function burstCheck(client, config, monthRange, usedBytes) {
   // 的代价：漏掉一次真的指标失明要糟糕得多。
   const stale = lagSeconds !== null && lagSeconds >= MAX_TOLERABLE_LAG_SECONDS;
 
-  // 数据变旧最常见的原因不是「指标坏了」，而是**实例已经不在跑了**（看门狗自己停的、
-  // 或操作者停的）—— 桶不再产生，最新的那个就越来越旧。这是一条异常路径，多花一次
-  // 状态查询把这两件事分开是值得的：知道实例停着，日志才能写出 DOWN 而不是 OK。
-  // undefined = 这一轮没查过；null = 查了但读不出来；字符串 = 已知状态。
-  // 三者必须分开：查过但失败时不该在同一轮里再试一次（fail-closed 的逻辑本来就把 null
-  // 当成「照停」处理），否则一次 5xx 会被重试两遍共六次。
-  const instanceState = stale ? await getInstanceState(client, config).catch(() => null) : undefined;
-
+  // 数据变旧最常见的原因不是「指标坏了」，而是**实例已经不在跑了** —— 桶不再产生，最新
+  // 的那个就越来越旧。用这一轮查到的真实状态把两件事分开，不靠推断。
   if (stale && instanceState === "running") {
     console.error(
       `${config.label} BLIND | newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, past the ${MAX_TOLERABLE_LAG_SECONDS / 60} min tolerance | the burst gate can no longer outrun a full-rate burst this run (meter lagging, or the instance is not running)`,
@@ -646,9 +633,24 @@ export default {
     const now = new Date(controller.scheduledTime ?? Date.now());
 
     const range = usageWindow(now);
-    const [monthIn, monthOut] = await Promise.all([
+
+    // 实例状态每一轮都问一次，和两次月度查询并行发出（零额外延迟）。
+    //
+    // 此前它是**按需**查的：只在要动手停机/启动、或者数据变旧变没的时候才问，正常路径
+    // 完全不问 —— 于是「实例在跑」是从「指标里还有新数据」**推断**出来的。代价是实例停机
+    // 后的头十二分钟日志照写 OK，而它从来没问过。
+    //
+    // 现在不猜：识别实例状态只有一个来源，就是 API。每轮多一次调用（正常路径 4 → 5），
+    // 速率仍是 0.008 次/秒，而 Lightsail API 不计费也没有速率配额。省下那次调用换来的是
+    // 一段「看起来正常、其实站点已经下线」的窗口，这笔交易不划算。
+    const [monthIn, monthOut, instanceState] = await Promise.all([
       sumMetric(client, config, "NetworkIn", range, METRIC_PERIOD_SECONDS),
       sumMetric(client, config, "NetworkOut", range, METRIC_PERIOD_SECONDS),
+      getInstanceState(client, config).catch((err) => {
+        // 读不出来就是读不出来，绝不退回推断。停机路径本来就把 null 当作「照停」。
+        console.error(`${config.label} DEGRADED | instance state unreadable (${err.message})`);
+        return null;
+      }),
     ]);
 
     // 虽然只有出向超量才计费，但两个方向都在消耗额度。
@@ -686,6 +688,7 @@ export default {
         config,
         usedGib,
         `over the ${limitGib.toFixed(3)} GiB stop threshold (${config.quotaGib} GiB quota x ${config.threshold})`,
+        instanceState,
       );
       return;
     }
@@ -720,10 +723,9 @@ export default {
     // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
     let burst = null;
     if (usedBytes > 0) {
-      burst = await burstCheck(client, config, range, usedBytes);
+      burst = await burstCheck(client, config, range, usedBytes, instanceState);
       if (burst.reason) {
-        // 突发闸门在数据变旧时已经查过状态，别再查第二次。
-        await stopOverLimit(client, config, usedGib, burst.reason, burst.instanceState);
+        await stopOverLimit(client, config, usedGib, burst.reason, instanceState);
         return;
       }
     }
@@ -772,12 +774,12 @@ export default {
     if (usedBytes > 0) {
       // 突发闸门可以在用量还没到静态线时就跳闸。停机之后用量不再增长，于是此后每一次
       // 触发都满足 `used < limit`，走的正是这一支 —— 如果无脑写 OK，就会出现「站点已经
-      // 下线，而 `grep -v " OK | "` 里什么都没有」。凡是这一轮**确知**实例没在跑的时候
-      // （突发闸门在数据变旧或消失时查过状态），就写 DOWN，与静态线停机后的稳态收敛到
-      // 同一个可 grep 的词上。
-      const down = typeof burst?.instanceState === "string" && burst.instanceState !== "running";
+      // 下线，而 `grep -v " OK | "` 里什么都没有」。
+      //
+      // 判据是这一轮**实际问到的**状态，不是「突发闸门恰好查过没有」。
+      const down = typeof instanceState === "string" && instanceState !== "running";
       const token = down ? "DOWN" : "OK";
-      const tail = down ? [...common, `instance is "${burst.instanceState}"`] : common;
+      const tail = down ? [...common, `instance is "${instanceState}"`] : common;
       console.log([`${config.label} ${token}`, ...tail].join(" | "));
       return;
     }
@@ -813,7 +815,13 @@ export default {
     // 这里不接管 getInstanceState 的异常：与停机路径相反，重启路径上的不确定性应该向
     // 「什么都不做」倾斜 —— 少启动一次只是站点晚几分钟回来，误启动一台操作者刻意停下的
     // 实例则会开始烧流量。
-    const state = await getInstanceState(client, config);
+    // 复用这一轮开头查到的状态。读不出来时不启动 —— 重启路径上的不确定性向「什么都不做」
+    // 倾斜，误启动一台被刻意停下的实例会开始烧流量。
+    const state = instanceState;
+    if (state === null) {
+      console.log([`${config.label} NOOP`, ...common, "instance state unreadable, not starting"].join(" | "));
+      return;
+    }
     if (state !== "stopped") {
       // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
       console.log([`${config.label} NOOP`, ...common, `instance is "${state}", nothing to do`].join(" | "));

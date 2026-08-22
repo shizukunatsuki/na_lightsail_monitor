@@ -234,8 +234,11 @@ test("just under the 819.2 GiB stop line the instance is left running", async ()
   const mock = stubAws({ networkIn: STOP_LINE_GIB * GIB - MIB, networkOut: 0 });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
-  // 两次月度查询 + 两次突发窗口查询，没有任何状态查询或动作。
-  assert.deepEqual(opsOf(mock.calls), new Array(4).fill("GetInstanceMetricData"));
+  // 两次月度查询 + 一次状态查询（每轮无条件）+ 两次突发窗口查询，没有动作。
+  assert.deepEqual(opsOf(mock.calls).sort(), [
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceMetricData",
+    "GetInstanceState",
+  ]);
 });
 
 test("just over the 819.2 GiB stop line the instance is stopped", async () => {
@@ -258,9 +261,10 @@ test("under the threshold it checks usage and the recent rate, and nothing else"
   const mock = stubAws({ networkIn: 100 * GIB, networkOut: 200 * GIB, recentIn: GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), new Array(4).fill("GetInstanceMetricData"));
+  assert.equal(opsOf(mock.calls).filter((o) => o === "GetInstanceMetricData").length, 4);
+  assert.equal(opsOf(mock.calls).filter((o) => o === "GetInstanceState").length, 1);
   assert.deepEqual(
-    mock.calls.map((c) => c.body.metricName).sort(),
+    mock.calls.filter((c) => c.operation === "GetInstanceMetricData").map((c) => c.body.metricName).sort(),
     ["NetworkIn", "NetworkIn", "NetworkOut", "NetworkOut"],
   );
 });
@@ -313,11 +317,8 @@ test("over the threshold it stops a running instance exactly once", async () => 
   const mock = stubAws({ networkIn: 400 * GIB, networkOut: 450 * GIB });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), [
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
-    "GetInstanceState",
-    "StopInstance",
+  assert.deepEqual(opsOf(mock.calls).sort(), [
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState", "StopInstance",
   ]);
   const stop = mock.calls.at(-1);
   assert.deepEqual(stop.body, { instanceName: "example-instance" });
@@ -351,13 +352,9 @@ test("a burst that would blow the quota before the next reaction stops the insta
   const mock = stubAws({ networkIn: 700 * GIB, recentIn: 340 * GIB });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
-  assert.deepEqual(opsOf(mock.calls), [
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
-    "GetInstanceState",
-    "StopInstance",
+  assert.deepEqual(opsOf(mock.calls).sort(), [
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceMetricData",
+    "GetInstanceState", "StopInstance",
   ]);
   assert.match(lines.at(-1), /STOPPED \| used 700\.000 GiB \(68\.4% of 1024\) \| burning 1622\.5 Mbps/);
   assert.match(lines.at(-1), /324\.000 GiB of quota left = 29 min to overage, inside the 60 min reaction horizon/);
@@ -574,6 +571,19 @@ test("the same zero reading in the first minutes of a month is normal", async ()
   assert.match(lines.at(-1), /NOOP \|.*instance is "running"/);
 });
 
+test("a stopped instance is reported as DOWN from the very first trigger", async () => {
+  // 实例状态每一轮都问 API，所以停机后**第一格 cron** 就知道它停了 —— 不用等数据变旧。
+  // 此前状态是按需查的：正常路径完全不问，「在跑」是从「指标里还有新数据」推断出来的，
+  // 于是停机后的头十二分钟日志照写 OK 而它从来没问过。
+  const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "stopped" });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(opsOf(mock.calls).includes("GetInstanceState"), "每一轮都必须实际问一次状态");
+  assert.match(lines.at(-1), /^\S+ DOWN \|.*instance is "stopped"$/);
+  assert.ok(!opsOf(mock.calls).includes("StartInstance"));
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"));
+});
+
 test("after the burst gate stops it, the steady state says DOWN, not OK", async () => {
   // 突发闸门可以在用量还没到静态线时就跳闸。停机后用量不再增长，于是此后每一次触发都
   // 满足 used < limit，走的是「正常」那一支 —— 此前它无脑写 OK，结果是**站点已经下线，
@@ -770,13 +780,10 @@ test("a reset allowance starts a stopped instance", async () => {
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
   await run("2026-09-01T00:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), [
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
-    "GetInstanceState",
-    "StartInstance",
+  assert.deepEqual(opsOf(mock.calls).sort(), [
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState", "StartInstance",
   ]);
-  assert.deepEqual(mock.calls[3].body, { instanceName: "example-instance" });
+  assert.deepEqual(mock.calls.at(-1).body, { instanceName: "example-instance" });
   // 窗口取的是新月份，而不是那个用量导致停机的月份。
   assert.equal(mock.calls[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });
@@ -806,7 +813,9 @@ test("a stopped instance with traffic on the meter is left alone", async () => {
   const mock = stubAws({ state: "stopped", networkIn: 120 * GIB, networkOut: 80 * GIB });
   await run("2026-08-20T09:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), new Array(4).fill("GetInstanceMetricData"));
+  assert.equal(opsOf(mock.calls).filter((o) => o === "GetInstanceMetricData").length, 4);
+  assert.ok(!opsOf(mock.calls).includes("StartInstance"));
+  assert.ok(!opsOf(mock.calls).includes("StopInstance"));
 });
 
 test("zero usage on a running instance costs one state check and nothing else", async () => {
@@ -814,10 +823,8 @@ test("zero usage on a running instance costs one state check and nothing else", 
   const mock = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
   await run("2026-09-01T00:00:00Z", baseEnv, mock);
 
-  assert.deepEqual(opsOf(mock.calls), [
-    "GetInstanceMetricData",
-    "GetInstanceMetricData",
-    "GetInstanceState",
+  assert.deepEqual(opsOf(mock.calls).sort(), [
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState",
   ]);
 });
 
@@ -827,7 +834,10 @@ test("MANUAL_HOLD suppresses the start without suppressing the stop", async () =
   // 额度已重置、实例处于停机：正常情况下应该启动。加了 hold 之后，它连状态都不去问。
   const start = stubAws({ state: "stopped" });
   await run("2026-09-01T00:00:00Z", held, start);
-  assert.deepEqual(opsOf(start.calls), ["GetInstanceMetricData", "GetInstanceMetricData"]);
+  // 状态查询现在是每轮无条件的，所以 HOLD 路径也有它 —— 但仍然不发出任何动作。
+  assert.deepEqual(opsOf(start.calls).sort(), [
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState",
+  ]);
 
   // 账单护栏照常生效 —— hold 的含义是「不要把我拉起来」，不是「允许我超额跑着」。
   const stop = stubAws({ state: "running", networkIn: 900 * GIB });
@@ -947,7 +957,8 @@ test("an unreadable instance state still stops an over-limit instance", async ()
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
-  assert.match(lines.join("\n"), /instance state unreadable .*GetInstanceState returned no state name.*erring toward the stop/);
+  // 状态查询上移到每轮开头之后，读不出来就在那里写一行 DEGRADED；停机路径照旧 fail-closed。
+  assert.match(lines.join("\n"), /DEGRADED \| instance state unreadable .*GetInstanceState returned no state name/);
 });
 
 test("a failing state check still stops an over-limit instance", async () => {
@@ -958,16 +969,19 @@ test("a failing state check still stops an over-limit instance", async () => {
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
 });
 
-test("an unreadable instance state on the restart path throws rather than starting", async () => {
+test("an unreadable instance state on the restart path does not start the instance", async () => {
   // 与停机路径相反：少启动一次只是站点晚几分钟回来，误启动一台操作者刻意停下的实例
-  // 则会开始烧流量。所以这个方向上的异常不接管。
+  // 则会开始烧流量。所以状态读不出来时绝不启动。
+  //
+  // 状态查询上移到每轮开头之后，它的失败不再让整轮抛出 —— 那样会连**停机**路径一起
+  // 掐掉，而停机路径本来是 fail-closed 的。改为：开头写一行 DEGRADED，两条路径各自按
+  // 自己的方向处理 null。
   const mock = stubAws({ networkIn: 0, networkOut: 0, unreadableState: true });
+  const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
-  await assert.rejects(
-    () => run("2026-09-01T00:00:00Z", baseEnv, mock),
-    /GetInstanceState returned no state name/,
-  );
-  assert.ok(!opsOf(mock.calls).includes("StartInstance"));
+  assert.ok(!opsOf(mock.calls).includes("StartInstance"), "状态读不出来时绝不启动");
+  assert.match(lines.join("\n"), /DEGRADED \| instance state unreadable/);
+  assert.match(lines.at(-1), /NOOP \|.*instance state unreadable, not starting$/);
 });
 
 test("at the exact month rollover the burst window reaches back into the previous month", async () => {
@@ -1012,15 +1026,15 @@ test("a 500 is retried, a 400 is not", async () => {
   // 周期的防护。Lightsail 的客户端错误全是 400，重试它们只会浪费时间。
   const retried = stubAws({ networkIn: 10 * GIB, recentIn: GIB, serviceErrors: 2 });
   await run("2026-08-15T12:00:00Z", baseEnv, retried);
-  // 两个月度查询是并行发出的，各吃一次 500 各重试一次，然后是两次突发窗口查询：
-  // 4 次逻辑调用 + 2 次重试 = 6。
-  assert.equal(retried.calls.length, 6, "两次 500 应当各触发一次重试");
-  assert.equal(opsOf(retried.calls).filter((o) => o === "GetInstanceMetricData").length, 6);
+  // 开头三个请求（两个月度查询 + 状态查询）是并行发出的，前两个各吃一次 500 各重试
+  // 一次，然后是两次突发窗口查询：5 次逻辑调用 + 2 次重试 = 7。
+  assert.equal(retried.calls.length, 7, "两次 500 应当各触发一次重试");
 
   const notRetried = stubAws({ fail: "GetInstanceMetricData" });
   await assert.rejects(() => run("2026-08-15T12:00:00Z", baseEnv, notRetried), /HTTP 400/);
-  // 400 是终局的：两个指标各试一次就抛，不该出现第三次尝试。
-  assert.ok(notRetried.calls.length <= 2, `400 不该重试，实际 ${notRetried.calls.length} 次`);
+  // 400 是终局的：开头三个并行请求各试一次，不该出现重试。
+  const metricTries = opsOf(notRetried.calls).filter((o) => o === "GetInstanceMetricData").length;
+  assert.ok(metricTries <= 2, `400 不该重试，实际 ${metricTries} 次`);
 });
 
 test("misconfiguration throws before any AWS call is made", async () => {
