@@ -719,8 +719,16 @@ export default {
     const state = await getInstanceState(client, config);
     if (state !== "stopped") {
       // 「运行中的实例几分钟内必然产生某些流量」是零字节闸门的全部前提。月份已经走过
-      // 好几个小时、实例还在跑、读数却仍然是零 —— 这个前提在此刻不成立，多半是月度读数
-      // 根本没覆盖到今天（见上面那段）。零字节此时不再等价于「它没起来」。
+      // 好几个小时、实例还在跑、读数却仍然是零 —— 这个前提在此刻不成立。
+      //
+      // 实测（2026-08-22）确认了前提的两头：运行中的实例 300 秒桶连续无缺口、每桶至少
+      // 几百 KB；实例不在跑时则**一个数据点都没有**（不是 sum=0 的点）。所以「在跑 + 读数
+      // 恒零」确实是异常，值得响一声。
+      //
+      // 已知的误报窗口：实例从 stopped 转为 running 之后，要等桶关闭（≤5 分钟）加落库
+      // （约 1 分钟）读数才会转正，这 ≤6 分钟里若正好落进一格 cron，会多写一行。代价是
+      // 一行日志，只在月中手动启动实例时可能出现一次 —— 相对「静默放过一台在跑却读不到
+      // 流量的实例」，这个方向是对的。
       if (state === "running" && range.endTime - range.startTime > 2 * 3600) {
         console.error(
           `${config.label} BLIND | ${((range.endTime - range.startTime) / 3600).toFixed(1)} h into the month,` +
