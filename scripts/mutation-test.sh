@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 变异测试：往代码里注入已知缺陷，看测试会不会变红。
 #
-# 存在的理由：「测试通过」证明不了测试有用。这个仓库里出现过两次真实的反例 ——
+# 存在的理由：「测试通过」证明不了测试有用。两种真实的反例 ——
 # 一次是打桩把 AWS 的合法空响应当成畸形响应（夹具和断言互相印证同一个错误假设），
 # 一次是性质测试跑得很热闹却抓不到任何注入的缺陷。能抓住缺陷才是唯一的证据。
 #
 # 三条纪律，都是踩过坑之后加的：
-#   1. 全程在临时副本里操作，绝不碰工作区 —— 曾经有一次中断把 `if (false && manualHold)`
+#   1. 全程在临时副本里操作，绝不碰工作区 —— 中途一次中断就可能把 `if (false && manualHold)`
 #      留在了 src 里，差点提交上去。
 #   2. 先跑对照组：不做任何变异时必须是绿的，否则说明检测器本身在瞎报。
 #   3. 检测器自己也要能被检验。这里踩过两个坑：数行数会被 reporter 打两遍的失败行骗到；
@@ -52,7 +52,7 @@ detect() {
 
 # 调参常量搬到 src/tuning.js 之后，变异目标就跨了两个文件。默认打 src/index.js，
 # `--in <路径>` 换到别的源文件。每次都从原始 src 整目录恢复 —— 只恢复一个文件的话，
-# 上一轮打在另一个文件上的变异会残留到下一轮，于是「谁抓到了什么」全部作废。
+# 只恢复一个文件的话，打在另一个文件上的变异会残留到下一轮，于是「谁抓到了什么」全部作废。
 mutate() {
   local file="src/index.js"
   if [ "$1" = "--in" ]; then file="$2"; shift 2; fi
@@ -103,7 +103,7 @@ mutate "if (usedGib >= limitGib) {" "if (usedGib <= limitGib) {" "静态线比�
 mutate "if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };" \
        "if (secondsToQuota <= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };" \
        "突发闸门比较符号写反"
-# 告警门槛退回到「从窗口推」的旧写法：cron 十分钟下它会迟到四分钟
+# 告警门槛改成「从观察窗口推」：cron 十分钟下它会迟到四分钟
 mutate "lagSeconds >= MAX_TOLERABLE_LAG_SECONDS" \
        "lagSeconds >= BURST_WINDOW_SECONDS - 2 * BURST_PERIOD_SECONDS" \
        "延迟告警门槛退回按窗口推导（迟到）"
@@ -114,23 +114,23 @@ mutate --in src/tuning.js "export const MAX_TOLERABLE_LAG_SECONDS = 720;" "expor
        "延迟容忍退回按窗口推导的旧值"
 mutate --in src/tuning.js "export const BURST_WINDOW_SECONDS = 1800;" "export const BURST_WINDOW_SECONDS = 900;" \
        "窗口缩到 15 分钟（容忍延迟下凑不出两个数据点）"
-# 独立审计翻出来的那一类：静默失明。变异测试本身抓不到「缺失的代码」，
+# 静默失明这一类。变异测试本身抓不到「缺失的代码」，
 # 但代码补上之后，它能防止这段代码被改回去。
 mutate "if (recentIn.points === 0 && recentOut.points === 0) {" "if (false) {" \
        "去掉「窗口零数据点」的失明检测（F1 回归）"
 mutate "const meterShouldSeeTraffic = (state) => state === \"running\" || state === null;" \
        'const meterShouldSeeTraffic = (state) => state === "running";' \
        "状态读不出时不再报失明"
-# 跨模型审计翻出来的：月度读数覆盖范围 / 时间戳量级
+# 月度读数的覆盖范围，以及时间戳的量级
 # 判据是三行的多行条件（加了实例状态那一档之后）—— 锚点必须整段照抄，否则会变成
 # 「变异未应用」，而那被计为存活：一个施加不上去的变异什么也没验证。
 mutate "    if (
-      monthBehindSeconds !== null &&
-      monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
+      behindSeconds !== null &&
+      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
       meterShouldSeeTraffic(instanceState)
     ) {" "    if (false) {" \
        "去掉「月度读数落后过久」的检测"
-mutate "      monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&" \
+mutate "      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&" \
        "      Number.isFinite(monthNewest) && monthNewest < Math.floor(range.endTime / 86400) * 86400 &&" \
        "月度新鲜度判据改回「不是今天」（每天 00:00 UTC 误报）"
 mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(...withPoints.map((m) => m.newest))" \
@@ -142,7 +142,7 @@ mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SE
 mutate "      getInstanceState(client, config).catch((err) => {" \
        "      Promise.resolve(\"running\").then((v) => v).catch((err) => {" \
        "不查状态，直接假定实例在跑"
-# 第三轮审计（带 AWS 权限）翻出来的可观测性问题
+# 可观测性：稳态必须能被 grep 出来，告警不能被别的分支吞掉
 mutate 'const down = typeof instanceState === "string" && instanceState !== "running";' \
        "const down = false;" \
        "停机后的稳态退回写 OK（站点下线而过滤器里什么都没有）"
@@ -186,7 +186,8 @@ mutate "export function monthStartMs(now) {" \
        "let _cache = null;\nexport function monthStartMs(now) {\n  if (_cache !== null) return _cache;\n  _cache = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);\n  return _cache;" \
        "给 monthStartMs 加模块级缓存（破坏无状态）"
 
-# 第四轮 review：同一条防线在 A 处修好、B 处的同类没跟着修
+# 「同一条防线在一处修好、另一处的同类没跟着修」这一族。判据必须只有一个来源
+# （meterShouldSeeTraffic），下面几个变异各自把其中一处改回去。
 mutate "      meterShouldSeeTraffic(instanceState)
     ) {" "      true
     ) {" \
@@ -195,8 +196,26 @@ mutate "      meterShouldSeeTraffic(instanceState)
     ) {" '      instanceState === "running"
     ) {' \
        "月度落后告警把「状态读不出来」这一档吞掉（该宁可多喊一声）"
-mutate "  if (darkDirection !== null && meterShouldSeeTraffic(instanceState)) {" "  if (false) {" \
-       "去掉「一个方向零数据点」的失明检测（闸门只看得见一半流量）"
+mutate "  if (dark === null) return;" "  return;" \
+       "去掉「一个方向零数据点」的失明检测（只看得见一半流量）"
+mutate "  if (!meterShouldSeeTraffic(instanceState)) return;" '  if (instanceState !== "running") return;' \
+       "半瞎检测把「状态读不出来」这一档吞掉"
+# 两个调用点各自是一条独立的防线，去掉任一个都必须变红
+mutate "  warnIfHalfBlind(config, recentIn, recentOut, instanceState, {" \
+       "  if (false) warnIfHalfBlind(config, recentIn, recentOut, instanceState, {" \
+       "突发窗口不再做半瞎检测"
+mutate "    warnIfHalfBlind(config, monthIn, monthOut, instanceState, {" \
+       "    if (false) warnIfHalfBlind(config, monthIn, monthOut, instanceState, {" \
+       "月度读数不再做半瞎检测（静态线少看一整个方向的用量）"
+# 数据点上限守卫：按跨度算而不是按桶相位算，会恰好在它守的那个边界上放行
+mutate "  const gridStart = Math.floor(range.startTime / 60) * 60;
+  const wanted = Math.ceil((range.endTime - gridStart) / period);" \
+       "  const wanted = Math.ceil((range.endTime - range.startTime) / period);" \
+       "上限守卫按窗口跨度算（起点未对齐时少算一个桶，边界上失效）"
+# stale 告警的措辞必须跟着实际查到的状态走
+mutate '        ? "the instance is running, so the meter itself is behind"' \
+       '        ? "the meter is lagging, or the instance is not running"' \
+       "stale 告警摆出一个已被状态排除的解释"
 mutate "  if (stale && meterShouldSeeTraffic(instanceState)) {" '  if (stale && instanceState === "running") {' \
        "stale 告警把「状态读不出来」这一档吞掉"
 mutate "      common.push(\`win \${burst.inPoints},\${burst.outPoints}/\${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}\`);" \

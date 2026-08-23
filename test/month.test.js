@@ -169,7 +169,7 @@ test("readConfig rejects a QUOTA_GIB that would compare as NaN", () => {
 test("readConfig rejects a QUOTA_GIB large enough to disable the watchdog", () => {
   // 1e308 能通过「有限且为正」那道检查，但 1e308 × 2^30 溢出成 Infinity，停机线于是变成
   // 一个永远够不到的数 —— 一个看起来在跑、实际什么都不做的看门狗。这正是 THRESHOLD
-  // 上界要防的东西，QUOTA_GIB 此前没有对应的防护。
+  // 上界要防的是同一件事，两个变量都需要。
   for (const QUOTA_GIB of ["1e308", "1e30", String(Number.MAX_SAFE_INTEGER)]) {
     assert.throws(() => readConfig({ ...validEnv, QUOTA_GIB }), /QUOTA_GIB must be a positive number of at most/);
   }

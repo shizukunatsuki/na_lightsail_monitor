@@ -48,7 +48,7 @@ function scenario(r, stratum) {
     failOp: stratum === "failure" || r() < 0.15 ? OPS[Math.floor(r() * OPS.length)] : null,
     // 400 / 403 / 500 三档都要生成。Lightsail 的两份文档对 AccessDeniedException 给的
     // 状态码并不一致（按操作那份写 400，Common Errors 那份写 403），而重试只认 5xx 和
-    // 429 —— 400 与 403 都是终局失败，500 会被重试三次。此前只生成 400/500，等于把 403
+    // 429 —— 400 与 403 都是终局失败，500 会被重试三次。只生成 400/500 的话，403
     // 那条路径整个排除在外。
     failStatus: [400, 403, 500][Math.floor(r() * 3)],
     badShape:
@@ -61,7 +61,7 @@ function scenario(r, stratum) {
     quotaGib,
     threshold,
     usedGib,
-    // 两个方向独立取量、独立取落库进度 —— 上一轮那个「用共同分母摊平速率」的漏停
+    // 两个方向独立取量、独立取落库进度 —— 「用共同分母摊平速率」那类漏停
     // bug 就活在这一维里，打桩必须能生成它。
     recentInGib: stratum === "burst" ? r() * 2 : r() < 0.3 ? r() * quotaGib : r() * 2,
     recentOutGib: stratum === "burst" || r() < 0.3 ? r() * quotaGib : r() * 2,
@@ -254,7 +254,7 @@ test("the handler is stateless: the same tick decided twice gives the same answe
 });
 
 test("the watchdog's self-assessment is monotone in metric lag", async () => {
-  // 这条是独立审计指出的**缺失的不变量**：数据越旧，看门狗对自己的评价不得越乐观。
+  // 这是一条**容易漏掉的不变量**：数据越旧，看门狗对自己的评价不得越乐观。
   //
   // 违反它的正是 F1：可观测延迟有天花板（窗口 30 分钟 − 粒度 5 分钟 = 25 分钟），越过
   // 之后窗口里一个点都落不进来，于是延迟算不出来、失明检测失效、速率被当成 0 —— 25 分钟
@@ -427,7 +427,7 @@ test("invariants hold across randomised scenarios", async () => {
     }
 
     // 9a. 评估的必须是 scheduledTime 所在的那一格，而不是墙上时钟。cron 被延迟或重试时
-    //     这条是唯一能保证「算的还是当初被触发的那一格」的东西。
+    //     这条是唯一能保证「算的还是它当初被触发的那一格」的东西。
     const monthQueries = calls.filter((c) => c.body.period === 86400);
     if (monthQueries.length > 0) {
       const d = new Date(Date.parse(at));

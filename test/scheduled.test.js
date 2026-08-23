@@ -32,9 +32,10 @@ const GIB = 1024 ** 3;
  * 于是可观测的延迟是被量化到 300 秒一档的（0、300、600 …），而且总是**不小于**真实延迟：
  * 真实延迟 720 秒时，最新一个完整的桶结束在 900 秒之前，日志里读到的就是 900 秒。
  * 这个方向是保守的 —— 告警只会更早，不会更晚。
- * 旧夹具是后者，它造出过两种真实 API 绝不会返回的东西：起点落在 startTime 之前的桶；
- * 以及「6 个点 + 5 分钟延迟」这种组合 —— 30 分钟的窗口里有 5 分钟延迟时最多只能有 5 个桶。
- * 后者曾是这个文件的**默认值**，`win 6/6 | meter 5.0 min behind` 因此写进了一大批断言。
+ * **不要改成「桶已经出现、但内容还不完整」那种建模。** 那会造出两种真实 API 绝不会返回
+ * 的东西：起点落在 startTime 之前的桶；以及「6 个点 + 5 分钟延迟」这种组合 —— 30 分钟的
+ * 窗口里有 5 分钟延迟时，物理上最多只能有 5 个桶。一个不可能的夹具会让一大批断言在描述
+ * 一件根本不会发生的事。
  *
  * 要的点数超过物理上能有的数量时直接抛错，不静默截断：一个悄悄给少了的夹具，会让断言
  * 看起来在描述一件根本没发生的事。
@@ -90,6 +91,8 @@ function stubAws({
   recentOutLagSeconds,
   metricShape,
   monthNewestDaysAgo = 0,
+  monthInPoints,
+  monthOutPoints,
   monthTimestampsUnusable = false,
   badPoints,
   rawMetricBody,
@@ -114,9 +117,9 @@ function stubAws({
       // 状态码用 400：Lightsail 把 AccessDenied / Unauthenticated / NotFound /
       // InvalidInput / OperationFailure 全部归为 HTTP 400，只有 ServiceException 是 500。
       // 这个区分很要紧 —— 签名客户端只对 5xx 和 429 重试，所以 400 是一次性的终局失败。
-      // 两个凭据各回显**两次**。只出现一次的话，`replaceAll` 和 `replace` 行为完全一样，
-      // 「必须替换全部出现」这条性质就没有任何测试能区分 —— 独立审计正是这样发现它没被
-      // 覆盖的（把 replaceAll 改成 replace，78 个用例全绿）。
+      // 两个凭据各回显**两次**，这是刻意的。只出现一次的话 `replaceAll` 和 `replace` 行为
+      // 完全一样，「必须替换全部出现」这条性质就没有任何测试能区分 —— 把 replaceAll 改成
+      // replace 时整个套件会全绿，而一个凭据的第二次出现照样进了日志。
       return new Response(
         `{"__type":"InvalidSignatureException","message":"Credential ${ACCESS_KEY_ID} should be scoped: ` +
           `${ACCESS_KEY_ID}/20260815/ap-northeast-1/lightsail/aws4_request; secret ${SECRET} was echoed twice: ${SECRET}"}`,
@@ -181,8 +184,8 @@ function stubAws({
         }
 
         const total = body.metricName === "NetworkIn" ? networkIn : networkOut;
-        // 时间戳按天对齐、最新的一个是**今天**的桶。此前这里用的是三个固定的历史时间戳，
-        // 等于对月度查询的覆盖范围完全没有建模 —— 跨模型审计正是从这个维度切进来的：
+        // 时间戳按天对齐、最新的一个是**今天**的桶。写死成三个固定的历史时间戳等于对这一维完全没有建模 ——
+        // 月度查询的覆盖范围决定了静态线看到的是不是一份过期用量：
         // period 86400 的桶是一整天，如果 API 只返回已关闭的天桶，月度读数就对今天全盲。
         const today = Math.floor(body.endTime / 86400) * 86400;
         // 最新那个天桶落在哪一天。默认是今天（解释 A：API 为未完成的当天返回部分聚合，
@@ -195,10 +198,14 @@ function stubAws({
         // 天桶会停在它最后跑过的那一天——**这一步是推断**（不能为了验证去停生产实例），
         // 依据和它的界限都记在 README 的「指标历史从实例创建那一刻开始」一节。
         //
-        // 这个参数此前不存在（只有一个 "yesterday" 开关），于是 `state: "stopped"` 的用例
-        // 全都在跑一份物理上不可能的响应：实例停着，月度读数却照样覆盖到今天。月度落后
-        // 告警缺状态条件那个缺陷正是因此整整躲过了一轮审计 —— 夹具让它无法显形。
+        // **写 `state: "stopped"` 的用例时记得一起调这个参数。** 实例停着而月度读数照样
+        // 覆盖到今天，是一份物理上不可能的响应 —— 用它做出来的断言什么也没有验证。
         const newestDay = today - monthNewestDaysAgo * 86400;
+        // 一个方向的月度读数整个没有数据点。真实 API 里这是「那个方向的管道停摆」的样子
+        // —— 空数组，HTTP 仍然是 200，metricName 照常回显。
+        const wantPoints = (body.metricName === "NetworkIn" ? monthInPoints : monthOutPoints) ?? 3;
+        if (wantPoints === 0) return Response.json({ metricName: body.metricName, metricData: [] });
+
         const stamp = (t) => (monthTimestampsUnusable ? new Date(t * 1000).toISOString() : t);
         // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
         // 不保证。
@@ -462,12 +469,14 @@ test("the metric lag is measured from the newest bucket and reported every run",
 
 test("one metric's pipeline stalling is not masked by the other", async () => {
   // 速率刻意按每个指标各算各的，理由是「两个指标的落库进度并不保证同步」。那么新鲜度
-  // 也必须按同一个前提判断。此前这里取的是两者中**更新鲜**的那一个，于是「NetworkOut
-  // 管道停摆、NetworkIn 照常」会被报告成一切新鲜：不响 BLIND、不标 (stale)、meter 报 0,
-  // 而速率里有一半是二十多分钟前的数据 —— 半瞎的计量表被读作全新鲜，方向是漏停。
+  // 也必须按同一个前提判断：取两者中**更旧**的那一个。
   //
-  // 既有的「自我评价随延迟单调不减」那条不变量看不见它，因为它的打桩把两个指标的延迟
-  // 一起推移。这正是本项目踩过不止一次的「缺失的不变量」形状。
+  // 取更新鲜的那一个会让「NetworkOut 管道变慢、NetworkIn 照常」报告成一切新鲜 —— 不响
+  // BLIND、不标 (stale)、meter 报 0，而速率里有一半是二十多分钟前的数据。半瞎的计量表
+  // 被读作全新鲜，方向是漏停。
+  //
+  // 「自我评价随延迟单调不减」那条不变量**看不见**这个缺陷，因为它的打桩把两个指标的
+  // 延迟一起推移。两个方向不同步这一维只有这条用例在守。
   const mock = stubAws({
     networkIn: 300 * GIB,
     recentIn: 5 * GIB,
@@ -491,17 +500,22 @@ test("a lag past the tolerance is called out loudly", async () => {
     lines.join("\n"),
     /^\S+ BLIND \| newest metric bucket is 25\.0 min old, past the 12 min tolerance \|/m,
   );
-  // 措辞只陈述观察到的事实：光看指标分不出「指标侧延迟」和「实例没在跑」。
-  assert.match(lines.join("\n"), /meter lagging, or the instance is not running/);
+  // 措辞跟着这一轮**实际查到的**状态走。实例确认在跑时，「实例没在跑」这个解释已经被
+  // 排除掉了，就不该再摆出来让人多查一遍。
+  assert.match(lines.join("\n"), /the instance is running, so the meter itself is behind/);
+  assert.ok(
+    !lines.join("\n").includes("or an instance that is not running"),
+    "实例确认在跑时不该再提这个已被排除的解释",
+  );
   // 而且刚被宣布不可信的那个速率，在 OK 行里必须带 (stale) 标记，不能装成正常读数。
   assert.match(lines.at(-1), /^\S+ OK \|.*\| now \S+ \S+ \(stale\), /);
   assert.ok(!opsOf(mock.calls).includes("StopInstance"), "报警归报警，不能因此停机");
 });
 
 test("a lag past the tolerance with an unreadable state is still called out", async () => {
-  // 判据此前就地写成 `instanceState === "running"`，于是状态读不出来时这条告警被整个
-  // 吞掉 —— 而项目对这一档的既定规则是「宁可多喊一声」，另外三个调用点和 README 的
-  // 表格都是这么定的。状态读不出来时数据还很旧，恰恰是最需要说话的时候。
+  // 判据必须走 `meterShouldSeeTraffic`，不要就地写 `instanceState === "running"`：那样
+  // 状态读不出来时这条告警会被整个吞掉。这一档的既定规则是「宁可多喊一声」，五个调用点
+  // 和 README 的表格都是这么定的 —— 状态读不出来而数据还很旧，恰恰是最需要说话的时候。
   //
   // 这一轮还会另写一行 DEGRADED，但那说的是「状态读不出来」，不是「速率不可信」——
   // 两件事，不能互相顶替。
@@ -517,6 +531,8 @@ test("a lag past the tolerance with an unreadable state is still called out", as
     lines.join("\n"),
     /^\S+ BLIND \| newest metric bucket is 25\.0 min old, past the 12 min tolerance \|/m,
   );
+  // 状态读不出来时两种解释都还活着，措辞必须把两种都摆出来。
+  assert.match(lines.join("\n"), /either a lagging meter or an instance that is not running/);
   assert.match(lines.at(-1), /^\S+ OK \|.*\| now \S+ \S+ \(stale\), /);
 });
 
@@ -560,12 +576,12 @@ test("a direction with no landed points contributes zero instead of blinding the
 });
 
 test("a direction going dark is called out, not silently averaged into the rate", async () => {
-  // 上一条钉住的是「缺一个方向不该让闸门失效」，那是对的，别改。这一条钉住的是另一半：
-  // **这件事必须说出来**。闸门此刻只看得见一半的流量，少报的方向正是漏停。
+  // 「缺一个方向不该让闸门失效」（上面那条用例）和「这件事必须说出来」（这条）是两个
+  // 独立的要求，都要满足。闸门此刻只看得见一半的流量，少报的方向正是漏停。
   //
-  // 此前这里完全沉默，而且 `win` 字段取两个方向的**较大值** —— 于是 NetworkOut 整个
-  // 管道停摆时日志照写 `win 6/6 | meter 0.0 min behind`，与一切正常那一行完全同形。
-  // 两个方向都零点会响 BLIND，一个方向零点却一声不吭，没有道理。
+  // 沉默的代价：`win` 字段如果取两个方向的**较大值**，NetworkOut 整个管道停摆时日志会
+  // 写成 `win 6/6 | meter 0.0 min behind` —— 与一切正常那一行完全同形。两个方向都零点会
+  // 响 BLIND，一个方向零点却一声不吭，没有道理。
   //
   // 实测（2026-08-23，ap-northeast-1）：跑着的实例两个方向的桶数完全同步（6/6 与 6/6，
   // lag 都是 16 秒），所以「一侧 6 个桶、另一侧 0 个」不是正常形态。
@@ -592,6 +608,38 @@ test("both directions landing normally raises no half-blind alarm", async () => 
 
   assert.ok(!lines.join("\n").includes("has no data points"), "两侧都正常时不该告警");
   assert.ok(lines.at(-1).includes("win 6,6/6"), lines.at(-1));
+});
+
+test("a direction going dark with an unreadable state is still called out", async () => {
+  // 状态读不出来这一档一律「宁可多喊一声」——「不确定实例在不在跑」不是把话咽回去的
+  // 理由，何况这一轮的速率里确实少了一整个方向。判据走 meterShouldSeeTraffic，与另外
+  // 四个调用点一致。
+  const mock = stubAws({
+    networkIn: 5 * GIB,
+    networkOut: 5 * GIB,
+    unreadableState: true,
+    recentInPoints: 6,
+    recentOutPoints: 0,
+    recentIn: GIB,
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| NetworkOut has no data points in the last 30 min/);
+  assert.match(lines.at(-1), /win 6,0\/6/);
+});
+
+test("a month reading missing one direction with an unreadable state is still called out", async () => {
+  // 月度那一侧同理 —— 两个调用点共用同一个判据，两边都要有用例钉住。
+  const mock = stubAws({
+    networkIn: 400 * GIB,
+    networkOut: 400 * GIB,
+    monthOutPoints: 0,
+    unreadableState: true,
+    recentIn: GIB,
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| NetworkOut has no data points in the month-to-date reading/);
 });
 
 test("a draining window on a stopped instance is not a half-blind alarm", async () => {
@@ -630,7 +678,7 @@ test("a very long runway is capped rather than printed to the day", async () => 
 });
 
 test("the lag alarm fires before the design stops holding, not after", async () => {
-  // 这条守的是一个只在改了 cron 之后才出现的缺陷。告警门槛原先是从**观察窗口**推出来的
+  // 这条守的是一个只在改了 cron 之后才显形的缺陷：门槛挂在**观察窗口**上时
   // （凑不出两个数据点 = 20 分钟）；而真正会断的是**检测回路**：cron 每 2 分钟时闸门在
   // 延迟 25 分钟才守不住，20 分钟的告警是提前的；cron 放宽到 10 分钟后临界点降到 16 分钟，
   // 同一个 20 分钟就变成了迟到四分钟 —— 延迟落在 [16, 20) 分钟时设计已经失效而没有任何
@@ -672,9 +720,9 @@ test("the daily UTC rollover does not raise a month-staleness alarm", async () =
 });
 
 test("a month-to-date reading that does not cover today is reported", async () => {
-  // 跨模型审计的头号发现。月度查询用 period: 86400，桶是一整天。如果 Lightsail 沿用
-  // 「只返回已完成周期」的语义，月度读数就只覆盖到昨天 —— 今天的流量对静态线完全不可见，
-  // 盲区最长 24 小时，比处处标定的「10 分钟落库延迟」大两个数量级，而此前日志里零痕迹。
+  // 月度查询用 period: 86400，桶是一整天。如果上游哪天改成
+  // 「只返回已完成周期」，月度读数就只覆盖到昨天 —— 今天的流量对静态线完全不可见，
+  // 盲区最长 24 小时，比处处精心标定的「10 分钟落库延迟」大两个数量级。这条告警是那种情形唯一的信号。
   //
   // 这个检查在两种语义下都正确：返回当天部分聚合时永不触发；只返回已关闭天桶时必然触发。
   // 也就是说它既是防线，也是那个「一次 API 调用才能分辨」的实验 —— 上线第一天就有结论。
@@ -691,11 +739,11 @@ test("a legitimately stopped instance is not accused of a blind month reading", 
   // 那个就停在它最后跑过的那一天，之后每天多落后 24 小时 —— 实测确认没有流量的日子
   // 根本不返回桶（见 stubAws 里月度分支的注释）。
   //
-  // 此前这条告警**根本没问过实例状态**，于是从停机次日 00:20 UTC 起每一个 cron 周期都
-  // 喊一次，一天约 142 条，一直喊到实例被拉起来或者跨月。而且那句话是错的：停机期间
-  // 今天的流量不是「不可见」，是不存在。
+  // 告警**不问实例状态**的话，从停机次日 00:20 UTC 起每一个 cron 周期都会喊一次，一天
+  // 约 142 条，一直喊到实例被拉起来或者跨月。而且那句话本身是错的：停机期间今天的流量
+  // 不是「不可见」，是不存在。
   //
-  // 这与零读数告警当初的教训完全同形，README 里已经写过一次：真正的管道故障会淹没在
+  // 这与零读数告警面对的是同一个问题，README 里也写着同一条结论：真正的管道故障会淹没在
   // 这串噪音里。夹具当时让它无法显形 —— `state: "stopped"` 的响应照样覆盖到今天。
   //
   // 用量刻意压在静态线之下：越线会走 675 行那条提前 return，根本到不了这条告警。
@@ -719,7 +767,7 @@ test("a legitimately stopped instance is not accused of a blind month reading", 
 });
 
 test("the same stale month reading on a running instance is still reported", async () => {
-  // 上一条的对照组。加了状态条件之后这一条必须照旧响 —— 否则那个条件就不是「去掉误报」，
+  // 对照组：带上状态条件之后这一条必须照旧响 —— 否则那个条件就不是「去掉误报」，
   // 而是把整条防线关掉了。实例在跑却读不到今天的桶，才是静态线真的在看一份过期用量。
   const mock = stubAws({ networkIn: 200 * GIB, recentIn: GIB, state: "running", monthNewestDaysAgo: 3 });
   const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
@@ -772,8 +820,8 @@ test("the same zero reading in the first minutes of a month is normal", async ()
 
 test("a stopped instance is reported as DOWN from the very first trigger", async () => {
   // 实例状态每一轮都问 API，所以停机后**第一格 cron** 就知道它停了 —— 不用等数据变旧。
-  // 此前状态是按需查的：正常路径完全不问，「在跑」是从「指标里还有新数据」推断出来的，
-  // 于是停机后的头十二分钟日志照写 OK 而它从来没问过。
+  // 改成「按需查」（正常路径不问，靠「指标里还有没有新数据」推断）的话，指标的落库延迟会让
+  // 停机后的头十几分钟日志继续写 OK，而它从来没问过。
   const mock = stubAws({ networkIn: 300 * GIB, recentIn: GIB, state: "stopped" });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
@@ -785,8 +833,8 @@ test("a stopped instance is reported as DOWN from the very first trigger", async
 
 test("after the burst gate stops it, the steady state says DOWN, not OK", async () => {
   // 突发闸门可以在用量还没到静态线时就跳闸。停机后用量不再增长，于是此后每一次触发都
-  // 满足 used < limit，走的是「正常」那一支 —— 此前它无脑写 OK，结果是**站点已经下线，
-  // 而 `grep -v " OK | "` 里什么都没有**。两条停机路径的稳态现在收敛到同一个可 grep 的词。
+  // 满足 used < limit，走的是「正常」那一支 —— 这一支如果无脑写 OK，结果就是**站点已经下线，
+  // 而 `grep -v " OK | "` 里什么都没有**。两条停机路径的稳态收敛到同一个可 grep 的词（DOWN）。
   for (const [label, opts] of [
     ["数据变旧", { recentLagSeconds: 25 * 60 }],
     ["数据全没", { emptyBurstWindow: true }],
@@ -814,8 +862,8 @@ test("the static-line stop also says DOWN", async () => {
 });
 
 test("MANUAL_HOLD does not swallow the zero-reading alarm", async () => {
-  // HOLD 的定义是「抑制所有 StartInstance」。此前它写在状态查询之后，于是连
-  // 「月份已过数小时、读数仍恰为零」那条告警一起吞掉 —— 维护期设了 hold 又忘记撤销，
+  // HOLD 的定义是「抑制所有 StartInstance」，仅此而已。它在 handler 里必须排在
+  // 「月份已过数小时、读数仍恰为零」那条告警**之后**：排在前面会把那条一起吞掉 —— 维护期设了 hold 又忘记撤销，
   // 就同时失去了静默失明的唯一兜底，而 HOLD 那行字面上还在说一切按计划。
   //
   // hold 与实例状态是两件事：hold 只挡启动，它自己并不停机。所以「设了 hold 而实例还在
@@ -829,9 +877,9 @@ test("MANUAL_HOLD does not swallow the zero-reading alarm", async () => {
 });
 
 test("a legitimately stopped instance reading zero is not alarmed about", async () => {
-  // 对照，也是这次改动删掉的一个真实误报：实例被合法停着（看门狗停的，或操作者自己停的），
-  // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。旧写法只看「月份已过几小时」，
-  // 于是从当月第 2 小时起每一次触发都报一次 BLIND，一直报到实例被拉起来为止。
+  // 对照：实例被合法停着（看门狗停的，或操作者自己停的）时，
+  // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。判据只看「月份已过几小时」而不看状态的话，
+  // 会从当月第 2 小时起每一次触发都报一次 BLIND，一直报到实例被拉起来为止。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
 
@@ -840,7 +888,8 @@ test("a legitimately stopped instance reading zero is not alarmed about", async 
 });
 
 test("a month reading with no usable timestamp is reported", async () => {
-  // 突发路径早就有这条；月度路径此前没有，于是覆盖范围检测会整段静默而这一轮看起来正常。
+  // 突发路径和月度路径各有一条，两边都要有。少掉任何一条，对应那一侧的覆盖范围检测都会
+  // 整段静默，而那一轮看起来完全正常。
   const mock = stubAws({ networkIn: 600 * GIB, recentIn: GIB, monthTimestampsUnusable: true });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
@@ -849,11 +898,12 @@ test("a month reading with no usable timestamp is reported", async () => {
 });
 
 test("an empty burst window on a running instance is reported, never read as zero traffic", async () => {
-  // 独立审计发现的最严重缺陷（F1）。可观测延迟有天花板：窗口 30 分钟 − 粒度 5 分钟
-  // = 25 分钟。越过它之后窗口里一个点都落不进来，于是 newest 为 null、延迟算不出来、
-  // 失明检测跟着失效，而 rateOf 返回的 0 会被当成正常读数打进日志 —— 看门狗在没有任何
-  // 数据的情况下**主动断言实例没有流量**。这正是本项目明令禁止的那件事，只不过发生在
-  // 速率路径而不是用量路径上。
+  // 可观测延迟有天花板：窗口 30 分钟 − 粒度 5 分钟 = 25 分钟。越过它之后窗口里一个点都
+  // 落不进来，于是 newest 为 null、延迟算不出来、失明检测跟着失效。
+  //
+  // 没有专门的一支来接这种情形的话，`rateOf` 返回的 0 会被当成正常读数打进日志 ——
+  // 看门狗在没有任何数据的情况下**主动断言实例没有流量**，而 0 正是唯一会让它什么都不做
+  // 的读数。症状是延迟 25 分钟时报警并停机、26 分钟时静默放行并写下 `now 0 kbps`。
   const mock = stubAws({ networkIn: 300 * GIB, emptyBurstWindow: true, state: "running" });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
@@ -867,13 +917,12 @@ test("an empty burst window on a running instance is reported, never read as zer
 });
 
 test("a millisecond timestamp is rejected, not silently trusted as fresh", async () => {
-  // 跨模型审计的 A3。此前唯一的检查是 `typeof === "number"`，于是毫秒时间戳会让
-  // endTime − (newest + 300) 变成巨大的负数、被 Math.max(0, …) 钳到 0 —— staleness 检测
-  // 整体失效，而日志还宣称「meter 0.0 min behind」数据很新鲜。真实落库延迟 20 分钟
-  // （已越过 12 分钟容忍线）时，秒时间戳会正常告警，毫秒时间戳则一声不吭。
+  // 只检查 `typeof === "number"` 是不够的：毫秒时间戳会让 endTime − (newest + 300) 变成
+  // 巨大的负数、被 Math.max(0, …) 钳到 0 —— 新鲜度检测整体失效，而日志还宣称
+  // 「meter 0.0 min behind」数据很新鲜。
   //
-  // 讽刺的是 README「编码时的坑」自己就写着「多乘或少乘一个 1000 是这里的经典 bug」,
-  // 而当时只防了「不是数字」那一半。
+  // 这条用例把两种时间戳摆在同一个场景下对比：真实落库延迟 20 分钟（已越过 12 分钟容忍
+  // 线）时，秒时间戳会正常告警，毫秒时间戳则一声不吭。
   const NOW = Date.parse("2026-08-15T12:00:00Z") / 1000;
   const stale = NOW - 20 * 60 - BURST_PERIOD;
   const mock = stubAws({
@@ -926,8 +975,8 @@ test("an empty burst window on a stopped instance is not an alarm", async () => 
 });
 
 test("exactly on the stop line the instance is stopped", async () => {
-  // 819.2 GiB 恰好等于停机线。`>=` 改成 `>` 只在这一点上显形，而例子测试此前只在两侧
-  // 各取了一点（±1 MiB），于是这个变异只有性质测试的 boundary 分层能抓 —— 防线只有一层。
+  // 819.2 GiB 恰好等于停机线。`>=` 改成 `>` **只在这一个点上**显形 —— 在两侧各取一点
+  // （±1 MiB）是抓不到的。边界必须显式生成，随机采样永远撞不上等号。
   const mock = stubAws({ networkIn: STOP_LINE_GIB * GIB, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
@@ -936,8 +985,8 @@ test("exactly on the stop line the instance is stopped", async () => {
 });
 
 test("a non-finite sum throws, and says so readably", async () => {
-  // `{"sum": 1e400}` 是完全合法的 JSON，JSON.parse 出来是 Infinity。此前错误消息用
-  // JSON.stringify 序列化它，而 JSON.stringify(Infinity) 是 "null" —— 日志会写成
+  // `{"sum": 1e400}` 是完全合法的 JSON，JSON.parse 出来是 Infinity。错误消息**不能**用
+  // JSON.stringify 序列化它：`JSON.stringify(Infinity)` 是 `"null"`，日志会写成
   // 「unusable sum: null」，把人引向「字段缺失」这个完全错误的方向。
   const mock = stubAws({
     rawMetricBody: '{"metricName":"METRIC","metricData":[{"sum":1e400,"timestamp":1754006400,"unit":"Bytes"}]}',
@@ -1093,8 +1142,8 @@ test("a failure on the stop call itself is not swallowed", async () => {
 test("an omitted metricData field is a legitimate zero, not an error", async () => {
   // 这条守的是一个差点被写进生产的 bug。AWS 的响应定义里 metricData 没有任何「必然
   // 出现」的保证，各语言 SDK 一律把「字段缺失」正规化成空数组 —— 也就是说服务端允许
-  // 在没有数据时把它整个省掉。此前的实现把「字段缺失」当成读不懂并抛错，而一台停机的
-  // 实例在新月份读到的恰恰就是这种空响应：每次触发都抛错，重启永远发不出去，实例会
+  // 在没有数据时把它整个省掉。把「字段缺失」当成读不懂并抛错的代价是致命的：一台停机的
+  // 实例在新月份读到的恰恰就是这种空响应，于是每次触发都抛错，重启永远发不出去，实例会
   // 停满一整个月。
   //
   // 更隐蔽的是，当时的打桩正是用 `{ metricName }` 来模拟「畸形响应」的 —— 夹具和测试
@@ -1141,7 +1190,8 @@ test("a negative sum throws", async () => {
 });
 
 test("a null data point throws deliberately rather than crashing", async () => {
-  // 此前这里是一句不透明的 TypeError: Cannot read properties of null。
+  // 不显式检查的话，这里会是一句不透明的 TypeError: Cannot read properties of null ——
+  // 那只是碰巧崩了，不是一道防线（换个运行时或换个畸形形状就可能不崩）。
   const mock = stubAws({ badPoints: [null] });
   await assert.rejects(
     () => run("2026-08-15T12:00:00Z", baseEnv, mock),
@@ -1182,6 +1232,54 @@ test("a query that would exceed the API's datapoint cap throws", async () => {
   }
 });
 
+test("the datapoint cap counts buckets by their phase, not by the window's span", async () => {
+  // 桶的相位跟着查询走：起点是 `floor(startTime / 60) * 60`，最多比 startTime 早 59 秒。
+  // 于是一个窗口能盖住的桶数可能比「跨度 ÷ 粒度」多一个。
+  //
+  // 按跨度算的话，守卫恰好在它守的那个边界上放行：startTime 对 60 取余 59、跨度 5 天、
+  // 粒度 300 秒时，跨度算出来是 1440（放行），而真实桶数是 1441 —— 上游对超限**不报错**，
+  // 它回 HTTP 200 加一个空数组，落地就是 0 字节。守卫失效的方式恰好是它存在的理由。
+  const mock = stubAws();
+  const client = new AwsClient({
+    accessKeyId: ACCESS_KEY_ID, secretAccessKey: SECRET, service: "lightsail", region: "ap-northeast-1",
+  });
+  const config = { region: "ap-northeast-1", instanceName: "example-instance", label: "x" };
+  try {
+    // 起点没对齐到分钟：跨度仍是 1440 × 300，但真实桶数是 1441。
+    await assert.rejects(
+      () => sumMetric(client, config, "NetworkOut", { startTime: 59, endTime: 59 + 1440 * 300 }, 300),
+      /would ask for 1441 data points, past the 1440/,
+      "起点未对齐时窗口多盖一个桶，守卫必须按相位算出 1441",
+    );
+    // 对照：同样的跨度，起点对齐到分钟时真实桶数就是 1440，必须放行。
+    await sumMetric(client, config, "NetworkOut", { startTime: 60, endTime: 60 + 1440 * 300 }, 300);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a month reading missing one whole direction is called out", async () => {
+  // 月度查询也有「半瞎」这一档，而且后果更直接：静态线的总量少了一整个方向。
+  // 打桩让 NetworkOut 的月度读数一个天桶都没有，NetworkIn 正常。
+  const mock = stubAws({ networkIn: 400 * GIB, networkOut: 400 * GIB, monthOutPoints: 0, recentIn: GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  const text = lines.join("\n");
+
+  assert.match(text, /BLIND \| NetworkOut has no data points in the month-to-date reading/);
+  assert.match(text, /under-reports it against the static line/);
+  // 而且那一行必须让人看出是哪一侧没了。
+  assert.match(lines.at(-1), /days 3,0\/15/);
+  // 用量确实只读到了一半 —— 断言这一点，免得哪天打桩改了而测试还在自我印证。
+  assert.match(lines.at(-1), /used 400\.000 GiB/);
+});
+
+test("a month reading with both directions present raises no half-blind alarm", async () => {
+  // 对照：正常那一轮一次都不该出现，否则它就是纯噪音。
+  const mock = stubAws({ networkIn: 5 * GIB, networkOut: 5 * GIB, recentIn: GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  assert.ok(!lines.join("\n").includes("in the month-to-date reading"), lines.join("\n"));
+});
+
 test("a month reading that starts after the month does say so", async () => {
   // 打桩的月度数据只有三个天桶，最老的那个远晚于月初 —— 读数没覆盖到月初这件事必须
   // 出现在日志里。`days 16/22` 只说少了六天，不说少的是哪六天，而「月初连续少六天」
@@ -1204,8 +1302,8 @@ test("a data point in the wrong unit throws instead of being summed", async () =
 });
 
 test("a data point with no unit field is still accepted", async () => {
-  // 刻意的不对称，也是这个仓库付过学费的那一课：把**合法的字段缺失**当成畸形响应，
-  // 曾经让停机中的实例整月发不出重启。缺席按「没说」处理，出现且不一致才算错。
+  // 刻意的不对称。把**合法的字段缺失**当成畸形响应，
+  // 会让停机中的实例整月发不出重启。缺席按「没说」处理，出现且不一致才算错。
   const mock = stubAws({ badPoints: [{ sum: GIB, timestamp: 1.754e9 }] });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
   assert.match(lines.at(-1), /used 2\.000 GiB/);
@@ -1315,8 +1413,8 @@ test("a controller without scheduledTime falls back to the wall clock", async ()
 });
 
 test("a 500 is retried, a 400 is not", async () => {
-  // README 声称「2 次重试，只针对 5xx 和 429」。此前这条只靠读 aws4fetch 源码来确认，
-  // 没有任何行为测试 —— 而它决定了一次 ServiceException 抖动会不会白白丢掉一个 cron
+  // README 声称「2 次重试，只针对 5xx 和 429」。这条用例是那句话的行为证据 —— 光读
+  // aws4fetch 的源码不算，因为它决定了一次 ServiceException 抖动会不会白白丢掉一个 cron
   // 周期的防护。Lightsail 的客户端错误全是 400，重试它们只会浪费时间。
   const retried = stubAws({ networkIn: 10 * GIB, recentIn: GIB, serviceErrors: 2 });
   await run("2026-08-15T12:00:00Z", baseEnv, retried);
