@@ -89,7 +89,7 @@ function stubAws({
   recentInLagSeconds,
   recentOutLagSeconds,
   metricShape,
-  monthCoversOnlyThrough,
+  monthNewestDaysAgo = 0,
   monthTimestampsUnusable = false,
   badPoints,
   rawMetricBody,
@@ -184,10 +184,20 @@ function stubAws({
         // 时间戳按天对齐、最新的一个是**今天**的桶。此前这里用的是三个固定的历史时间戳，
         // 等于对月度查询的覆盖范围完全没有建模 —— 跨模型审计正是从这个维度切进来的：
         // period 86400 的桶是一整天，如果 API 只返回已关闭的天桶，月度读数就对今天全盲。
-        // 打桩按「返回当天部分聚合」（解释 A）建模；`monthCoversOnlyThrough` 可以切到
-        // 另一种语义。
         const today = Math.floor(body.endTime / 86400) * 86400;
-        const newestDay = monthCoversOnlyThrough === "yesterday" ? today - 86400 : today;
+        // 最新那个天桶落在哪一天。默认是今天（解释 A：API 为未完成的当天返回部分聚合，
+        // 2026-08-23 再次实测确认）。
+        //
+        // **但「今天的桶一定在」不是普遍真理，它只在实例今天跑过的前提下成立。** 实测
+        // （2026-08-23，ap-northeast-1，period 86400）：请求 60 天只回 18 个桶，缺的 42 天
+        // 是实例指标历史开始之前 —— 没有流量的日子**根本不返回桶**，不是返回 `sum: 0`
+        // 的桶（60 天里一个 `sum: 0` 都没出现过）。所以一台停着的实例，最新的天桶会停在
+        // 它最后跑过的那一天，之后每天多落后 24 小时。
+        //
+        // 这个参数此前不存在（只有一个 "yesterday" 开关），于是 `state: "stopped"` 的用例
+        // 全都在跑一份物理上不可能的响应：实例停着，月度读数却照样覆盖到今天。月度落后
+        // 告警缺状态条件那个缺陷正是因此整整躲过了一轮审计 —— 夹具让它无法显形。
+        const newestDay = today - monthNewestDaysAgo * 86400;
         const stamp = (t) => (monthTimestampsUnusable ? new Date(t * 1000).toISOString() : t);
         // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
         // 不保证。
@@ -274,7 +284,7 @@ test("bytes are converted on a 2^30 basis", async () => {
   // 一次触发只写一行，行首是可 grep 的状态标记，字段全部是这一轮已经算出来的东西。
   assert.deepEqual(lines, [
     "example-instance@ap-northeast-1 OK | used 1.000 GiB (0.1% of 1024) | stop at 819.200 GiB" +
-      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | win 6/6 | days 3/15 | covers from 2026-08-13 | meter 0.0 min behind",
+      " | now 0 kbps, never to quota | month 47% elapsed, projected 2 GiB | win 6,6/6 | days 3,3/15 | covers from 2026-08-13 | meter 0.0 min behind",
   ]);
 });
 
@@ -420,7 +430,7 @@ test("ordinary traffic at the same month-to-date total does not trip the gate", 
   // 额度——这正是这个字段存在的意义：静态线还没碰到，但趋势已经写在脸上了。
   assert.match(
     lines[0],
-    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| win 6\/6 \| days 3\/15 \| covers from 2026-08-13 \| meter 0\.0 min behind$/,
+    /^\S+ OK \| used 700\.000 GiB \(68\.4% of 1024\) \| stop at 819\.200 GiB \| now 23\.9 Mbps, 32\.4 h to quota \| month 47% elapsed, projected 1497 GiB \| win 6,6\/6 \| days 3,3\/15 \| covers from 2026-08-13 \| meter 0\.0 min behind$/,
   );
 });
 
@@ -446,7 +456,7 @@ test("the metric lag is measured from the newest bucket and reported every run",
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: 12 * 60 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
-  assert.match(lines.at(-1), /win 3\/6 \| days \d+\/\d+ \| covers from [\d-]+ \| meter 15\.0 min behind$/);
+  assert.match(lines.at(-1), /win 3,3\/6 \| days \d+,\d+\/\d+ \| covers from [\d-]+ \| meter 15\.0 min behind$/);
 });
 
 test("one metric's pipeline stalling is not masked by the other", async () => {
@@ -487,6 +497,28 @@ test("a lag past the tolerance is called out loudly", async () => {
   assert.ok(!opsOf(mock.calls).includes("StopInstance"), "报警归报警，不能因此停机");
 });
 
+test("a lag past the tolerance with an unreadable state is still called out", async () => {
+  // 判据此前就地写成 `instanceState === "running"`，于是状态读不出来时这条告警被整个
+  // 吞掉 —— 而项目对这一档的既定规则是「宁可多喊一声」，另外三个调用点和 README 的
+  // 表格都是这么定的。状态读不出来时数据还很旧，恰恰是最需要说话的时候。
+  //
+  // 这一轮还会另写一行 DEGRADED，但那说的是「状态读不出来」，不是「速率不可信」——
+  // 两件事，不能互相顶替。
+  const mock = stubAws({
+    networkIn: 10 * GIB,
+    recentIn: GIB,
+    recentLagSeconds: 25 * 60,
+    unreadableState: true,
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.match(
+    lines.join("\n"),
+    /^\S+ BLIND \| newest metric bucket is 25\.0 min old, past the 12 min tolerance \|/m,
+  );
+  assert.match(lines.at(-1), /^\S+ OK \|.*\| now \S+ \S+ \(stale\), /);
+});
+
 test("a still-open newest bucket reads as zero lag rather than a negative one", async () => {
   const mock = stubAws({ networkIn: 10 * GIB, recentIn: GIB, recentLagSeconds: -120 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
@@ -524,6 +556,58 @@ test("a direction with no landed points contributes zero instead of blinding the
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
+});
+
+test("a direction going dark is called out, not silently averaged into the rate", async () => {
+  // 上一条钉住的是「缺一个方向不该让闸门失效」，那是对的，别改。这一条钉住的是另一半：
+  // **这件事必须说出来**。闸门此刻只看得见一半的流量，少报的方向正是漏停。
+  //
+  // 此前这里完全沉默，而且 `win` 字段取两个方向的**较大值** —— 于是 NetworkOut 整个
+  // 管道停摆时日志照写 `win 6/6 | meter 0.0 min behind`，与一切正常那一行完全同形。
+  // 两个方向都零点会响 BLIND，一个方向零点却一声不吭，没有道理。
+  //
+  // 实测（2026-08-23，ap-northeast-1）：跑着的实例两个方向的桶数完全同步（6/6 与 6/6，
+  // lag 都是 16 秒），所以「一侧 6 个桶、另一侧 0 个」不是正常形态。
+  for (const [dark, opts] of [
+    ["NetworkOut", { recentInPoints: 6, recentOutPoints: 0, recentIn: GIB }],
+    ["NetworkIn", { recentInPoints: 0, recentOutPoints: 6, recentOut: GIB }],
+  ]) {
+    const mock = stubAws({ networkIn: 5 * GIB, networkOut: 5 * GIB, state: "running", ...opts });
+    const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+    const text = lines.join("\n");
+
+    assert.match(text, new RegExp(`BLIND \\| ${dark} has no data points`), `${dark} 停摆必须告警`);
+    assert.match(text, /measuring only half the traffic/);
+    // 而且那一行不能再把它显示成健康。`win 6,0/6` 一眼看得出是哪一侧没了。
+    const expected = dark === "NetworkOut" ? "win 6,0/6" : "win 0,6/6";
+    assert.ok(lines.at(-1).includes(expected), `${dark} 停摆时应写 ${expected}，实际 ${lines.at(-1)}`);
+  }
+});
+
+test("both directions landing normally raises no half-blind alarm", async () => {
+  // 对照：正常那一轮一次都不该出现，否则它就是纯噪音。同时钉住正常形态下的字段长相。
+  const mock = stubAws({ networkIn: 5 * GIB, networkOut: 5 * GIB, recentIn: GIB, recentOut: GIB });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(!lines.join("\n").includes("has no data points"), "两侧都正常时不该告警");
+  assert.ok(lines.at(-1).includes("win 6,6/6"), lines.at(-1));
+});
+
+test("a draining window on a stopped instance is not a half-blind alarm", async () => {
+  // 实例确认停着时，窗口正在把停机前的桶排空，两个方向先后掉到零是正常的。判据走
+  // meterShouldSeeTraffic，与另外三个调用点一致 —— 不为一次合法停机制造噪音。
+  const mock = stubAws({
+    networkIn: 5 * GIB,
+    networkOut: 5 * GIB,
+    state: "stopped",
+    recentInPoints: 2,
+    recentOutPoints: 0,
+    recentIn: GIB,
+  });
+  const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+
+  assert.ok(!lines.join("\n").includes("has no data points"), lines.join("\n"));
+  assert.match(lines.at(-1), /^\S+ DOWN \|/);
 });
 
 test("just outside the reaction horizon it reports the countdown instead of stopping", async () => {
@@ -577,7 +661,7 @@ test("the daily UTC rollover does not raise a month-staleness alarm", async () =
   //
   // 用真实 API 复现过：连续三天的 00:00 UTC 全部误报。判据必须是「落后多久」。
   for (const at of ["2026-08-22T00:00:00Z", "2026-08-22T00:05:00Z", "2026-09-01T00:00:00Z"]) {
-    const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthCoversOnlyThrough: "yesterday" });
+    const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthNewestDaysAgo: 1 });
     const lines = await capturingLogs(() => run(at, baseEnv, mock));
     assert.ok(
       !lines.join("\n").includes("month-to-date reading only covers"),
@@ -593,12 +677,64 @@ test("a month-to-date reading that does not cover today is reported", async () =
   //
   // 这个检查在两种语义下都正确：返回当天部分聚合时永不触发；只返回已关闭天桶时必然触发。
   // 也就是说它既是防线，也是那个「一次 API 调用才能分辨」的实验 —— 上线第一天就有结论。
-  const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthCoversOnlyThrough: "yesterday" });
+  const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthNewestDaysAgo: 1 });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
 
   assert.match(lines.join("\n"), /BLIND \| month-to-date reading only covers through 2026-08-14/);
   assert.match(lines.join("\n"), /12\.0 h behind/);
   assert.match(lines.join("\n"), /today's traffic is invisible to the static line/);
+});
+
+test("a legitimately stopped instance is not accused of a blind month reading", async () => {
+  // 实例合法停着（突发闸门停的，或者操作者自己停下来做维护）时，它不再产生天桶，最新
+  // 那个就停在它最后跑过的那一天，之后每天多落后 24 小时 —— 实测确认没有流量的日子
+  // 根本不返回桶（见 stubAws 里月度分支的注释）。
+  //
+  // 此前这条告警**根本没问过实例状态**，于是从停机次日 00:20 UTC 起每一个 cron 周期都
+  // 喊一次，一天约 142 条，一直喊到实例被拉起来或者跨月。而且那句话是错的：停机期间
+  // 今天的流量不是「不可见」，是不存在。
+  //
+  // 这与零读数告警当初的教训完全同形，README 里已经写过一次：真正的管道故障会淹没在
+  // 这串噪音里。夹具当时让它无法显形 —— `state: "stopped"` 的响应照样覆盖到今天。
+  //
+  // 用量刻意压在静态线之下：越线会走 675 行那条提前 return，根本到不了这条告警。
+  for (const daysAgo of [1, 3, 12]) {
+    const mock = stubAws({
+      networkIn: 200 * GIB,
+      networkOut: 200 * GIB,
+      state: "stopped",
+      monthNewestDaysAgo: daysAgo,
+      emptyBurstWindow: true,
+    });
+    const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
+    assert.ok(
+      !lines.join("\n").includes("month-to-date reading only covers"),
+      `停机 ${daysAgo} 天：不该告警，实际写了 ${lines.find((l) => l.includes("BLIND"))}`,
+    );
+    // 对照：这一轮**确实**有话要说，只是那句话是 DOWN 而不是 BLIND。断言终态还在，
+    // 免得哪天整轮被静音了这条测试还是绿的。
+    assert.match(lines.at(-1), /^\S+ DOWN \|/);
+  }
+});
+
+test("the same stale month reading on a running instance is still reported", async () => {
+  // 上一条的对照组。加了状态条件之后这一条必须照旧响 —— 否则那个条件就不是「去掉误报」，
+  // 而是把整条防线关掉了。实例在跑却读不到今天的桶，才是静态线真的在看一份过期用量。
+  const mock = stubAws({ networkIn: 200 * GIB, recentIn: GIB, state: "running", monthNewestDaysAgo: 3 });
+  const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| month-to-date reading only covers through 2026-08-17/);
+  assert.match(lines.join("\n"), /while the instance is "running"/);
+});
+
+test("a stale month reading with an unreadable state is still reported", async () => {
+  // 状态读不出来这一档一律「宁可多喊一声」—— 与另外三个调用点、以及 README 的表格一致。
+  // 不能因为「不确定它在不在跑」就把话咽回去。
+  const mock = stubAws({ networkIn: 200 * GIB, recentIn: GIB, unreadableState: true, monthNewestDaysAgo: 3 });
+  const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.join("\n"), /BLIND \| month-to-date reading only covers through 2026-08-17/);
+  assert.match(lines.join("\n"), /while the instance is of unreadable state/);
 });
 
 test("a month reading that covers today raises no alarm", async () => {
@@ -1051,7 +1187,7 @@ test("a month reading that starts after the month does say so", async () => {
   // 和「中间零散少六天」是完全不同的两件事。
   const mock = stubAws({ networkIn: GIB });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
-  assert.match(lines.at(-1), /days 3\/15 \| covers from 2026-08-13 \|/);
+  assert.match(lines.at(-1), /days 3,3\/15 \| covers from 2026-08-13 \|/);
 });
 
 test("a data point in the wrong unit throws instead of being summed", async () => {

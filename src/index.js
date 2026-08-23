@@ -255,7 +255,11 @@ async function getInstanceState(client, config) {
  * @param {"NetworkIn" | "NetworkOut"} metricName
  * @param {{ startTime: number, endTime: number }} range
  * @param {number} period
- * @returns {Promise<{ bytes: number, points: number, newest: number | null }>}
+ * @returns {Promise<{ bytes: number, points: number, newest: number | null,
+ *   oldest: number | null, coveredSeconds: number | null }>}
+ *   `oldest` 是最旧一个可用时间戳的桶起点，用来判断读数是不是从月初起算；
+ *   `coveredSeconds` 是窗口内被数据点真正覆盖到的秒数，速率的分母优先用它，拿不到时
+ *   为 `null`（见下面返回处的说明）。
  *
  * 导出只为了能直接测那道数据点上限检查：当前两个查询离 1440 都很远，从 handler 那头
  * 根本走不到它，而它防的恰恰是「有人把粒度改小」这种以后才会发生的事。同 `formatDuration`。
@@ -438,17 +442,25 @@ async function stopOverLimit(client, config, usedGib, reason, state) {
  * 比较的目标是**整份额度**而不是 THRESHOLD 那条保守的早停线：这道闸门问的是「会不会在
  * 下一次能反应过来之前冲过配额」，而配额才是开始计费的地方。
  *
- * @param {AwsClient} client
- * @param {Config} config
  * 同时顺带实测指标的落库延迟 —— 这个数 AWS 不公开，而整套余量标定都建立在它之上。
  *
+ * @param {AwsClient} client
+ * @param {Config} config
  * @param {{ startTime: number, endTime: number }} monthRange
  * @param {number} usedBytes 月初至今总量，字节
+ * @param {string | null} instanceState 这一轮开头查到的实例状态；`null` 表示读不出来。
+ *   闸门自己不查状态 —— 同一轮里两个可能不一致的答案比没有答案更糟。它只用来把「指标
+ *   看不见」和「实例本来就没在跑」分开，判据一律走 `meterShouldSeeTraffic`。
  * @returns {Promise<{ reason: string | null, lagSeconds: number | null,
- *   bytesPerSecond: number | null, secondsToQuota: number | null }>}
+ *   bytesPerSecond: number | null, secondsToQuota: number | null, stale: boolean,
+ *   unmeasurable: boolean, instanceState: string | null,
+ *   inPoints: number, outPoints: number }>}
  *   `reason` 非空表示需要停机。其余几项是这一轮算出来的遥测，**不跳闸时也要带回去** ——
- *   否则闸门在正常运行里完全不可见，没人能确认它是不是还在正常工作。`stale` 表示这个
- *   速率是从过旧的数据点算出来的，日志里必须标出来，不能让它看起来和正常读数一样可信。
+ *   否则闸门在正常运行里完全不可见，没人能确认它是不是还在正常工作。
+ *   `stale` 表示这个速率是从过旧的数据点算出来的，日志里必须标出来，不能让它看起来和
+ *   正常读数一样可信；`unmeasurable` 表示窗口里一个数据点都没有，速率无从谈起，与
+ *   「速率是零」必须分开；`inPoints` / `outPoints` 是两个方向各自落库的桶数，**分开带**
+ *   而不是取较大值 —— 合成一个数会把「一侧管道停摆」显示成一切正常。
  */
 async function burstCheck(client, config, monthRange, usedBytes, instanceState) {
   const { endTime } = monthRange;
@@ -498,8 +510,37 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
       stale: false,
       unmeasurable: true,
       instanceState,
-      windowPoints: 0,
+      inPoints: 0,
+      outPoints: 0,
     };
+  }
+
+  // 恰好**一个**方向零数据点。速率照常按有数据的那一侧算（缺的那一侧贡献零，见 rateOf）
+  // —— 这是刻意的，缺一个方向不该让闸门整个失效，`test/scheduled.test.js` 有一条用例
+  // 专门钉住它。但这件事此前**完全不说**，而那是错的：闸门此刻只看得见一半的流量，
+  // 少报的方向正是漏停。
+  //
+  // 两个方向零点会响 BLIND（上面那一段），一个方向零点却一声不吭，没有道理 —— 后者对
+  // 速率估计的损害是同一性质的。更糟的是 `win` 字段当时取两个方向的**较大值**，于是
+  // NetworkOut 整个管道停摆时日志照写 `win 6/6 | meter 0.0 min behind`，与一切正常那一行
+  // 完全同形。字段现在改成两个方向都露出来（`win 6,0/6`），告警补在这里。
+  //
+  // 实测（2026-08-23，ap-northeast-1）：一台跑着的实例两个方向的桶数完全同步（6/6 与
+  // 6/6，lag 都是 16 秒），所以「一个方向有 6 个桶、另一个 0 个」不是正常形态。
+  //
+  // 判据同样走 meterShouldSeeTraffic：实例确认停着时，窗口正在把停机前的桶排空，两个
+  // 方向先后掉到零是正常的，不该为此喊。
+  // 只可能有一个方向是暗的：两个都暗在上面那一段就返回了。所以这里不做「收集一个列表」
+  // 的写法 —— 那会带一条永远走不到的分支，而措辞（「另一个方向有数据」）在两个都暗时
+  // 本来就是自相矛盾的。
+  const darkDirection =
+    recentIn.points === 0 ? "NetworkIn" : recentOut.points === 0 ? "NetworkOut" : null;
+  if (darkDirection !== null && meterShouldSeeTraffic(instanceState)) {
+    console.error(
+      `${config.label} BLIND | ${darkDirection} has no data points` +
+        ` in the last ${BURST_WINDOW_SECONDS / 60} min while the other direction does` +
+        ` | the burst gate is measuring only half the traffic, which under-reports the rate`,
+    );
   }
 
   const rateOf = (metric) => {
@@ -523,9 +564,8 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
     withPoints.length > 0 && withPoints.every((m) => m.newest !== null)
       ? Math.min(...withPoints.map((m) => m.newest))
       : -Infinity;
-  const newest = oldestNewest;
-  const lagSeconds = Number.isFinite(newest)
-    ? Math.max(0, endTime - (newest + BURST_PERIOD_SECONDS))
+  const lagSeconds = Number.isFinite(oldestNewest)
+    ? Math.max(0, endTime - (oldestNewest + BURST_PERIOD_SECONDS))
     : null;
 
   // 有数据点、却一个可用时间戳都没有：速率算得出来（它不碰时间戳），但**数据有多新
@@ -550,7 +590,12 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
 
   // 数据变旧最常见的原因不是「指标坏了」，而是**实例已经不在跑了** —— 桶不再产生，最新
   // 的那个就越来越旧。用这一轮查到的真实状态把两件事分开，不靠推断。
-  if (stale && instanceState === "running") {
+  //
+  // 判据走 `meterShouldSeeTraffic` 而不是就地写 `=== "running"`。差别只在状态**读不出来**
+  // 那一档：此前它会把这条告警整个吞掉，而项目对这一档的既定规则是「宁可多喊一声」——
+  // 另外三个调用点都是这么判的，README 的表格里也是这么写的。状态读不出来时数据还很旧，
+  // 恰恰是最需要说话的时候，不该因为「不确定它在不在跑」就沉默。
+  if (stale && meterShouldSeeTraffic(instanceState)) {
     console.error(
       `${config.label} BLIND | newest metric bucket is ${(lagSeconds / 60).toFixed(1)} min old, past the ${MAX_TOLERABLE_LAG_SECONDS / 60} min tolerance | the burst gate can no longer outrun a full-rate burst this run (meter lagging, or the instance is not running)`,
     );
@@ -561,7 +606,10 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
   const secondsToQuota = bytesPerSecond > 0 ? remainingBytes / bytesPerSecond : Infinity;
   const telemetry = {
     lagSeconds, bytesPerSecond, secondsToQuota, stale, unmeasurable: false, instanceState,
-    windowPoints: Math.max(recentIn.points, recentOut.points),
+    // 两个方向分开带回去。此前这里是 `Math.max(...)` —— 一个数字，而它取的恰好是**乐观**
+    // 的那一头，于是一侧管道停摆时日志写的仍然是 `win 6/6`。
+    inPoints: recentIn.points,
+    outPoints: recentOut.points,
   };
 
   if (secondsToQuota >= REACTION_HORIZON_SECONDS) return { reason: null, ...telemetry };
@@ -692,10 +740,31 @@ export default {
     const monthBehindSeconds = Number.isFinite(monthNewest)
       ? range.endTime - (monthNewest + METRIC_PERIOD_SECONDS)
       : null;
-    if (monthBehindSeconds !== null && monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS) {
+    // 判据里必须带上实例状态，理由和零读数告警那条**完全一样**，只是当时只修了那一条。
+    //
+    // 实测（2026-08-23，ap-northeast-1）：`period: 86400` 下没有流量的日子**根本不返回桶**
+    // —— 请求 60 天只回 18 个，缺的 42 天是实例指标历史开始之前，而且 60 天里没有出现过
+    // 任何 `sum: 0` 的桶。于是一台合法停着的实例，最新那个天桶会停在它最后跑过的那一天，
+    // 之后每过一天就多落后 24 小时。
+    //
+    // 不带状态条件的代价（探针复现过）：实例被突发闸门停下、或者操作者自己停机做维护，
+    // 从次日 00:20 UTC 起**每一个 cron 周期**都会喊一次「today's traffic is invisible」——
+    // 一天约 142 条，一直喊到实例被拉起来或者跨月。而且那句话本身是错的：停机期间今天的
+    // 流量不是「不可见」，是根本不存在。这正是 README 里为零读数告警记下来的那个教训 ——
+    // 真正的管道故障混在这串噪音里根本看不出来。
+    //
+    // 加上条件之后：实例在跑（或状态读不出来）而读数没覆盖到今天，仍然照响 —— 那才是
+    // 静态线真的在看一份过期用量的情形。
+    if (
+      monthBehindSeconds !== null &&
+      monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)
+    ) {
       console.error(
         `${config.label} BLIND | month-to-date reading only covers through ${new Date(monthNewest * 1000).toISOString().slice(0, 10)}` +
-          ` (${(monthBehindSeconds / 3600).toFixed(1)} h behind) | today's traffic is invisible to the static line`,
+          ` (${(monthBehindSeconds / 3600).toFixed(1)} h behind)` +
+          ` while the instance is ${instanceState === null ? "of unreadable state" : `"${instanceState}"`}` +
+          ` | today's traffic is invisible to the static line`,
       );
     }
 
@@ -737,14 +806,20 @@ export default {
 
     // 突发窗口实际拿到几个桶。这是 `meter` 真正的替代品：`meter` 量化到一整个 300 秒桶，
     // 而生产的 endTime 恰好落在桶边界上，所以它几乎恒为 0；桶数则一掉就掉一格，有分辨率。
-    if (burst && burst.windowPoints !== null) {
-      common.push(`win ${burst.windowPoints}/${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}`);
+    //
+    // 格式是 `win in,out/应有`，**两个方向分开写**。此前是一个数、取两者的较大值，于是
+    // NetworkOut 整个管道停摆时这里照写 `win 6/6` —— 取的恰好是乐观的那一头，把闸门只
+    // 看得见一半流量这件事盖了过去。宁可让正常那一行多一个字符，也不要一个会说谎的字段。
+    if (burst) {
+      common.push(`win ${burst.inPoints},${burst.outPoints}/${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}`);
     }
 
     // 月度读数拿到几个天桶 vs 本月已过几天。差值有正当解释（实例合法停机的日子没有桶），
     // 所以只记录不告警 —— 但月中缺一整天时，至少有人能看见。
+    // 同样两个方向分开写，理由同 `win`：取较大值会把「一个方向的月度管道缺了几天」显示
+    // 成完整。月度查询按天聚合，一侧缺一整天就是一整天的字节没进静态线的总量。
     const daysElapsed = Math.ceil((range.endTime - range.startTime) / METRIC_PERIOD_SECONDS);
-    common.push(`days ${Math.max(monthIn.points, monthOut.points)}/${daysElapsed}`);
+    common.push(`days ${monthIn.points},${monthOut.points}/${daysElapsed}`);
 
     // 读数没从月初起算时，把真正的起点写出来。`days 16/22` 只说少了六天，不说少的是哪
     // 六天 —— 而「少的是月初连续的六天」和「中间零散缺六天」是完全不同的两件事。

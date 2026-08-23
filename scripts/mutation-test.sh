@@ -122,10 +122,16 @@ mutate "const meterShouldSeeTraffic = (state) => state === \"running\" || state 
        'const meterShouldSeeTraffic = (state) => state === "running";' \
        "状态读不出时不再报失明"
 # 跨模型审计翻出来的：月度读数覆盖范围 / 时间戳量级
-mutate "if (monthBehindSeconds !== null && monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS) {" "if (false) {" \
+# 判据是三行的多行条件（加了实例状态那一档之后）—— 锚点必须整段照抄，否则会变成
+# 「变异未应用」，而那被计为存活：一个施加不上去的变异什么也没验证。
+mutate "    if (
+      monthBehindSeconds !== null &&
+      monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)
+    ) {" "    if (false) {" \
        "去掉「月度读数落后过久」的检测"
-mutate "if (monthBehindSeconds !== null && monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS) {" \
-       "if (Number.isFinite(monthNewest) && monthNewest < Math.floor(range.endTime / 86400) * 86400) {" \
+mutate "      monthBehindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&" \
+       "      Number.isFinite(monthNewest) && monthNewest < Math.floor(range.endTime / 86400) * 86400 &&" \
        "月度新鲜度判据改回「不是今天」（每天 00:00 UTC 误报）"
 mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(...withPoints.map((m) => m.newest))" \
        "新鲜度取两个指标里最新的那个（一个方向停摆会被掩盖）"
@@ -179,6 +185,26 @@ mutate "    if (monthOldest !== null && monthOldest > range.startTime) {" "    i
 mutate "export function monthStartMs(now) {" \
        "let _cache = null;\nexport function monthStartMs(now) {\n  if (_cache !== null) return _cache;\n  _cache = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);\n  return _cache;" \
        "给 monthStartMs 加模块级缓存（破坏无状态）"
+
+# 第四轮 review：同一条防线在 A 处修好、B 处的同类没跟着修
+mutate "      meterShouldSeeTraffic(instanceState)
+    ) {" "      true
+    ) {" \
+       "月度落后告警丢掉状态条件（合法停机期每轮误报，一天约 142 条）"
+mutate "      meterShouldSeeTraffic(instanceState)
+    ) {" '      instanceState === "running"
+    ) {' \
+       "月度落后告警把「状态读不出来」这一档吞掉（该宁可多喊一声）"
+mutate "  if (darkDirection !== null && meterShouldSeeTraffic(instanceState)) {" "  if (false) {" \
+       "去掉「一个方向零数据点」的失明检测（闸门只看得见一半流量）"
+mutate "  if (stale && meterShouldSeeTraffic(instanceState)) {" '  if (stale && instanceState === "running") {' \
+       "stale 告警把「状态读不出来」这一档吞掉"
+mutate "      common.push(\`win \${burst.inPoints},\${burst.outPoints}/\${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}\`);" \
+       "      common.push(\`win \${Math.max(burst.inPoints, burst.outPoints)}/\${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}\`);" \
+       "win 退回取两个方向的较大值（一侧停摆被显示成健康）"
+mutate "    common.push(\`days \${monthIn.points},\${monthOut.points}/\${daysElapsed}\`);" \
+       "    common.push(\`days \${Math.max(monthIn.points, monthOut.points)}/\${daysElapsed}\`);" \
+       "days 退回取两个方向的较大值"
 
 echo
 if [ "$SURVIVORS" -gt 0 ]; then
