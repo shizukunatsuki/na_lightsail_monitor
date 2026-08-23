@@ -91,8 +91,10 @@ function stubAws({
   recentOutLagSeconds,
   metricShape,
   monthNewestDaysAgo = 0,
+  monthOutNewestDaysAgo,
   monthInPoints,
   monthOutPoints,
+  monthOutStartsDaysLate = 0,
   monthTimestampsUnusable = false,
   badPoints,
   rawMetricBody,
@@ -200,11 +202,28 @@ function stubAws({
         //
         // **写 `state: "stopped"` 的用例时记得一起调这个参数。** 实例停着而月度读数照样
         // 覆盖到今天，是一份物理上不可能的响应 —— 用它做出来的断言什么也没有验证。
-        const newestDay = today - monthNewestDaysAgo * 86400;
+        // 两个方向的覆盖**终点**也可以不同：一侧的月度管道落后几天，另一侧照常。
+        const daysAgo =
+          body.metricName === "NetworkOut" ? (monthOutNewestDaysAgo ?? monthNewestDaysAgo) : monthNewestDaysAgo;
+        const newestDay = today - daysAgo * 86400;
         // 一个方向的月度读数整个没有数据点。真实 API 里这是「那个方向的管道停摆」的样子
         // —— 空数组，HTTP 仍然是 200，metricName 照常回显。
         const wantPoints = (body.metricName === "NetworkIn" ? monthInPoints : monthOutPoints) ?? 3;
         if (wantPoints === 0) return Response.json({ metricName: body.metricName, metricData: [] });
+
+        // 两个方向的覆盖**起点**可以不同：一侧的月度管道缺了月初那几天，另一侧完整。
+        // 真实 API 里这就是「那几天那个方向没有数据」的样子——那几天根本不返回桶。
+        if (monthOutStartsDaysLate > 0) {
+          const monthStart = Date.UTC(2026, 7, 1) / 1000;
+          const todayBucket = Math.floor(body.endTime / 86400) * 86400;
+          const from =
+            body.metricName === "NetworkIn" ? monthStart : monthStart + monthOutStartsDaysLate * 86400;
+          const pts = [];
+          for (let t = from; t <= todayBucket; t += 86400) {
+            pts.push({ sum: (total * 86400) / (todayBucket - from + 86400), timestamp: t, unit: "Bytes" });
+          }
+          return Response.json({ metricName: body.metricName, metricData: pts });
+        }
 
         const stamp = (t) => (monthTimestampsUnusable ? new Date(t * 1000).toISOString() : t);
         // 乱序、稀疏，并且其中一个数据点完全没有 `sum` 字段 —— 这三件事 API 一件都
@@ -1278,6 +1297,43 @@ test("a month reading with both directions present raises no half-blind alarm", 
   const mock = stubAws({ networkIn: 5 * GIB, networkOut: 5 * GIB, recentIn: GIB });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
   assert.ok(!lines.join("\n").includes("in the month-to-date reading"), lines.join("\n"));
+});
+
+test("month coverage takes the pessimistic end at BOTH ends, in opposite directions", async () => {
+  // 两头取的方向相反，而且都是悲观的那一侧。这条把两个方向一起钉住——它们看起来对称，
+  // 很容易被「统一一下」而改坏，而改坏之后两种都是**静默**的。
+  //
+  // `oldest` 取 max：总量只有从「两侧都有数据」的那一天起才完整。取 min 的话，
+  // NetworkIn 从月初就有、NetworkOut 缺了前九天时，min 恰好等于月初，`covers from`
+  // 的条件不成立——九天的出向用量凭空消失，而这个字段一声不吭。
+  const mock = stubAws({ monthOutStartsDaysLate: 9, networkIn: 200 * GIB, networkOut: 110 * GIB, recentIn: GIB });
+  const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
+
+  assert.match(lines.at(-1), /covers from 2026-08-10/, `出向缺了月初九天，必须写出真正的起点：${lines.at(-1)}`);
+  // 对照：两个方向的天桶数确实不同，缺口是真实存在的。
+  assert.match(lines.at(-1), /days 20,11\/20/);
+});
+
+test("month staleness takes the older of the two directions", async () => {
+  // `newest` 取 min：只要有一侧的数据停在过去，整份读数就已经过期了。取更新鲜的那一头
+  // 会让「一侧管道落后、另一侧照常」报告成一切新鲜，落后告警永不触发——方向是漏停。
+  //
+  // 突发窗口那一侧有同名的用例（`one metric's pipeline stalling is not masked by the other`），
+  // 月度这一侧是同一个判断，两边都要有人守。
+  const mock = stubAws({
+    networkIn: 100 * GIB,
+    networkOut: 100 * GIB,
+    monthNewestDaysAgo: 0, // NetworkIn 覆盖到今天
+    monthOutNewestDaysAgo: 3, // NetworkOut 停在三天前
+    recentIn: GIB,
+  });
+  const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
+
+  assert.match(
+    lines.join("\n"),
+    /BLIND \| month-to-date reading only covers through 2026-08-17/,
+    `一侧停在三天前时必须按那一侧判定过期：${lines.join(" // ")}`,
+  );
 });
 
 test("a month reading that starts after the month does say so", async () => {

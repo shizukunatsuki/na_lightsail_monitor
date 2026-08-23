@@ -135,6 +135,13 @@ mutate "      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&" \
        "月度新鲜度判据改回「不是今天」（每天 00:00 UTC 误报）"
 mutate "      ? Math.min(...withPoints.map((m) => m.newest))" "      ? Math.max(...withPoints.map((m) => m.newest))" \
        "新鲜度取两个指标里最新的那个（一个方向停摆会被掩盖）"
+# 月度那一侧是同一个判断，两头方向相反，各自都要有变异守着
+mutate "        ? Math.min(...monthWithPoints.map((m) => m.newest))" \
+       "        ? Math.max(...monthWithPoints.map((m) => m.newest))" \
+       "月度新鲜度取最乐观的一头（一侧管道落后被掩盖，落后告警永不触发）"
+mutate "        ? Math.max(...monthWithPoints.map((m) => m.oldest))" \
+       "        ? Math.min(...monthWithPoints.map((m) => m.oldest))" \
+       "月度覆盖起点取最乐观的一头（一侧缺了月初几天时 covers from 不出现）"
 mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;" \
        "      true;" \
        "去掉时间戳量级检查（毫秒可静默绕过 staleness，A3）"

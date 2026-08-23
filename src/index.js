@@ -238,11 +238,14 @@ export function usageWindow(now) {
  * 所以落后时长就是「此刻」减去那个桶的结束时刻。当天的桶还开着时会算出负数，那正表示
  * 读数覆盖到了今天。
  *
+ * 不导出：它只有 `scheduled` 一个调用点，而那条路径已经被端到端用例完整覆盖。本仓库的
+ * 约定是「导出必须有理由」——`formatDuration` 和 `sumMetric` 各自在文档里写明了为什么。
+ *
  * @param {{ endTime: number }} range
  * @param {number} monthNewest 最新天桶的起点（Unix 秒），无可用时间戳时为 `-Infinity`
  * @returns {number | null}
  */
-export function monthBehindSeconds(range, monthNewest) {
+function monthBehindSeconds(range, monthNewest) {
   return Number.isFinite(monthNewest) ? range.endTime - (monthNewest + METRIC_PERIOD_SECONDS) : null;
 }
 
@@ -804,8 +807,18 @@ export default {
     const usedGib = usedBytes / BYTES_PER_GIB;
     const limitGib = config.quotaGib * config.threshold;
 
-    // 月度读数覆盖到哪一段时间，两头都要看。取两个指标里**最旧**的那一个，理由同
-    // burstCheck 里的 oldestNewest：取乐观的那一头会让「一侧管道落后」显示成一切新鲜。
+    // 月度读数覆盖到哪一段时间，两头都要看。
+    //
+    // **两头取的方向相反，而且两个方向都是「悲观」的那一侧**，别按对称的直觉去改：
+    //
+    //   `newest` 取 **min**（两者中更旧的那个）—— 用量是 In + Out 之和，只要有一侧的
+    //     数据停在过去，整份读数就已经过期了。取更新鲜的那一头会让「一侧管道落后、另一侧
+    //     照常」报告成一切新鲜，落后告警永不触发，方向是漏停。
+    //
+    //   `oldest` 取 **max**（两者中更晚的那个）—— 总量只有从「两侧都有数据」的那一天起
+    //     才是完整的。取更早的那一头会让 `covers from` 在最该出现的时候消失：NetworkIn
+    //     从月初就有、NetworkOut 缺了前九天时，min 等于月初，条件 `> range.startTime`
+    //     不成立，于是九天的出向用量凭空消失而日志里没有这个字段。
     //
     // `oldest` 那一头**不告警**，只把事实摆进日志：同一个形状至少有三种成因 —— 实例在
     // 本月内才创建（创建之前没有任何指标历史）、那几天实例没在跑、指标真的丢了数据。
@@ -813,7 +826,7 @@ export default {
     const monthWithPoints = [monthIn, monthOut].filter((m) => m.points > 0);
     const monthOldest =
       monthWithPoints.length > 0 && monthWithPoints.every((m) => m.oldest !== null)
-        ? Math.min(...monthWithPoints.map((m) => m.oldest))
+        ? Math.max(...monthWithPoints.map((m) => m.oldest))
         : null;
     const monthNewest =
       monthWithPoints.length > 0 && monthWithPoints.every((m) => m.newest !== null)
