@@ -44,7 +44,7 @@
 
     // 可选。设为 "true" 会抑制所有 StartInstance，适用于你自己把实例停下来维护、
     // 不希望它被拉起来的场景。停机不受影响。其它任何值、或者不设置，都表示正常运行。
-    // "MANUAL_HOLD": "true"
+    "MANUAL_HOLD": "true"
   },
 
   // AWS_ACCESS_KEY_ID 和 AWS_SECRET_ACCESS_KEY 是 secret，永远不要写进 vars。
