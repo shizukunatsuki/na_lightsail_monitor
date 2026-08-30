@@ -179,9 +179,10 @@ mutate --in src/tuning.js 'export const METRIC_UNIT = "Bytes";' 'export const ME
 mutate "    return metric.bytes / (metric.coveredSeconds ?? metric.points * BURST_PERIOD_SECONDS);" \
        "    return metric.bytes / (metric.points * BURST_PERIOD_SECONDS);" \
        "分母退回「桶数 × 粒度」（窗口未对齐时速率报低）"
-# 上游的数据点上限：超限不报错，静默回空数组
+# 上游的数据点上限：超限的表现两次实测不一致（08-22 静默空 / 08-30 响亮 400），守卫按
+# 「两种形态都可能出现」设计，两侧防线都要能被抓到
 mutate "  if (wanted > MAX_DATAPOINTS_PER_QUERY) {" "  if (false) {" \
-       "去掉数据点上限检查（改小粒度后每轮静默读到 0 字节）"
+       "去掉数据点上限检查（超限的调参直接打到上游，不再在本地拦下）"
 mutate --in src/tuning.js "export const MAX_DATAPOINTS_PER_QUERY = 1440;" \
        "export const MAX_DATAPOINTS_PER_QUERY = 100000;" \
        "上限放大到失效（等于没有这道检查）"
@@ -214,15 +215,22 @@ mutate "  warnIfHalfBlind(config, recentIn, recentOut, instanceState, {" \
 mutate "    warnIfHalfBlind(config, monthIn, monthOut, instanceState, {" \
        "    if (false) warnIfHalfBlind(config, monthIn, monthOut, instanceState, {" \
        "月度读数不再做半瞎检测（静态线少看一整个方向的用量）"
-# 数据点上限守卫：按跨度算而不是按桶相位算，会恰好在它守的那个边界上放行
+# 数据点上限守卫：按跨度算而不是按桶相位算。相位数不小于跨度数，按相位数是刻意比上游
+# 严一档的保守选择 —— 08-30 实测上游对分歧构造按跨度数（回 200 + 1440 个点），但 08-22
+# 的记录是超限静默回空数组。退成按跨度数等于赌上游永远按跨度数，而它在 8 天里变过一次。
 mutate "  const gridStart = Math.floor(range.startTime / 60) * 60;
   const wanted = Math.ceil((range.endTime - gridStart) / period);" \
        "  const wanted = Math.ceil((range.endTime - range.startTime) / period);" \
-       "上限守卫按窗口跨度算（起点未对齐时少算一个桶，边界上失效）"
+       "上限守卫退化成按窗口跨度数（丢掉覆盖静默空形态的保守余量）"
 # stale 告警的措辞必须跟着实际查到的状态走
 mutate '        ? "the instance is running, so the meter itself is behind"' \
        '        ? "the meter is lagging, or the instance is not running"' \
        "stale 告警摆出一个已被状态排除的解释"
+# 空窗告警是同一个问题：状态读不出来时不得断言「计量表失明」—— 维护期碰上状态查询坏掉
+# 时，那句话会把合法停机写成管道故障
+mutate '"the instance state is unreadable, so this is either a blind meter or an instance that is not running"' \
+       '"instance is of unreadable state, so the meter is blind, not idle"' \
+       "空窗告警在状态读不出时退回断言失明（把合法停机写成管道故障）"
 mutate "  if (stale && meterShouldSeeTraffic(instanceState)) {" '  if (stale && instanceState === "running") {' \
        "stale 告警把「状态读不出来」这一档吞掉"
 mutate "      common.push(\`win \${burst.inPoints},\${burst.outPoints}/\${BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS}\`);" \

@@ -974,11 +974,20 @@ test("data points with no usable timestamp are reported, not silently trusted", 
 test("an empty burst window with an unreadable state still alarms", async () => {
   // 窗口空、而状态又读不出来 —— 分辨不了「指标失明」和「实例没在跑」。这时必须**报警**：
   // 对失明保持沉默的代价（放任一场看不见的突发）远大于多报一次的代价。
+  //
+  // 但报警的话不许**断言**成因。旧措辞「instance is of unreadable state, so the meter is
+  // blind, not idle」在状态读不出来时仍一口咬定计量表失明 —— 而同一份响应形状下「实例被
+  // 操作者合法停着」完全可能（维护期恰好碰上状态查询坏掉），那句话会把一次合法停机写成
+  // 管道故障，每个 cron 周期一条，直到有人修好状态查询为止。stale 告警对同一个问题用的
+  // 是 either/or 措辞（见 burstCheck 里另一处 explanation），这里必须对齐。
   const mock = stubAws({ networkIn: 300 * GIB, emptyBurstWindow: true, fail: "GetInstanceState" });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
+  const text = lines.join("\n");
 
-  assert.match(lines.join("\n"), /BLIND \| no metric data points/);
-  assert.match(lines.join("\n"), /instance is of unreadable state/);
+  assert.match(text, /BLIND \| no metric data points in the last 30 min/);
+  // 两种成因都还活着，措辞必须把两种都摆出来 —— 不替 API 说出它没说的那一种。
+  assert.match(text, /either a blind meter or an instance that is not running/);
+  assert.ok(!text.includes("the meter is blind, not idle"), "状态读不出来时不得断言「计量表失明」");
   assert.match(lines.at(-1), /now unknown \(no data points in window\)/);
 });
 
@@ -1226,13 +1235,13 @@ test("a missing sum is still a legitimate zero", async () => {
 });
 
 test("a query that would exceed the API's datapoint cap throws", async () => {
-  // 实测（2026-08-22，ap-northeast-1）：单次查询的上限正好是 1440 个数据点，**超限不报错**
-  // —— 1440 个拿回 1440 个，1441 个拿回 0 个，HTTP 仍是 200、metricName 照常回显。落地就是
-  // 0 字节，唯一会让看门狗什么都不做的读数。
+  // 单次查询的上限是 1440 个数据点，两次实测一致。**超限之后的表现两次不一致**：
+  // 2026-08-22 记录为 HTTP 200 + 空数组（静默的 0 字节，唯一会让看门狗什么都不做的读数）；
+  // 2026-08-30 复测同一构造是 HTTP 400 InvalidInputException，错误消息明说超限。
   //
   // 当前两个查询离上限很远（月度 31、突发 6），所以从 handler 那头走不到这里 —— 它防的是
-  // 以后有人把 METRIC_PERIOD_SECONDS 从 86400 改成 900：月度查询要 2976 个点，于是每一轮
-  // 都读到 0 字节，而日志一片祥和。所以直接测这个函数。
+  // 以后有人把 METRIC_PERIOD_SECONDS 从 86400 改成 900：月度查询要 2976 个点，按 08-30
+  // 的行为每轮以 400 响亮失败，按 08-22 的记录则是每轮静默读到 0 字节。所以直接测这个函数。
   const mock = stubAws();
   const client = new AwsClient({
     accessKeyId: ACCESS_KEY_ID, secretAccessKey: SECRET, service: "lightsail", region: "ap-northeast-1",
@@ -1255,9 +1264,12 @@ test("the datapoint cap counts buckets by their phase, not by the window's span"
   // 桶的相位跟着查询走：起点是 `floor(startTime / 60) * 60`，最多比 startTime 早 59 秒。
   // 于是一个窗口能盖住的桶数可能比「跨度 ÷ 粒度」多一个。
   //
-  // 按跨度算的话，守卫恰好在它守的那个边界上放行：startTime 对 60 取余 59、跨度 5 天、
-  // 粒度 300 秒时，跨度算出来是 1440（放行），而真实桶数是 1441 —— 上游对超限**不报错**，
-  // 它回 HTTP 200 加一个空数组，落地就是 0 字节。守卫失效的方式恰好是它存在的理由。
+  // 2026-08-30 实测到这个分歧构造的真实行为：startTime 对 60 取余 59、跨度恰好 5 天、
+  // 粒度 300 秒时，跨度算法是 1440、相位算法是 1441，而上游对这个请求回的是 200 + 1440
+  // 个点 —— 它（至少那一天）按跨度数。守卫**仍然**按相位数：相位数不小于跨度数，于是最多
+  // 比上游严一个桶、且只在分歧点上发生（生产两个查询的起点都对齐到分钟，两种数法相等）；
+  // 而按跨度数就等于把「上游按哪种数」当成一个需要赌对的假设 —— 它在 8 天里变过一次
+  // （08-22 的记录是超限静默回空数组）。宁可这边响亮地多拦一次，不赌。
   const mock = stubAws();
   const client = new AwsClient({
     accessKeyId: ACCESS_KEY_ID, secretAccessKey: SECRET, service: "lightsail", region: "ap-northeast-1",

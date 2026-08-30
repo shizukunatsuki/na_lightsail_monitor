@@ -131,8 +131,10 @@ test("ASSUMED_LAG_SECONDS stays observable at the burst granularity", () => {
 });
 
 test("both configured queries stay under the API's datapoint cap", () => {
-  // 上限实测是 1440，而**超限不报错**：HTTP 200、metricName 正常回显、metricData 空数组，
-  // 落地就是 0 字节。所以这条不是性能优化，是防止整个看门狗静默失效。
+  // 上限两次实测都是 1440。超限的表现两次实测不一致：2026-08-22 记录为 HTTP 200 + 空数组
+  // （静默的 0 字节），2026-08-30 复测为 HTTP 400 InvalidInputException（响亮失败）。所以
+  // 这条不是性能优化，是防止整个看门狗在「静默空」那种形态下无声失效 —— 见 src/tuning.js
+  // 里 MAX_DATAPOINTS_PER_QUERY 的完整记录。
   //
   // 月度查询按最长的月份（31 天）算最坏情况。
   const monthWorstCase = Math.ceil((31 * 86400) / METRIC_PERIOD_SECONDS);
