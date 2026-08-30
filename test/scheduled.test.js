@@ -238,6 +238,9 @@ function stubAws({
         });
       }
       case "StopInstance":
+      // StartInstance 这一支**刻意保留**：源码永远不会发出它，但变异测试会注入一个
+      // 「把自动启动加回来」的变异。打桩要能正常应答，那个变异才会因为断言而红，
+      // 而不是因为打桩回了个 400 —— 后者看起来也是红的，却证明不了任何事。
       case "StartInstance":
         return Response.json({ operations: [{ id: "b1a2", status: "Started" }] });
       default:
@@ -759,7 +762,7 @@ test("a legitimately stopped instance is not accused of a blind month reading", 
   // 根本不返回桶（见 stubAws 里月度分支的注释）。
   //
   // 告警**不问实例状态**的话，从停机次日 00:20 UTC 起每一个 cron 周期都会喊一次，一天
-  // 约 142 条，一直喊到实例被拉起来或者跨月。而且那句话本身是错的：停机期间今天的流量
+  // 约 142 条，直到实例重新跑起来或者跨月为止。而且那句话本身是错的：停机期间今天的流量
   // 不是「不可见」，是不存在。
   //
   // 这与零读数告警面对的是同一个问题，README 里也写着同一条结论：真正的管道故障会淹没在
@@ -883,7 +886,7 @@ test("the static-line stop also says DOWN", async () => {
 test("a legitimately stopped instance reading zero is not alarmed about", async () => {
   // 对照：实例被合法停着（看门狗停的，或操作者自己停的）时，
   // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。判据只看「月份已过几小时」而不看状态的话，
-  // 会从当月第 2 小时起每一次触发都报一次 BLIND，一直报到实例被拉起来为止。
+  // 会从当月第 2 小时起每一次触发都报一次 BLIND，直到实例重新跑起来为止。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
 
@@ -1045,7 +1048,7 @@ test("zero month-to-date usage skips the burst check entirely", async () => {
   assert.deepEqual(burstCalls(mock.calls), []);
 });
 
-// --- 重启 ---------------------------------------------------------------------
+// --- 零用量与「绝不启动」 -------------------------------------------------------
 
 test("a reset allowance does not start the instance", async () => {
   // **这个看门狗只停机，永远不启动。** 新的计费月：月初至今归零，实例还停在上个月那次

@@ -69,10 +69,13 @@ import {
  * 藏进沉默里。
  *
  * **所有「计量表该不该看得见东西」的判断都必须走这个函数，不要就地再写一遍比较。**
- * 目前有五个调用点：突发窗口零数据点、突发窗口只有一个方向有数据、数据旧过容忍上限、
- * 月度读数只有一个方向有数据、月度读数没覆盖到今天，以及月度读数恰为零。它们问的是
- * 同一个问题，答案必须只有一个来源 —— 就地写 `=== "running"` 会把「状态读不出来」那一档
- * 悄悄吞掉，而那一档恰恰最需要说话。
+ * 它管着六个问题，分布在五个调用点上（`warnIfHalfBlind` 一个调用点服务两个查询窗口）：
+ *
+ *   突发窗口零数据点 / 突发窗口只有一个方向有数据 / 数据旧过容忍上限
+ *   月度读数只有一个方向有数据 / 月度读数没覆盖到今天 / 月度读数恰为零
+ *
+ * 它们问的是同一个问题，答案必须只有一个来源 —— 就地写 `=== "running"` 会把「状态读不
+ * 出来」那一档悄悄吞掉，而那一档恰恰最需要说话。
  *
  * @param {string | null} state
  * @returns {boolean}
@@ -334,9 +337,10 @@ async function lightsail(client, config, operation, body) {
 /**
  * 实例当前的状态名，例如 `"running"` / `"stopped"`。
  *
- * 响应无法识别时抛错，而不是返回 `undefined`：重启路径把「不是 stopped」当作无事可做，
- * 停机路径把「不是 running」当作无事可做 —— 一个悄悄缺失的状态会在**两边**都被读成
- * 「什么都不用做」。异常由调用方按方向承接，见 `scheduled` 里那次调用的 `.catch`。
+ * 响应无法识别时抛错，而不是返回 `undefined`。停机路径把「不是 running」当作无事可做，
+ * 所以一个悄悄缺失的状态会被读成「什么都不用做」—— 而那正是漏停的方向。异常由调用方
+ * 承接：见 `scheduled` 里那次调用的 `.catch`，它把读不出来记作 `null` 并写一行 DEGRADED，
+ * 而 `stopOverLimit` 收到 `null` 时照停不误。
  *
  * @param {AwsClient} client
  * @param {Config} config
@@ -434,8 +438,8 @@ export async function sumMetric(client, config, metricName, range, period) {
   // 但「读不懂」的判据**不能**挂在 `metricData` 存不存在上。AWS 的响应定义里它没有任何
   // 「必然出现」的保证，而各语言 SDK 一律把「字段缺失」正规化成空数组 —— 这恰恰说明
   // 服务端允许在没有数据时把它整个省掉。把合法的缺失当成错误，代价是致命的：一台停机的
-  // 实例在新月份读到的正是这种空响应，于是每次触发都抛错，重启永远发不出去，实例停满
-  // 一整个月。
+  // 实例读到的正是这种空响应，于是每次触发都抛错 —— 整个看门狗在那台实例上彻底失效，
+  // 而它本该在实例重新跑起来时继续守着。
   //
   // 判据挂在两个信号上，满足其一就认定这份响应是真的：
   //   - `metricName` 正确回显（有值的标量必然被序列化，不像空集合那样可省）；
@@ -812,8 +816,8 @@ export default {
       sumMetric(client, config, "NetworkIn", range, METRIC_PERIOD_SECONDS),
       sumMetric(client, config, "NetworkOut", range, METRIC_PERIOD_SECONDS),
       getInstanceState(client, config).catch((err) => {
-        // 读不出来就是读不出来，绝不退回推断。停机路径把 null 当作「照停」，重启路径把
-        // 它当作「什么都不做」—— 两个方向各自倾斜，见各自的调用点。
+        // 读不出来就是读不出来，绝不退回推断。`null` 在停机路径上被当作「照停」
+        // （fail-closed），在几条可信度告警里被当作「该说话」—— 见 meterShouldSeeTraffic。
         console.error(`${config.label} DEGRADED | instance state unreadable (${err.message})`);
         return null;
       }),
@@ -899,8 +903,8 @@ export default {
     //
     // 判据里必须带实例状态。一台合法停着的实例不再产生天桶，最新那个会停在它最后跑过的
     // 那一天，之后每天多落后 24 小时 —— 不带状态条件的话，实例被停下之后从次日 00:20 UTC
-    // 起**每个 cron 周期**都会喊一次，一天约 142 条，一直喊到实例被拉起来或者跨月。而且
-    // 那句话本身是错的：停机期间今天的流量不是「不可见」，是根本不存在。
+    // 起**每个 cron 周期**都会喊一次，一天约 142 条，直到实例重新跑起来或者跨月为止。
+    // 而且那句话本身是错的：停机期间今天的流量不是「不可见」，是根本不存在。
     const behindSeconds = monthBehindSeconds(range, monthNewest);
     if (
       behindSeconds !== null &&
@@ -912,6 +916,30 @@ export default {
           ` (${(behindSeconds / 3600).toFixed(1)} h behind)` +
           ` while the instance is ${describeState(instanceState)}` +
           ` | today's traffic is invisible to the static line`,
+      );
+    }
+
+    // ── 零读数的兜底告警 ────────────────────────────────────────────────────
+    //
+    // 「月初至今恰为零」有两种成因，光看指标分不开：
+    //   实例没在跑 —— 正常，没什么可说的。
+    //   量的那一侧坏了 —— 例如请求的 unit 传错。实测传成 Bits / Count / Percent /
+    //     Seconds / Megabytes 中任意一个，AWS 都回 HTTP 200、metricName 正确回显、
+    //     metricData 空数组，与「没有流量」完全同形，`sumMetric` 的双信号校验对它无感。
+    //
+    // 有了每轮实测的实例状态就不用猜：跑着的实例读数为零在物理上不成立，只可能是管道
+    // 坏了 —— 而 0 字节正是唯一会让看门狗什么都不做的读数，所以这条兜底不能少。
+    const monthAgeSeconds = range.endTime - range.startTime;
+    if (
+      usedBytes === 0 &&
+      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)
+    ) {
+      console.error(
+        `${config.label} BLIND | ${(monthAgeSeconds / 3600).toFixed(1)} h into the month, month-to-date reads exactly zero` +
+          ` while the instance is ${describeState(instanceState)}` +
+          ` | a running instance always moves some bytes, so the metric pipeline is what is broken` +
+          ` (a wrong unit returns HTTP 200 with an empty array)`,
       );
     }
 
@@ -970,30 +998,6 @@ export default {
 
     if (burst && burst.lagSeconds !== null) {
       common.push(`meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`);
-    }
-
-    // ── 零读数的兜底告警 ────────────────────────────────────────────────────
-    //
-    // 「月初至今恰为零」有两种成因，光看指标分不开：
-    //   实例没在跑 —— 正常，没什么可说的。
-    //   量的那一侧坏了 —— 例如请求的 unit 传错。实测传成 Bits / Count / Percent /
-    //     Seconds / Megabytes 中任意一个，AWS 都回 HTTP 200、metricName 正确回显、
-    //     metricData 空数组，与「没有流量」完全同形，`sumMetric` 的双信号校验对它无感。
-    //
-    // 有了每轮实测的实例状态就不用猜：跑着的实例读数为零在物理上不成立，只可能是管道
-    // 坏了 —— 而 0 字节正是唯一会让看门狗什么都不做的读数，所以这条兜底不能少。
-    const monthAgeSeconds = range.endTime - range.startTime;
-    if (
-      usedBytes === 0 &&
-      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&
-      meterShouldSeeTraffic(instanceState)
-    ) {
-      console.error(
-        `${config.label} BLIND | ${(monthAgeSeconds / 3600).toFixed(1)} h into the month, month-to-date reads exactly zero` +
-          ` while the instance is ${describeState(instanceState)}` +
-          ` | a running instance always moves some bytes, so the metric pipeline is what is broken` +
-          ` (a wrong unit returns HTTP 200 with an empty array)`,
-      );
     }
 
     // ── 出口：这一轮的终态 ──────────────────────────────────────────────────

@@ -42,7 +42,7 @@ test("monthStartMs handles February in a leap year", () => {
 });
 
 test("the allowance boundary is the UTC rollover, not the local one", () => {
-  // 重启已经不再看日期了，但查询窗口仍然必须在精确的那一刻翻页：让月初至今的用量
+  // 查询窗口必须在精确的那一刻翻页：让月初至今的用量
   // 掉回阈值以下的，正是这个窗口，除此之外没有别的东西。下面这两个时刻，就是一个
   // 按本地时间实现的版本会给出不同答案的地方。
   //

@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # 变异测试：往代码里注入已知缺陷，看测试会不会变红。
 #
-# 存在的理由：「测试通过」证明不了测试有用。两种真实的反例 ——
-# 一次是打桩把 AWS 的合法空响应当成畸形响应（夹具和断言互相印证同一个错误假设），
-# 一次是性质测试跑得很热闹却抓不到任何注入的缺陷。能抓住缺陷才是唯一的证据。
+# 存在的理由：「测试通过」证明不了测试有用。两类反例都很常见 ——
+# 打桩把上游的**合法**响应当成畸形响应（夹具和断言互相印证同一个错误假设，全绿而代码是
+# 错的），以及性质测试跑得很热闹却抓不到任何注入的缺陷。能抓住缺陷才是唯一的证据。
 #
-# 三条纪律，都是踩过坑之后加的：
-#   1. 全程在临时副本里操作，绝不碰工作区 —— 中途一次中断就可能把 `if (false && manualHold)`
-#      留在了 src 里，差点提交上去。
-#   2. 先跑对照组：不做任何变异时必须是绿的，否则说明检测器本身在瞎报。
-#   3. 检测器自己也要能被检验。这里踩过两个坑：数行数会被 reporter 打两遍的失败行骗到；
-#      而把 `node --test | grep -q` 放在 `set -o pipefail` 下，管道会返回 node 的退出码
-#      （测试失败 = 1）而不是 grep 的（找到 = 0），整个检测逻辑被反了过来 —— 于是所有
-#      变异都被报成「漏过」，而对照组碰巧还是绿的。现在先把输出收进变量再判断，并且
-#      强制区分「跑了且通过」「不变量被违反」「根本没跑起来」三种情况。
+# 三条纪律。它们防的都是同一种失效：**检测器自己坏了，却静默地一律输出「通过」**。
+#   1. 全程在临时副本里操作，绝不碰工作区 —— 中途一次中断就会把 `if (false && ...)`
+#      这样的变异留在 src 里，然后被提交上去。
+#   2. 先跑对照组：不做任何变异时必须是绿的。否则「全部变异都被抓到」是假的 —— 例如忘了
+#      把 wrangler.jsonc 复制进副本，整个套件会在副本里直接报错，于是每一个变异都被误判
+#      成「抓到」。
+#   3. 检测器自己也要能被检验。三个具体的坑：数失败行数会被 reporter 把同一行打两遍骗到；
+#      把 `node --test | grep -q` 放在 `set -o pipefail` 下时，管道返回的是 node 的退出码
+#      （测试失败 = 1）而不是 grep 的（找到 = 0），判断整个反过来；用 `^. tests` 匹配多字节
+#      的 `ℹ` 永远匹配不上（grep -E 的 `.` 按字节走）。所以先把输出收进变量再判断，直接读
+#      汇总里的计数，并强制区分「跑了且通过」「不变量被违反」「根本没跑起来」三种情况。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -95,7 +97,7 @@ mutate "    const down = typeof instanceState === \"string\" && instanceState !=
        "把自动启动加回来（额度归零就把实例拉起来）"
 mutate "      getInstanceState(client, config).catch((err) => {" \
        '      Promise.resolve("stopped").then((v) => v).catch((err) => {' \
-       "状态查询被换成写死的 stopped（重启路径会误启动）"
+       "状态查询被换成写死的 stopped（越线时会写 DOWN 而不是真的停机）"
 mutate "const now = new Date(controller.scheduledTime ?? Date.now());" "const now = new Date(Date.now());" "忽略 scheduledTime 改用墙上时钟"
 mutate 'for (const secret of [client.accessKeyId, client.secretAccessKey]) {' \
        'for (const secret of [client.accessKeyId]) {' "只脱敏 access key id，漏掉 secret"
@@ -159,8 +161,8 @@ mutate 'const down = typeof instanceState === "string" && instanceState !== "run
        "const down = false;" \
        "停机后的稳态退回写 OK（站点下线而过滤器里什么都没有）"
 mutate '      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
-       '      `${config.label} NOOP | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
-       "静态线停机的稳态退回 NOOP（两条路径不再收敛）"
+       '      `${config.label} OK | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
+       "停机后的稳态写成 OK（站点已下线而日志过滤器里什么都没有）"
 mutate "    if (
       usedBytes === 0 &&
       monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&

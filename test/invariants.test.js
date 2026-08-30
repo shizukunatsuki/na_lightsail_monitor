@@ -29,7 +29,8 @@ const STRATA = ["zeroUsage", "boundary", "burst", "failure", "random"];
 function scenario(r, stratum) {
   const quotaGib = [1024, 2048, 3072, 512][Math.floor(r() * 4)];
   const threshold = [0.5, 0.8, 0.95, 1][Math.floor(r() * 4)];
-  // 三档用量：恰为零、阈值附近、全域随机。零那一档要足够常见，重启路径才会被走到。
+  // 三档用量：恰为零、阈值附近、全域随机。零那一档要足够常见 —— 与「零字节读数」有关的
+  // 判断全都只在那一档上活动。
   const pick = stratum === "zeroUsage" ? 0 : stratum === "boundary" ? 0.25 : r();
   const usedGib =
     pick < 0.2
@@ -127,7 +128,9 @@ function stub(sc) {
   return calls;
 }
 
-const TOKENS = ["OK", "STOPPED", "STARTED", "NOOP", "HOLD", "DOWN"];
+// 终态标记只有三个：实例在跑（OK）、没在跑（DOWN）、这一轮把它停了（STOPPED）。
+// BLIND 与 DEGRADED 是附加告警，不是终态，所以不在这里。
+const TOKENS = ["OK", "DOWN", "STOPPED"];
 
 async function runScenario(sc, at) {
   const calls = stub(sc);
