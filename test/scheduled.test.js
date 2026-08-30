@@ -70,7 +70,7 @@ const BURST_PERIOD = 300;
 /**
  * 打桩 `globalThis.fetch`，记录每一次 Lightsail 操作。
  *
- * 指标查询按 `period` 分流：86400 是「月初至今」，300 是突发闸门那一小时的窗口。两者
+ * 指标查询按 `period` 分流：86400 是「月初至今」，300 是突发闸门那半小时的窗口。两者
  * 必须能分别给量，否则「本月用了 800 GiB」会被当成「最近一小时烧了 800 GiB」，突发闸门
  * 在每个测试里都会误触发。
  *
@@ -387,8 +387,10 @@ test("the burst window is the trailing half hour at 300-second granularity", asy
   for (const call of burstCalls(mock.calls)) {
     assert.equal(call.body.period, BURST_PERIOD);
     assert.equal(call.body.endTime, now);
-    // 半小时而不是一小时：一小时的平均会把刚开始的突发稀释掉，闸门要等耗尽进度走完
-    // 63% 才跳；半小时是 40%。见 src/index.js 里 BURST_WINDOW_SECONDS 的说明。
+    // 半小时而不是一小时：窗口越长，刚开始的突发被平均得越狠 —— 一场刚跑了 5 分钟的
+    // 突发，在一小时的窗口里只显出真实速率的十二分之一。取 30 分钟的完整推导（含数值
+    // 模拟）见 src/tuning.js 里 BURST_WINDOW_SECONDS 的说明；**别用「跳闸时耗尽进度
+    // 百分之几」去论证它**，那个比例随速率和相位在 41%–109% 之间剧烈变化，不稳定。
     assert.equal(call.body.startTime, now - 1800);
   }
   assert.deepEqual(burstCalls(mock.calls).map((c) => c.body.metricName).sort(), ["NetworkIn", "NetworkOut"]);
@@ -666,7 +668,7 @@ test("a month reading missing one direction with an unreadable state is still ca
 
 test("a draining window on a stopped instance is not a half-blind alarm", async () => {
   // 实例确认停着时，窗口正在把停机前的桶排空，两个方向先后掉到零是正常的。判据走
-  // meterShouldSeeTraffic，与另外三个调用点一致 —— 不为一次合法停机制造噪音。
+  // meterShouldSeeTraffic，与另外四个调用点一致 —— 不为一次合法停机制造噪音。
   const mock = stubAws({
     networkIn: 5 * GIB,
     networkOut: 5 * GIB,
@@ -726,11 +728,10 @@ test("the lag alarm fires before the design stops holding, not after", async () 
 });
 
 test("the daily UTC rollover does not raise a month-staleness alarm", async () => {
-  // 判据一度写成「最新的天桶不是今天」。在 00:00 UTC 那一格，今天才过了 0 秒，今天的桶
-  // 当然还不存在，最新的必然是昨天 —— 于是每天必定误报一行 error，而它自己算出来的
-  // 落后时长恰好是 0.0 小时。噪音与真实故障同形，是最坏的一种。
-  //
-  // 用真实 API 复现过：连续三天的 00:00 UTC 全部误报。判据必须是「落后多久」。
+  // **判据必须是「落后多久」，不能是「最新的天桶是不是今天」。** 后者在 00:00 UTC 那一格
+  // 必定误报：那一刻今天才过了 0 秒，今天的桶当然还不存在，最新的必然是昨天 —— 于是每天
+  // 一行 error，而它自己算出来的落后时长恰好是 0.0 小时。噪音与真实故障同形，是最坏的
+  // 一种。（用真实 API 验证过：连续三天的 00:00 UTC 全部命中。）
   for (const at of ["2026-08-22T00:00:00Z", "2026-08-22T00:05:00Z", "2026-09-01T00:00:00Z"]) {
     const mock = stubAws({ networkIn: 100 * GIB, recentIn: GIB, monthNewestDaysAgo: 1 });
     const lines = await capturingLogs(() => run(at, baseEnv, mock));
@@ -744,7 +745,8 @@ test("the daily UTC rollover does not raise a month-staleness alarm", async () =
 test("a month-to-date reading that does not cover today is reported", async () => {
   // 月度查询用 period: 86400，桶是一整天。如果上游哪天改成
   // 「只返回已完成周期」，月度读数就只覆盖到昨天 —— 今天的流量对静态线完全不可见，
-  // 盲区最长 24 小时，比处处精心标定的「10 分钟落库延迟」大两个数量级。这条告警是那种情形唯一的信号。
+  // 盲区最长 24 小时，比处处精心标定的「10 分钟落库延迟」大两个数量级。这条告警是那种
+  // 情形唯一的信号。
   //
   // 这个检查在两种语义下都正确：返回当天部分聚合时永不触发；只返回已关闭天桶时必然触发。
   // 也就是说它既是防线，也是那个「一次 API 调用才能分辨」的实验 —— 上线第一天就有结论。
@@ -771,7 +773,8 @@ test("a legitimately stopped instance is not accused of a blind month reading", 
   // 注意打桩必须让停机中的实例的月度读数**停在它最后跑过的那一天**（`monthNewestDaysAgo`）。
   // 用一份「实例停着、读数却覆盖到今天」的响应，这个缺陷在测试里根本无法显形。
   //
-  // 用量刻意压在静态线之下：越线会走 675 行那条提前 return，根本到不了这条告警。
+  // 用量刻意压在静态线之下：越线的话 `usedGib >= limitGib` 那一支会提前 return，根本到
+  // 不了这条告警。
   for (const daysAgo of [1, 3, 12]) {
     const mock = stubAws({
       networkIn: 200 * GIB,
@@ -802,7 +805,7 @@ test("the same stale month reading on a running instance is still reported", asy
 });
 
 test("a stale month reading with an unreadable state is still reported", async () => {
-  // 状态读不出来这一档一律「宁可多喊一声」—— 与另外三个调用点、以及 README 的表格一致。
+  // 状态读不出来这一档一律「宁可多喊一声」—— 与另外四个调用点、以及 README 的表格一致。
   // 不能因为「不确定它在不在跑」就把话咽回去。
   const mock = stubAws({ networkIn: 200 * GIB, recentIn: GIB, unreadableState: true, monthNewestDaysAgo: 3 });
   const lines = await capturingLogs(() => run("2026-08-20T12:00:00Z", baseEnv, mock));
@@ -888,8 +891,8 @@ test("the static-line stop also says DOWN", async () => {
 
 test("a legitimately stopped instance reading zero is not alarmed about", async () => {
   // 对照：实例被合法停着（看门狗停的，或操作者自己停的）时，
-  // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。判据只看「月份已过几小时」而不看状态的话，
-  // 会从当月第 2 小时起每一次触发都报一次 BLIND，直到实例重新跑起来为止。
+  // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。判据只看「月份已过几小时」
+  // 而不看状态的话，会从当月第 2 小时起每一次触发都报一次 BLIND，直到实例重新跑起来。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
   const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
 
@@ -966,11 +969,11 @@ test("an empty burst window with an unreadable state still alarms", async () => 
   // 窗口空、而状态又读不出来 —— 分辨不了「指标失明」和「实例没在跑」。这时必须**报警**：
   // 对失明保持沉默的代价（放任一场看不见的突发）远大于多报一次的代价。
   //
-  // 但报警的话不许**断言**成因。旧措辞「instance is of unreadable state, so the meter is
-  // blind, not idle」在状态读不出来时仍一口咬定计量表失明 —— 而同一份响应形状下「实例被
-  // 操作者合法停着」完全可能（维护期恰好碰上状态查询坏掉），那句话会把一次合法停机写成
-  // 管道故障，每个 cron 周期一条，直到有人修好状态查询为止。stale 告警对同一个问题用的
-  // 是 either/or 措辞（见 burstCheck 里另一处 explanation），这里必须对齐。
+  // 但报警的话不许**断言**成因。写成「the meter is blind, not idle」是一口咬定计量表
+  // 失明 —— 而同一份响应形状下「实例被操作者合法停着」完全可能（维护期恰好碰上状态查询
+  // 也坏了），那句话会把一次合法停机写成管道故障，每个 cron 周期一条，直到有人修好状态
+  // 查询为止。只有实例**确认在跑**时那个成因才被排除掉。burstCheck 里的 stale 告警面对
+  // 同一个问题，措辞方式与这里一致。
   const mock = stubAws({ networkIn: 300 * GIB, emptyBurstWindow: true, fail: "GetInstanceState" });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
   const text = lines.join("\n");
@@ -1022,7 +1025,7 @@ test("a non-finite sum throws, and says so readably", async () => {
 });
 
 test("every credential occurrence is scrubbed, not just the first", async () => {
-  // 失败夹具现在把两个凭据各回显两次。只回显一次的话 replaceAll 和 replace 无从区分。
+  // 失败夹具把两个凭据各回显两次。只回显一次的话 replaceAll 和 replace 无从区分。
   const mock = stubAws({ fail: "GetInstanceMetricData" });
 
   await assert.rejects(
@@ -1037,7 +1040,7 @@ test("every credential occurrence is scrubbed, not just the first", async () => 
 });
 
 test("an idle instance with no recent data points is not treated as a burst", async () => {
-  // 最近一小时一个数据点都没有：速率无从谈起，绝不能因此停机。
+  // 最近半小时一个数据点都没有：速率无从谈起，绝不能因此停机。
   const mock = stubAws({ networkIn: 800 * GIB, recentPoints: 0 });
   await run("2026-08-15T12:00:00Z", baseEnv, mock);
 

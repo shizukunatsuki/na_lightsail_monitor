@@ -260,10 +260,11 @@ test("the handler is stateless: the same tick decided twice gives the same answe
 test("the watchdog's self-assessment is monotone in metric lag", async () => {
   // 这是一条**容易漏掉的不变量**：数据越旧，看门狗对自己的评价不得越乐观。
   //
-  // 违反它的正是 F1：可观测延迟有天花板（窗口 30 分钟 − 粒度 5 分钟 = 25 分钟），越过
-  // 之后窗口里一个点都落不进来，于是延迟算不出来、失明检测失效、速率被当成 0 —— 25 分钟
-  // 报警，26 分钟静默。变异测试结构上抓不到这类缺陷：缺的是一整段代码，没有哪一行可以被
-  // 变异成「不报警」。只有把两次运行按延迟排起来比才看得见。
+  // 它防的是这样一类缺陷：可观测延迟有天花板（窗口 30 分钟 − 粒度 5 分钟 = 25 分钟），
+  // 越过之后窗口里一个点都落不进来，于是延迟算不出来、失明检测失效、速率被当成 0 ——
+  // 表现为延迟 25 分钟时报警并停机、26 分钟时静默放行。变异测试结构上抓不到这类缺陷：
+  // 缺的是一整段代码，没有哪一行可以被变异成「不报警」。只有把两次运行按延迟排起来比
+  // 才看得见。
   //
   // 这里的打桩按真实管道语义建模：桶起点 T 覆盖 [T, T+300)，在 T+300+L 才可查；
   // 查询只返回起点落在窗口内的桶。
@@ -362,7 +363,7 @@ test("invariants hold across randomised scenarios", async () => {
     // 2. 畸形的指标响应必须抛错，绝不能被折算成 0 字节 —— 那是唯一会让看门狗什么都
     //    不做的读数。而且必须是**有意**的错误：一个 TypeError 说明只是碰巧崩了，
     //    换个运行时或换个畸形形状就可能不崩，那不是防线。
-    // HTTP 层先失败时拿到的是 HTTP 错误，形状检查根本没轮到 —— 那不算反例。
+    //    HTTP 层先失败时拿到的是 HTTP 错误，形状检查根本没轮到 —— 那不算反例。
     if (sc.badShape && sc.failOp !== "GetInstanceMetricData") {
       assert.ok(threw, `${where}: malformed metric response was swallowed`);
       assert.match(
@@ -378,7 +379,7 @@ test("invariants hold across randomised scenarios", async () => {
       assert.ok(!text.includes(SECRET), `${where}: secret leaked in: ${text.slice(0, 160)}`);
     }
 
-    // 3. 调用次数有上界，而且要把「逻辑操作」和「HTTP 请求」分开数 —— 5xx 会被
+    // 4. 调用次数有上界，而且要把「逻辑操作」和「HTTP 请求」分开数 —— 5xx 会被
     //    aws4fetch 重试两次，一个逻辑调用最多变成三次请求。直接给 HTTP 总数定一个
     //    魔数只会写出一个自己都说不清的上界。
     //    逻辑操作最多 6 个：2 月度 + 2 突发 + 1 状态 + 1 个动作（只可能是 StopInstance）。
@@ -390,13 +391,13 @@ test("invariants hold across randomised scenarios", async () => {
       assert.ok(n <= 3, `${where}: ${k} attempted ${n} times (retries cap at 3)`);
     }
 
-    // 4. **绝不启动实例，任何情形下都不。** 这个看门狗只有停机一个动作；启动实例的权限
+    // 5. **绝不启动实例，任何情形下都不。** 这个看门狗只有停机一个动作；启动实例的权限
     //    连 IAM 策略里都没有。这是硬安全性质，不是某条路径的断言：让看门狗有启动能力，
     //    等于给「读数谎报为零」那一类故障配上一个会烧钱的动作。
     const stopped = attempts.has("StopInstance");
     assert.ok(!attempts.has("StartInstance"), `${where}: issued StartInstance`);
 
-    // 5. 正常跑完必须恰好留下一行终态。BLIND / DEGRADED 是附加告警，不算终态。
+    // 6. 正常跑完必须恰好留下一行终态。BLIND / DEGRADED 是附加告警，不算终态。
     const terminal = lines.filter((l) => TOKENS.some((t) => l.includes(` ${t} | `)));
     if (!threw) {
       assert.equal(terminal.length, 1, `${where}: ${terminal.length} terminal lines: ${lines.join(" /// ")}`);
@@ -412,8 +413,8 @@ test("invariants hold across randomised scenarios", async () => {
     }
 
     // 8. 越过静态线且实例在跑 —— 这是账单护栏的核心承诺，任何情况下都不能漏。
-    // 指标读不出来就谈不上判断，所以这条只在指标可用时成立；但 GetInstanceState 失败
-    // **不**豁免它 —— 停机路径是 fail-closed 的，状态读不到也要照停。
+    //    指标读不出来就谈不上判断，所以这条只在指标可用时成立；但 GetInstanceState 失败
+    //    **不**豁免它 —— 停机路径是 fail-closed 的，状态读不到也要照停。
     const metricsUsable = sc.failOp !== "GetInstanceMetricData" && !sc.badShape;
     if (metricsUsable && sc.usedGib >= sc.quotaGib * sc.threshold && sc.state === "running") {
       assert.ok(stopped, `${where}: MISSED STOP — over the line and running`);
@@ -422,8 +423,8 @@ test("invariants hold across randomised scenarios", async () => {
       assert.ok(stopped, `${where}: state check failed but the stop must still go out`);
     }
 
-    // 9a. 评估的必须是 scheduledTime 所在的那一格，而不是墙上时钟。cron 被延迟或重试时
-    //     这条是唯一能保证「算的还是它当初被触发的那一格」的东西。
+    // 9. 评估的必须是 scheduledTime 所在的那一格，而不是墙上时钟。cron 被延迟或重试时
+    //    这条是唯一能保证「算的还是它当初被触发的那一格」的东西。
     const monthQueries = calls.filter((c) => c.body.period === 86400);
     if (monthQueries.length > 0) {
       const d = new Date(Date.parse(at));
@@ -438,10 +439,10 @@ test("invariants hold across randomised scenarios", async () => {
       );
     }
 
-    // 9. 用量为零时绝不可能停机 —— 没有任何理由。
+    // 10. 用量为零时绝不可能停机 —— 没有任何理由。
     if (sc.usedGib === 0) assert.ok(!stopped, `${where}: stopped at zero usage`);
 
-    // 10. 突发闸门的承诺，直接按需求复述一遍：按当前速率剩余额度撑不过反应视野、且
+    // 11. 突发闸门的承诺，直接按需求复述一遍：按当前速率剩余额度撑不过反应视野、且
     //     实例在跑，就必须停。速率是两个方向各自除以自己的覆盖时长再相加 —— 这条公式
     //     是需求本身，不是从实现里抄的变量。
     const rateOf = (gib, pts) => (pts > 0 ? (gib * GIB) / (pts * 300) : 0);

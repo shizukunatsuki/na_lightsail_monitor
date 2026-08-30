@@ -407,7 +407,7 @@ export async function sumMetric(client, config, metricName, range, period) {
   // 的是 200 + 1440 个点 —— 也就是说它（至少那一天）按跨度数。这里**仍然**按相位数：守卫
   // 最多比上游严一个桶、且只在两种数法分歧的边界上发生（生产两个查询的起点都对齐到分钟，
   // 两种数法在那里完全相等）；宁可这边响亮地多拦一次，也不把「上游按哪种数」当成一个需要
-  // 赌对的假设 —— 它在 8 天里变过一次。
+  // 赌对的假设 —— 关于超限行为的两次实测本身就对不上（见上面），没有理由认定这一条更稳。
   const gridStart = Math.floor(range.startTime / 60) * 60;
   const wanted = Math.ceil((range.endTime - gridStart) / period);
   if (wanted > MAX_DATAPOINTS_PER_QUERY) {
@@ -649,16 +649,18 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
   // 抓住它的是「看门狗对自己的评价必须随数据变旧而单调不增」这条性质。
   if (recentIn.points === 0 && recentOut.points === 0) {
     // 「指标看不见」和「实例本来就没在跑」在指标上长得一模一样 —— 所以不猜，直接用这一轮
-    // 已经查到的真实状态来分辨。**状态读不出来时同样不许断言成因**：旧措辞在这一档会写成
-    // 「the meter is blind, not idle」，一口咬定计量表失明 —— 可同一份响应形状下「实例被
-    // 合法停着」完全可能（维护期恰好碰上状态查询坏掉），那句话会把停机写成管道故障，每个
-    // cron 周期一条，直到有人修好状态查询为止。stale 告警对同一个问题用的是 either/or
-    // 措辞（见下面那条 explanation），这里对齐。
-    const explanation =
-      instanceState === "running"
-        ? "the instance is running, so the meter is blind, not idle"
-        : "the instance state is unreadable, so this is either a blind meter or an instance that is not running";
+    // 已经查到的真实状态来分辨。
+    //
+    // **状态读不出来时不许断言成因。** 一口咬定「the meter is blind, not idle」是不对的：
+    // 同一份响应形状下「实例被操作者合法停着」完全可能（维护期恰好碰上状态查询也坏了），
+    // 那句话会把一次合法停机写成管道故障，每个 cron 周期一条，直到有人修好状态查询为止。
+    // 只有实例**确认在跑**时那个成因才被排除掉，断言才成立。下面 stale 告警面对同一个
+    // 问题，措辞方式与这里一致。
     if (meterShouldSeeTraffic(instanceState)) {
+      const explanation =
+        instanceState === "running"
+          ? "the instance is running, so the meter is blind, not idle"
+          : "the instance state is unreadable, so this is either a blind meter or an instance that is not running";
       console.error(
         `${config.label} BLIND | no metric data points in the last ${BURST_WINDOW_SECONDS / 60} min` +
           ` | ${explanation}` +

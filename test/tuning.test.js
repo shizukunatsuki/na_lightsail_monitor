@@ -6,7 +6,7 @@
 // 于是它从「提前五分钟报警」变成「迟到四分钟」。这个文件把这些关系钉成硬失败，就是为了
 // 让那种改动过不了闸门。
 //
-// cron 写在 wrangler.jsonc 里、常量写在 src/index.js 里，跨文件的耦合最容易失修，所以
+// cron 写在 wrangler.jsonc 里、常量写在 src/tuning.js 里，跨文件的耦合最容易失修，所以
 // 这个文件把两边直接读进来一起验。
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -151,8 +151,9 @@ test("the requested metric unit is the one the byte maths assumes", () => {
 });
 
 test("ASSUMED_LAG_SECONDS stays observable at the burst granularity", () => {
-  // 设计假设的延迟必须大于一个桶，否则它连一次观测都撑不满，`meter` 那个字段就没有
-  // 任何校准价值。
+  // 设计假设的延迟必须大于一个桶：延迟只能按整桶观测，小于一个桶的假设值连一次观测都
+  // 撑不满，日志里根本反映不出来。（真要在生产上看延迟的变化，读 `win` 而不是 `meter`
+  // —— 理由见 src/tuning.js 里 ASSUMED_LAG_SECONDS 的说明。）
   assert.ok(ASSUMED_LAG_SECONDS >= BURST_PERIOD_SECONDS);
   assert.equal(DETECTION_LOOP_SECONDS,
     BUCKET_CLOSE_SECONDS + ASSUMED_LAG_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS);

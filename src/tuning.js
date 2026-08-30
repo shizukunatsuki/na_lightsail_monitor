@@ -9,8 +9,8 @@
  * 还有一类更隐蔽的分散：把数值直接内联在用它的那一行里。内联的数字同样是决策，只是没有
  * 名字 —— 既不会被复核，也没法被关系检查引用。**新增任何调参都写在这里，不要内联。**
  *
- * 唯一不在这里的是**部署侧变量**（区域、实例名、配额、阈值）：它们逐个部署
- * 不同，属于 `wrangler.jsonc` 的 `vars`，由 `readConfig` 校验。cron 也只能住在
+ * 唯一不在这里的是**部署侧变量**（区域、实例名、配额、阈值）：它们逐个部署不同，属于
+ * `wrangler.jsonc` 的 `vars`，由 `readConfig` 校验。cron 也只能住在
  * `wrangler.jsonc` 里，所以这里留一份**声明**，并由 `test/tuning.test.js` 与真身核对。
  */
 
@@ -39,8 +39,8 @@ export const CRON_INTERVAL_SECONDS = 600;
  * **实测（2026-08-22，ap-northeast-1）：这个粒度不存在「当天盲区」。** API 会为尚未结束
  * 的今天返回一个部分聚合的桶 —— 查询返回的最新桶起点就是今天 00:00 UTC，`sum` 是今天
  * 到此刻为止的量。所以「桶必须关闭后才可查」这条只适用于 300 秒那一档，不适用于这里。
- * `scheduled` 里那两条月度读数新鲜度告警仍然保留：零成本，而且能在 AWS 哪天改变这个
- * 行为时立刻响。
+ * 即便如此，`scheduled` 里那条「月度读数没覆盖到今天」的告警仍然保留：它零成本，而且
+ * 一旦 AWS 改成「只返回已关闭的天桶」，它会在改变生效的第一天就响。
  *
  * 至于为什么不用 3600：只是数据点少、解析便宜而已。**不是**出于 CPU 预算 —— 线上实测
  * 每次触发的 CPU 时间 P50 1.68 ms、P99 2.57 ms（免费版上限 10 ms），余量充足。（拿本机的
@@ -95,13 +95,19 @@ export const BURST_PERIOD_SECONDS = 300;
  * 闸门能动手之前烧完。
  *
  * 它同时是闸门唯一的灵敏度旋钮：跳闸判据等价于 `速率 > 剩余额度 / 视野`，所以调大它
- * 会线性地降低触发所需的速率。60 分钟意味着空表时要约 2.4 Gbps、用到 800 GiB 时约
- * 534 Mbps 才跳闸 —— 对一台个人站实例，这两个数仍然远在正常业务之上。想更保守就继续
- * 调大这个数（代价是可能掐掉一次合法的大流量传输），不要去动 `BURST_WINDOW_SECONDS`。
+ * 会线性地降低触发所需的速率。以 1 TB 套餐为例，60 分钟意味着空表时要约 2.4 Gbps、用到
+ * 800 GiB 时约 534 Mbps 才跳闸。**这两个数是否「远高于正常业务」取决于你的负载** —— 跑
+ * 大文件分发就未必。想更保守就继续调大这个数（代价是可能掐掉一次合法的大流量传输），
+ * 不要去动 `BURST_WINDOW_SECONDS`。
  */
 export const REACTION_HORIZON_SECONDS = 3600;
 
-/** 桶必须先关闭才可能被查到，最坏是一整个粒度。检测回路的第一项。 */
+/**
+ * 桶必须先关闭才可能被查到，最坏是一整个粒度。**检测回路的第一项。**
+ *
+ * 回路一共四项，按发生顺序：桶关闭（这一项）、落库延迟（`ASSUMED_LAG_SECONDS`）、
+ * cron 间隔（`CRON_INTERVAL_SECONDS`，见本文件第一节）、停机生效（`STOP_PROPAGATION_SECONDS`）。
+ */
 export const BUCKET_CLOSE_SECONDS = BURST_PERIOD_SECONDS;
 
 /**
@@ -109,11 +115,15 @@ export const BUCKET_CLOSE_SECONDS = BURST_PERIOD_SECONDS;
  *
  * **实测（2026-08-22，ap-northeast-1，5 次独立采样跨指标跨窗口）：约 0.9 分钟**，比这个
  * 悲观值快一个数量级。刻意**不**跟着调小 —— 一次采样不等于分布，而参数按悲观值定意味着
- * 真实情况下余量更大，方向是安全的。日志里的 `meter ... behind` 会持续校准它。
+ * 真实情况下余量更大，方向是安全的。
+ *
+ * 想在生产上持续校准这个数，**看日志里的 `win` 而不是 `meter`**：`meter` 量化到一整个
+ * 300 秒桶，而生产的 `endTime` 恰好落在桶边界上，所以它几乎恒为 0，看不出延迟的变化；
+ * `win` 一掉就掉一格（`6,6/6` -> `5,5/6`），才有分辨率。
  */
 export const ASSUMED_LAG_SECONDS = 600;
 
-/** StopInstance 发出到真正断流。检测回路的第四项。 */
+/** StopInstance 发出到真正断流。检测回路的第四项（也是最后一项）。 */
 export const STOP_PROPAGATION_SECONDS = 60;
 
 /**
@@ -160,7 +170,8 @@ export const MAX_TOLERABLE_LAG_SECONDS = 720;
  * 「AWS 哪天改了返回单位」这一侧也有实打实的检查，而不是靠假设。
  *
  * 至于「请求的单位不对导致空响应」，响应本身分辨不了 —— 它和「实例没在跑」长得一模一样。
- * 那一侧由 `scheduled` 里的零读数告警承接：实例状态是 running 而读数为零，物理上不成立。
+ * 那一侧由 `scheduled` 里的零读数告警承接：实例在跑（或状态读不出来）而读数为零，物理上
+ * 不成立 —— 判据走 `meterShouldSeeTraffic`。
  */
 export const METRIC_UNIT = "Bytes";
 
@@ -256,7 +267,13 @@ export const API_TARGET = "Lightsail_20161128";
  */
 export const AWS_RETRIES = 2;
 
-/** `wrangler.jsonc` 中需要操作者自行填写的变量所使用的占位值。 */
+/**
+ * 需要操作者自行填写的变量所使用的占位值，`readConfig` 会精确比较并拒绝它。
+ *
+ * **注意仓库里提交的 `wrangler.jsonc` 填的是实值而不是这个占位符**，所以这道检查不会替
+ * fork 之后忘记改配置的人响 —— 它只在有人主动写成 `CHANGE_ME` 时生效。部署前请自己核对
+ * `AWS_REGION` 与 `INSTANCE_NAME`，详见 README 配置项一节。
+ */
 export const PLACEHOLDER = "CHANGE_ME";
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -52,9 +52,9 @@ detect() {
   [ "${failed:-0}" -gt 0 ]
 }
 
-# 调参常量搬到 src/tuning.js 之后，变异目标就跨了两个文件。默认打 src/index.js，
-# `--in <路径>` 换到别的源文件。每次都从原始 src 整目录恢复 —— 只恢复一个文件的话，
-# 只恢复一个文件的话，打在另一个文件上的变异会残留到下一轮，于是「谁抓到了什么」全部作废。
+# 变异目标跨两个源文件：默认打 src/index.js，`--in <路径>` 换到 src/tuning.js。
+# **每次都从原始 src 整目录恢复**，不要只恢复一个文件 —— 否则打在另一个文件上的变异会
+# 残留到下一轮，于是「谁抓到了什么」全部作废。
 mutate() {
   local file="src/index.js"
   if [ "$1" = "--in" ]; then file="$2"; shift 2; fi
@@ -124,12 +124,12 @@ mutate --in src/tuning.js "export const BURST_WINDOW_SECONDS = 1800;" "export co
 # 静默失明这一类。变异测试本身抓不到「缺失的代码」，
 # 但代码补上之后，它能防止这段代码被改回去。
 mutate "if (recentIn.points === 0 && recentOut.points === 0) {" "if (false) {" \
-       "去掉「窗口零数据点」的失明检测（F1 回归）"
+       "去掉「窗口零数据点」的失明检测（无数据时会伪造出 0 kbps 读数）"
 mutate "const meterShouldSeeTraffic = (state) => state === \"running\" || state === null;" \
        'const meterShouldSeeTraffic = (state) => state === "running";' \
        "状态读不出时不再报失明"
 # 月度读数的覆盖范围，以及时间戳的量级
-# 判据是三行的多行条件（加了实例状态那一档之后）—— 锚点必须整段照抄，否则会变成
+# 判据是三行的多行条件 —— 锚点必须整段照抄，否则会变成
 # 「变异未应用」，而那被计为存活：一个施加不上去的变异什么也没验证。
 mutate "    if (
       behindSeconds !== null &&
@@ -151,7 +151,7 @@ mutate "        ? Math.max(...monthWithPoints.map((m) => m.oldest))" \
        "月度覆盖起点取最乐观的一头（一侧缺了月初几天时 covers from 不出现）"
 mutate "      Math.abs(point.timestamp - range.endTime) <= MAX_TIMESTAMP_SKEW_SECONDS;" \
        "      true;" \
-       "去掉时间戳量级检查（毫秒可静默绕过 staleness，A3）"
+       "去掉时间戳量级检查（毫秒时间戳可静默绕过新鲜度检测）"
 # 实例状态必须来自 API，不能靠推断
 mutate "      getInstanceState(client, config).catch((err) => {" \
        "      Promise.resolve(\"running\").then((v) => v).catch((err) => {" \
@@ -159,10 +159,10 @@ mutate "      getInstanceState(client, config).catch((err) => {" \
 # 可观测性：稳态必须能被 grep 出来，告警不能被别的分支吞掉
 mutate 'const down = typeof instanceState === "string" && instanceState !== "running";' \
        "const down = false;" \
-       "停机后的稳态退回写 OK（站点下线而过滤器里什么都没有）"
+       "OK/DOWN 判据恒为 OK（走正常出口时，已下线的实例被写成 OK）"
 mutate '      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
        '      `${config.label} OK | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
-       "停机后的稳态写成 OK（站点已下线而日志过滤器里什么都没有）"
+       "stopOverLimit 的幂等分支写成 OK（越线后重复触发时，已下线的实例被写成 OK）"
 mutate "    if (
       usedBytes === 0 &&
       monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&
@@ -182,15 +182,15 @@ mutate "    if (monthWithPoints.length > 0 && !Number.isFinite(monthNewest)) {" 
 mutate "  if (lagSeconds === null) {" "  if (false) {" \
        "时间戳读不出时不再报失明（同一条静默路径的另一个入口）"
 mutate 'detail = detail.replaceAll(secret, "[redacted]");' 'detail = detail.replace(secret, "[redacted]");' \
-       "脱敏只替换第一处出现（F6）"
+       "脱敏只替换第一处出现（同一份响应里凭据的第二次出现会进日志）"
 mutate '${String(point.sum)}' '${JSON.stringify(point.sum)}' \
-       "非有限 sum 的错误消息退回 JSON.stringify（会读作 null，F7）"
-# F3：unit 传错时 AWS 回 200 + 空数组，响应侧分辨不了 —— 两侧防线都要能被抓到
+       "非有限 sum 的错误消息退回 JSON.stringify（Infinity 会被写成 null，误导排查方向）"
+# unit 传错时 AWS 回 200 + 空数组，响应侧分辨不了 —— 请求侧和校验侧两道防线都要能被抓到
 mutate "    if (point.unit != null && point.unit !== METRIC_UNIT) {" "    if (false) {" \
        "去掉数据点的单位校验（把 Bits 当 Bytes 累加会少报八倍）"
 mutate --in src/tuning.js 'export const METRIC_UNIT = "Bytes";' 'export const METRIC_UNIT = "Bits";' \
        "请求的单位改错（上游静默回空数组，用量恒为零）"
-# F7：速率分母必须跟着实际覆盖的秒数走
+# 速率分母必须跟着实际覆盖的秒数走
 mutate "    return metric.bytes / (metric.coveredSeconds ?? metric.points * BURST_PERIOD_SECONDS);" \
        "    return metric.bytes / (metric.points * BURST_PERIOD_SECONDS);" \
        "分母退回「桶数 × 粒度」（窗口未对齐时速率报低）"

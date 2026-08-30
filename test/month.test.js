@@ -42,19 +42,19 @@ test("monthStartMs handles February in a leap year", () => {
 });
 
 test("the allowance boundary is the UTC rollover, not the local one", () => {
-  // 查询窗口必须在精确的那一刻翻页：让月初至今的用量
-  // 掉回阈值以下的，正是这个窗口，除此之外没有别的东西。下面这两个时刻，就是一个
-  // 按本地时间实现的版本会给出不同答案的地方。
+  // 查询窗口必须在精确的那一刻翻页：额度重置这件事，看门狗唯一能观测到的形式就是
+  // 「月初至今的用量掉回阈值以下」，而那完全取决于这个窗口从哪一刻起算。下面这两个
+  // 时刻，正是一个按本地时间实现的版本会给出不同答案的地方。
   //
-  // 此刻本地时间已是 1 号，UTC 还停在 31 号。这时若已经开始查三月，会报出约 0 的
-  // 用量，从而把一台额度根本没重置的实例交还回去。
+  // 此刻本地时间已是 1 号，UTC 还停在 31 号。这时若已经开始查三月，会报出约 0 的用量 ——
+  // 于是静态线看不到二月那笔已经花掉的额度，在额度**根本没重置**的情况下停止把关。
   const tokyoFirst = utc("2026-03-31T16:00:00Z");
   assert.equal(tokyoFirst.getUTCDate(), 31, "precondition: UTC is still the 31st");
   assert.equal(monthStartMs(tokyoFirst), epoch("2026-03-01T00:00:00Z"));
   assert.equal(usageWindow(tokyoFirst).startTime, epoch("2026-03-01T00:00:00Z") / 1000);
 
-  // 镜像情形：本地时间是 2 月 28 日，UTC 已经是 3 月 1 日。窗口必须已经翻过去了，
-  // 否则就会错过这次重置。
+  // 镜像情形：本地时间是 2 月 28 日，UTC 已经是 3 月 1 日。窗口必须已经翻过去了 ——
+  // 否则新月份的第一天还在按上个月的总量判断，会对一台额度已经重置的实例继续执行停机。
   const laLastDay = utc("2026-03-01T00:30:00Z");
   assert.equal(laLastDay.getMonth(), 1, "precondition: local clock still says February");
   assert.equal(monthStartMs(laLastDay), epoch("2026-03-01T00:00:00Z"));
@@ -166,8 +166,8 @@ test("readConfig rejects a QUOTA_GIB that would compare as NaN", () => {
 
 test("readConfig rejects a QUOTA_GIB large enough to disable the watchdog", () => {
   // 1e308 能通过「有限且为正」那道检查，但 1e308 × 2^30 溢出成 Infinity，停机线于是变成
-  // 一个永远够不到的数 —— 一个看起来在跑、实际什么都不做的看门狗。这正是 THRESHOLD
-  // 上界要防的是同一件事，两个变量都需要。
+  // 一个永远够不到的数 —— 一个看起来在跑、实际什么都不做的看门狗。THRESHOLD 的上界防的
+  // 是同一件事（把百分比写成 80），两个变量都需要各自的上界。
   for (const QUOTA_GIB of ["1e308", "1e30", String(Number.MAX_SAFE_INTEGER)]) {
     assert.throws(() => readConfig({ ...validEnv, QUOTA_GIB }), /QUOTA_GIB must be a positive number of at most/);
   }
