@@ -766,7 +766,10 @@ test("a legitimately stopped instance is not accused of a blind month reading", 
   // 不是「不可见」，是不存在。
   //
   // 这与零读数告警面对的是同一个问题，README 里也写着同一条结论：真正的管道故障会淹没在
-  // 这串噪音里。夹具当时让它无法显形 —— `state: "stopped"` 的响应照样覆盖到今天。
+  // 这串噪音里。
+  //
+  // 注意打桩必须让停机中的实例的月度读数**停在它最后跑过的那一天**（`monthNewestDaysAgo`）。
+  // 用一份「实例停着、读数却覆盖到今天」的响应，这个缺陷在测试里根本无法显形。
   //
   // 用量刻意压在静态线之下：越线会走 675 行那条提前 return，根本到不了这条告警。
   for (const daysAgo of [1, 3, 12]) {
@@ -1088,17 +1091,10 @@ test("StartInstance is never issued, under any state or usage", async () => {
   }
 });
 
-test("a stopped instance is not started while the month's usage is still spent", async () => {
-  // 与停机同一个月：额度没有重置，实例也就不该重启。正是这一点让用量触发等价于旧的
-  // 「1 号」触发，而不是变成一个反复重启的死循环。
-  const mock = stubAws({ state: "stopped", networkIn: 900 * GIB });
-  await run("2026-08-02T00:00:00Z", baseEnv, mock);
-
-  assert.ok(!opsOf(mock.calls).includes("StartInstance"));
-});
-
 test("a stopped instance with traffic on the meter is left alone", async () => {
-  // 低于阈值但不为零 —— 是操作者自己在月中把它停掉的。这里没有任何迹象表明额度重置了。
+  // 低于阈值但不为零 —— 典型形态是操作者自己在月中把它停掉做维护。看门狗对这台实例
+  // 无事可做：不该停（没越线），也不会启动（它从不启动）。断言四次指标查询都发出了，
+  // 是为了确认它**确实完整地量过一轮**，而不是在某个分支上提前 return 了。
   const mock = stubAws({ state: "stopped", networkIn: 120 * GIB, networkOut: 80 * GIB });
   await run("2026-08-20T09:00:00Z", baseEnv, mock);
 
@@ -1141,14 +1137,16 @@ test("a failure on the stop call itself is not swallowed", async () => {
 });
 
 test("an omitted metricData field is a legitimate zero, not an error", async () => {
-  // 这条守的是一个差点被写进生产的 bug。AWS 的响应定义里 metricData 没有任何「必然
-  // 出现」的保证，各语言 SDK 一律把「字段缺失」正规化成空数组 —— 也就是说服务端允许
-  // 在没有数据时把它整个省掉。把「字段缺失」当成读不懂并抛错的代价是致命的：一台停机的
-  // 实例在新月份读到的恰恰就是这种空响应，于是每次触发都抛错，重启永远发不出去，实例会
-  // 停满一整个月。
+  // AWS 的响应定义里 `metricData` 没有任何「必然出现」的保证，各语言 SDK 一律把「字段
+  // 缺失」正规化成空数组 —— 也就是说服务端允许在没有数据时把它整个省掉。
   //
-  // 更隐蔽的是，当时的打桩正是用 `{ metricName }` 来模拟「畸形响应」的 —— 夹具和测试
-  // 一起把同一个错误假设印证了两遍，而 53 个用例全绿。
+  // **把「字段缺失」当成读不懂并抛错的代价是致命的**：一台停机的实例读到的恰恰就是这种
+  // 空响应，于是每次触发都抛错 —— 看门狗在那台实例上彻底失效，而它本该在实例重新跑起来
+  // 时继续守着。
+  //
+  // 写这类用例时有个陷阱：**别拿 `{ metricName }` 去模拟「畸形响应」**。它是合法形状，
+  // 那样做会让夹具和断言一起印证同一个错误假设，整套测试全绿而代码是错的。畸形响应要用
+  // 真正读不懂的形状（见 `metricShape: "unrelated"` 那条用例）。
   const mock = stubAws({ state: "stopped", metricShape: "omitted" });
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
@@ -1344,8 +1342,8 @@ test("a data point in the wrong unit throws instead of being summed", async () =
 });
 
 test("a data point with no unit field is still accepted", async () => {
-  // 刻意的不对称。把**合法的字段缺失**当成畸形响应，
-  // 会让停机中的实例整月发不出重启。缺席按「没说」处理，出现且不一致才算错。
+  // 刻意的不对称：把**合法的字段缺失**当成畸形响应会让看门狗在这台实例上彻底失效
+  // （见上面 metricData 那几条用例）。缺席按「没说」处理，出现且不一致才算错。
   const mock = stubAws({ badPoints: [{ sum: GIB, timestamp: 1.754e9 }] });
   const lines = await capturingLogs(() => run("2026-08-15T12:00:00Z", baseEnv, mock));
   assert.match(lines.at(-1), /used 2\.000 GiB/);

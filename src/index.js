@@ -477,7 +477,7 @@ export async function sumMetric(client, config, metricName, range, period) {
     // `sum` 缺席**或显式为 null** 都按零算。这是一个明确的产品决定，不是隐式行为：
     // CloudWatch 家族的 Datapoint 各统计量字段本就可空，而「这个周期没有这个统计量」与
     // 「这个周期没有流量」在这里同义。折算方向确实偏向漏停，但一个存在的数据点带着 null
-    // 的 `Sum`（而我们明确请求了 Sum）尚未被观察到过。
+    // 的 `Sum`（而请求里明确写了 `statistics: ["Sum"]`）尚未被观察到过。
     //
     // 只要它出现且不是 null，就必须是有限的非负数字。这里不是洁癖：`bytes += "500"` 会走
     // 字符串拼接，两个 500 GiB 的桶会被读成 0.005 GiB —— 少报几个数量级，而少报正是唯一
@@ -493,7 +493,7 @@ export async function sumMetric(client, config, metricName, range, period) {
     }
 
     // 单位必须是请求的那一个。**字段缺席不算错**（同上面那条：合法的缺失不能当成畸形），
-    // 但只要它出现且不一致，这个 sum 就不是我们以为的那个数 —— 把 Bits 当 Bytes 累加会
+    // 但只要它出现且不一致，这个 sum 就不是这段代码以为的那个数 —— 把 Bits 当 Bytes 累加会
     // 少报八倍。实测的数据点形状带这个字段：`{"sum":785943,"timestamp":...,"unit":"Bytes"}`。
     if (point.unit != null && point.unit !== METRIC_UNIT) {
       throw new Error(
