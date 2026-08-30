@@ -19,7 +19,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      # 变异测试是真正在验证「测试有没有用」的那一层，见 README 第十节。
+      # 变异测试是真正在验证「测试有没有用」的那一层，见 README 的「测试 -> 四、变异测试」。
+      # INVARIANT_CASES 调小是拿样本量换时间：变异测试要把整个套件跑几十遍。
       - run: npm run mutate
         env:
           INVARIANT_CASES: "500"

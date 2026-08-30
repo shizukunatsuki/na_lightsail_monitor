@@ -108,6 +108,9 @@ test("formatDuration covers each range it is meant to distinguish", () => {
   // 「撑得过视野」时才写），但把视野调低它就会活过来 —— 所以在这里直接测。
   assert.equal(formatDuration(0), "0 min");
   assert.equal(formatDuration(1740), "29 min");
+  // 边界上的一个已知显示怪相：3599 秒四舍五入成「60 min」而不是「1.0 h」。分档判据用的是
+  // 秒数（`< 3600`），而显示又做了取整，两者在最后一秒对不上。只影响一行日志的读法，
+  // 不影响任何判断，所以不为它加特例 —— 但钉在这里，免得有人当成 bug 去「修」。
   assert.equal(formatDuration(3599), "60 min");
 
   assert.equal(formatDuration(3600), "1.0 h");
@@ -155,6 +158,7 @@ test("unknown vars are ignored, not silently honoured", () => {
   const config = readConfig({ ...validEnv, MANUAL_HOLD: "true", SOMETHING_ELSE: "1" });
   assert.deepEqual(Object.keys(config).sort(), ["instanceName", "label", "quotaGib", "region", "threshold"]);
 });
+
 test("readConfig rejects a QUOTA_GIB that would compare as NaN", () => {
   // `usedGib < NaN` 恒为 false，这会被读作「已超额」并停掉实例。所以必须在这里大声
   // 报错。缺失（`undefined`）也在其中：旧部署里残留的 QUOTA_GB 不会被读取，此时

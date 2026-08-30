@@ -83,8 +83,9 @@ test("the reaction horizon covers the whole detection loop with margin", () => {
 
 test("the lag alarm fires before the burst gate stops being able to keep up", () => {
   // 告警必须挂在**检测回路**上（及时性），不能挂在观察窗口上（分辨率）—— 两者会在改
-  // cron 时朝不同方向走。这里的判据是：延迟容忍上限必须严格小于「视野减去回路里除延迟
-  // 之外的部分」，也就是延迟吃光余量之前就得响。
+  // cron 时朝不同方向走。判据：延迟容忍上限不得超过「视野减去回路里除延迟之外的部分」——
+  // 也就是延迟吃光余量之前就得响。取等号也算合格（那一刻余量恰好归零，告警与失效同时
+  // 发生），但没有理由把它顶到等号上。
   const fixedLoop = BUCKET_CLOSE_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS;
   const lagBudget = REACTION_HORIZON_SECONDS / 2 - fixedLoop;
 
@@ -139,7 +140,7 @@ test("the lag alarm's real trip point survives bucket quantisation", () => {
 test("the burst window is a whole number of buckets", () => {
   // 不是整数倍时，窗口尾部会出现一个只覆盖了一部分 period 的桶，而它带回来的是整桶的
   // 字节。速率分母已经改成按实际覆盖秒数算，所以即便破坏这条也不会失守 —— 但没有理由
-  // 先把它破坏掉，而且 `win N/M` 那个分母也只有在整数倍时才读得通。
+  // 先把它破坏掉，而且 `win N,M/D` 那个分母 D 也只有在整数倍时才读得通。
   assert.equal(BURST_WINDOW_SECONDS % BURST_PERIOD_SECONDS, 0);
 });
 
@@ -155,8 +156,16 @@ test("ASSUMED_LAG_SECONDS stays observable at the burst granularity", () => {
   // 撑不满，日志里根本反映不出来。（真要在生产上看延迟的变化，读 `win` 而不是 `meter`
   // —— 理由见 src/tuning.js 里 ASSUMED_LAG_SECONDS 的说明。）
   assert.ok(ASSUMED_LAG_SECONDS >= BURST_PERIOD_SECONDS);
-  assert.equal(DETECTION_LOOP_SECONDS,
-    BUCKET_CLOSE_SECONDS + ASSUMED_LAG_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS);
+});
+
+test("the detection loop is exactly its four documented parts", () => {
+  // 单独一条：回路的构成是上面几乎每一个门槛的推导起点，它一旦被改动（少一项、多一项），
+  // 失败信息应当直接指向回路本身，而不是混在别的断言里让人去猜。
+  assert.equal(
+    DETECTION_LOOP_SECONDS,
+    BUCKET_CLOSE_SECONDS + ASSUMED_LAG_SECONDS + CRON_INTERVAL_SECONDS + STOP_PROPAGATION_SECONDS,
+    "检测回路不再等于「桶关闭 + 落库延迟 + cron 间隔 + 停机生效」这四项之和",
+  );
 });
 
 test("both configured queries stay under the API's datapoint cap", () => {
@@ -165,12 +174,19 @@ test("both configured queries stay under the API's datapoint cap", () => {
   // 这条不是性能优化，是防止整个看门狗在「静默空」那种形态下无声失效 —— 见 src/tuning.js
   // 里 MAX_DATAPOINTS_PER_QUERY 的完整记录。
   //
-  // 月度查询按最长的月份（31 天）算最坏情况。
-  const monthWorstCase = Math.ceil((31 * 86400) / METRIC_PERIOD_SECONDS);
+  // 按**生产守卫同一种数法**算最坏情况，否则这条测试验的边界比代码实际执行的更宽。
+  // 守卫按桶的相位起点数（`floor(startTime / 60) * 60`），起点最多比 startTime 早 59 秒，
+  // 于是窗口可能比「跨度 ÷ 粒度」多盖住一个桶 —— 这里的 `+ 59` 就是那一个桶。
+  const worstCase = (span, period) => Math.ceil((span + 59) / period);
+
+  const monthWorstCase = worstCase(31 * 86400, METRIC_PERIOD_SECONDS); // 最长的月份
   assert.ok(
     monthWorstCase <= MAX_DATAPOINTS_PER_QUERY,
-    `月度查询最坏要 ${monthWorstCase} 个数据点，超过上限 ${MAX_DATAPOINTS_PER_QUERY}，会静默读到 0 字节`,
+    `月度查询最坏要 ${monthWorstCase} 个数据点，超过上限 ${MAX_DATAPOINTS_PER_QUERY}`,
   );
-  const burstPoints = Math.ceil(BURST_WINDOW_SECONDS / BURST_PERIOD_SECONDS);
-  assert.ok(burstPoints <= MAX_DATAPOINTS_PER_QUERY, `突发查询要 ${burstPoints} 个数据点，超过上限`);
+  const burstWorstCase = worstCase(BURST_WINDOW_SECONDS, BURST_PERIOD_SECONDS);
+  assert.ok(
+    burstWorstCase <= MAX_DATAPOINTS_PER_QUERY,
+    `突发查询最坏要 ${burstWorstCase} 个数据点，超过上限 ${MAX_DATAPOINTS_PER_QUERY}`,
+  );
 });

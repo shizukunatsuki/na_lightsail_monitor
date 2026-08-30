@@ -59,13 +59,19 @@ mutate() {
   local file="src/index.js"
   if [ "$1" = "--in" ]; then file="$2"; shift 2; fi
   cp -R "$ROOT/src/." src/
-  if ! python3 -c "
+  # 锚点必须在目标文件里**恰好命中一次**。命中 0 次说明源码改过而锚点没跟着改；命中
+  # 多次说明锚点不够独特，替换会波及别处。两种都必须计为存活 —— 一个施加不上去的变异
+  # 什么也没验证。把命中次数打出来：不打的话，锚点漂移和锚点不唯一在输出里长得一样。
+  local why
+  if ! why="$(python3 -c "
 import sys, pathlib
 p = pathlib.Path(sys.argv[3]); s = p.read_text()
 n = s.count(sys.argv[1])
-assert n == 1, 'mutation site matched %d times' % n
-p.write_text(s.replace(sys.argv[1], sys.argv[2]))" "$1" "$2" "$file" 2>/dev/null; then
-    echo "  ?? 变异未应用  $3"; SURVIVORS=$((SURVIVORS + 1)); return
+if n != 1:
+    sys.stderr.write('锚点命中 %d 次（应为 1 次）' % n)
+    raise SystemExit(1)
+p.write_text(s.replace(sys.argv[1], sys.argv[2]))" "$1" "$2" "$file" 2>&1 >/dev/null)"; then
+    echo "  ?? 变异未应用  $3  —— ${why:-未知原因}"; SURVIVORS=$((SURVIVORS + 1)); return
   fi
   detect; local r=$?
   case "$r" in
@@ -187,7 +193,7 @@ mutate '${String(point.sum)}' '${JSON.stringify(point.sum)}' \
        "非有限 sum 的错误消息退回 JSON.stringify（Infinity 会被写成 null，误导排查方向）"
 # unit 传错时 AWS 回 200 + 空数组，响应侧分辨不了 —— 请求侧和校验侧两道防线都要能被抓到
 mutate "    if (point.unit != null && point.unit !== METRIC_UNIT) {" "    if (false) {" \
-       "去掉数据点的单位校验（把 Bits 当 Bytes 累加会少报八倍）"
+       "去掉数据点的单位校验（单位不一致时字节数会错几个数量级，Megabytes 那侧是漏停）"
 mutate --in src/tuning.js 'export const METRIC_UNIT = "Bytes";' 'export const METRIC_UNIT = "Bits";' \
        "请求的单位改错（上游静默回空数组，用量恒为零）"
 # 速率分母必须跟着实际覆盖的秒数走

@@ -493,8 +493,10 @@ export async function sumMetric(client, config, metricName, range, period) {
     }
 
     // 单位必须是请求的那一个。**字段缺席不算错**（同上面那条：合法的缺失不能当成畸形），
-    // 但只要它出现且不一致，这个 sum 就不是这段代码以为的那个数 —— 把 Bits 当 Bytes 累加会
-    // 少报八倍。实测的数据点形状带这个字段：`{"sum":785943,"timestamp":...,"unit":"Bytes"}`。
+    // 但只要它出现且不一致，这个 sum 就不是这段代码以为的那个数，而**错的方向取决于是
+    // 哪个单位**：Bits 的数值是 Bytes 的 8 倍，当成字节累加会多报八倍（误停）；而
+    // Megabytes 的数值只有百万分之一，会少报六个数量级（漏停）。漏停那一侧才是致命的，
+    // 所以这道检查不能省。实测的数据点带这个字段：`{"sum":785943,"timestamp":...,"unit":"Bytes"}`。
     if (point.unit != null && point.unit !== METRIC_UNIT) {
       throw new Error(
         `GetInstanceMetricData returned ${metricName} in ${String(point.unit)}, expected ${METRIC_UNIT}`,

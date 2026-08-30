@@ -105,9 +105,11 @@ function stub(sc) {
         return Response.json({ metricName: body.metricName, metricData: [{ sum: -1, timestamp: 1.754e9 }] });
       const isIn = body.metricName === "NetworkIn";
       const burst = body.period === 300;
+      // 月度用量**两个方向各一半**。全压在 NetworkIn 上会让「用量 = In + Out」这一维
+      // 在随机场景里从未被走到 —— 那样一个「只累加入向」的缺陷这一层根本看不见。
       const total = burst
         ? (isIn ? sc.recentInGib : sc.recentOutGib) * GIB
-        : (isIn ? sc.usedGib : 0) * GIB;
+        : (sc.usedGib / 2) * GIB;
       const n = burst ? (isIn ? sc.inPoints : sc.outPoints) : 1;
       // 月度桶按天对齐到今天，否则会误触发「月度读数没覆盖到今天」的告警。
       if (!burst) {
@@ -403,13 +405,23 @@ test("invariants hold across randomised scenarios", async () => {
       assert.equal(terminal.length, 1, `${where}: ${terminal.length} terminal lines: ${lines.join(" /// ")}`);
     }
 
-    // 7. 停机只允许发生在实例 running 时，且必须有越线或突发的理由。
+    // 7. 停机只允许发生在实例 running 时，而且**必须写明是哪一道线触发的**。
+    //    后半条是「绝不无故停机」的可检验形式：停机只有静态线和突发闸门两个来源，
+    //    终态那一行必须把其中之一说出来。一个「无论如何都停」的实现会在这里露馅 ——
+    //    否则它能同时满足其余所有不变量。
     if (stopped && sc.failOp !== "GetInstanceState") {
       assert.equal(sc.state, "running", `${where}: stopped from state ${sc.state}`);
       assert.ok(
         threw || terminal[0].includes("STOPPED"),
         `${where}: stop issued but terminal line is ${terminal[0]}`,
       );
+      if (!threw) {
+        assert.match(
+          terminal[0],
+          /over the [\d.]+ GiB stop threshold|burning .* inside the \d+ min reaction horizon/,
+          `${where}: 停机了却没说明是哪一道线触发的: ${terminal[0]}`,
+        );
+      }
     }
 
     // 8. 越过静态线且实例在跑 —— 这是账单护栏的核心承诺，任何情况下都不能漏。
@@ -445,6 +457,9 @@ test("invariants hold across randomised scenarios", async () => {
     // 11. 突发闸门的承诺，直接按需求复述一遍：按当前速率剩余额度撑不过反应视野、且
     //     实例在跑，就必须停。速率是两个方向各自除以自己的覆盖时长再相加 —— 这条公式
     //     是需求本身，不是从实现里抄的变量。
+    // 这个预言机算的是速率的**下界**：它用「桶数 × 粒度」当分母，而实现优先用「实际覆盖
+    // 秒数」，后者只会更小、于是算出的速率只会更大。所以这条断言只能是单向的（预言机说
+    // 该停就必须停），反过来不成立 —— 实现比预言机更容易跳闸，而那是安全的方向。
     const rateOf = (gib, pts) => (pts > 0 ? (gib * GIB) / (pts * 300) : 0);
     const bps = rateOf(sc.recentInGib, sc.inPoints) + rateOf(sc.recentOutGib, sc.outPoints);
     const remaining = (sc.quotaGib - sc.usedGib) * GIB;

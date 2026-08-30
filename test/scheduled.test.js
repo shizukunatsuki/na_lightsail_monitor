@@ -1334,8 +1334,10 @@ test("a month reading that starts after the month does say so", async () => {
 
 test("a data point in the wrong unit throws instead of being summed", async () => {
   // unit 传错时 AWS 回 HTTP 200 + 空数组，响应侧完全分辨不了 —— 那一侧由零读数告警承接。
-  // 但如果哪天返回的桶**带着**另一个单位，那就是响应自己说清楚了：把 Bits 当 Bytes 累加
-  // 会少报八倍，而少报是唯一会让看门狗放行的方向。这一条必须响亮地失败。
+  // 但如果哪天返回的桶**带着**另一个单位，那就是响应自己说清楚了，必须响亮地失败 ——
+  // 单位不一致时字节数会错几个数量级，而方向取决于是哪个单位：Bits 的数值是 Bytes 的
+  // 8 倍（多报八倍，误停），Megabytes 只有百万分之一（少报六个数量级，漏停）。漏停那一侧
+  // 是致命的。
   const mock = stubAws({ badPoints: [{ sum: 8 * GIB, timestamp: 1.754e9, unit: "Bits" }] });
 
   await assert.rejects(
