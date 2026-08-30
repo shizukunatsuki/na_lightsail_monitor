@@ -380,23 +380,37 @@ async function getInstanceState(client, config) {
  *   oldest: number | null, coveredSeconds: number | null }>}
  */
 export async function sumMetric(client, config, metricName, range, period) {
-  // 上游对单次查询的数据点数有硬上限，而**超限不报错**：HTTP 200、`metricName` 正常回显、
-  // `metricData` 空数组（实测 2026-08-22：1440 个点拿回 1440 个，1441 个拿回 0 个）。
-  // 落地就是 0 字节 —— 唯一会让看门狗什么都不做的读数，而日志里没有任何痕迹。
+  // 上游对单次查询的数据点数有硬上限 1440。超限时它怎么表现，两次实测给出**不同的答案**：
+  //
+  //   2026-08-22：HTTP 200、`metricName` 正常回显、`metricData` 空数组 —— 静默的 0 字节，
+  //     唯一会让看门狗什么都不做的读数（当时 1440 个点拿回 1440 个，1441 / 2880 个拿回
+  //     0 个）。
+  //   2026-08-30：同样的构造（相位对齐后 1441 / 2880 / 2976 个桶，period 300 与 900 都试
+  //     过）一律是 HTTP 400 `InvalidInputException`，错误消息明说 "requested number of
+  //     datapoints exceeds the limit of 1,440"；恰好 1440 个的照常 200 + 1440 个点。
+  //
+  // 两条记录必有一条不反映当时上游的真实行为，而 08-22 已无法复现。守卫按「两种形态都
+  // 可能出现」设计：在发请求**之前**就抛错 —— 400 的形态下省一次往返、错误也更清楚；
+  // 静默空的形态下这道守卫是唯一防线。
   //
   // 当前两个查询离上限都很远（月度约 31 个点、突发 6 个），这道检查防的是**调参**：
   // 比如把 METRIC_PERIOD_SECONDS 从 86400 改成 900，月度查询就要 2976 个点。
   //
-  // 按**桶的相位起点**算，不要按窗口跨度算。桶的相位跟着查询走（见下面 coveredSeconds
-  // 处的实测），起点最多比 startTime 早 59 秒，于是窗口可能比「跨度 ÷ 粒度」多盖住一个
-  // 桶。少算一个就意味着守卫恰好在它守的那个边界上放行：`startTime % 60 = 59`、跨度
-  // 5 天、粒度 300 秒时，按跨度算是 1440（放行），真实是 1441（上游静默返回空数组）。
+  // 按**桶的相位起点**算，不按窗口跨度算。桶的相位跟着查询走（见下面 coveredSeconds 处的
+  // 实测），起点最多比 startTime 早 59 秒，于是相位数不小于跨度数、最多多一个桶。2026-08-30
+  // 实测到一个分歧构造：起点 `% 60 = 59`、跨度恰好 1440 × 300 时，相位数是 1441 而上游回
+  // 的是 200 + 1440 个点 —— 也就是说它（至少那一天）按跨度数。这里**仍然**按相位数：守卫
+  // 最多比上游严一个桶、且只在两种数法分歧的边界上发生（生产两个查询的起点都对齐到分钟，
+  // 两种数法在那里完全相等）；宁可这边响亮地多拦一次，也不把「上游按哪种数」当成一个需要
+  // 赌对的假设 —— 它在 8 天里变过一次。
   const gridStart = Math.floor(range.startTime / 60) * 60;
   const wanted = Math.ceil((range.endTime - gridStart) / period);
   if (wanted > MAX_DATAPOINTS_PER_QUERY) {
     throw new Error(
       `GetInstanceMetricData for ${metricName} would ask for ${wanted} data points,` +
-        ` past the ${MAX_DATAPOINTS_PER_QUERY} the API silently truncates to an empty array`,
+        ` past the ${MAX_DATAPOINTS_PER_QUERY} the API refuses with HTTP 400 InvalidInputException` +
+        ` (as measured 2026-08-30; an earlier 2026-08-22 measurement instead recorded a silent` +
+        ` HTTP 200 with an empty array — assume either shape can come back)`,
     );
   }
 
@@ -630,11 +644,19 @@ async function burstCheck(client, config, monthRange, usedBytes, instanceState) 
   // 抓住它的是「看门狗对自己的评价必须随数据变旧而单调不增」这条性质。
   if (recentIn.points === 0 && recentOut.points === 0) {
     // 「指标看不见」和「实例本来就没在跑」在指标上长得一模一样 —— 所以不猜，直接用这一轮
-    // 已经查到的真实状态来分辨。
+    // 已经查到的真实状态来分辨。**状态读不出来时同样不许断言成因**：旧措辞在这一档会写成
+    // 「the meter is blind, not idle」，一口咬定计量表失明 —— 可同一份响应形状下「实例被
+    // 合法停着」完全可能（维护期恰好碰上状态查询坏掉），那句话会把停机写成管道故障，每个
+    // cron 周期一条，直到有人修好状态查询为止。stale 告警对同一个问题用的是 either/or
+    // 措辞（见下面那条 explanation），这里对齐。
+    const explanation =
+      instanceState === "running"
+        ? "the instance is running, so the meter is blind, not idle"
+        : "the instance state is unreadable, so this is either a blind meter or an instance that is not running";
     if (meterShouldSeeTraffic(instanceState)) {
       console.error(
         `${config.label} BLIND | no metric data points in the last ${BURST_WINDOW_SECONDS / 60} min` +
-          ` | instance is ${describeState(instanceState)}, so the meter is blind, not idle` +
+          ` | ${explanation}` +
           ` | the burst gate cannot measure a rate this run`,
       );
     }
