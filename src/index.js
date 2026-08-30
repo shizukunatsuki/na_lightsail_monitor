@@ -2,7 +2,14 @@
  * Lightsail 流量看门狗。
  *
  * AWS Lightsail 的套餐月流量额度用超之后按量计费且不封顶。这个 Worker 每 10 分钟量一次
- * 用量，在烧穿额度之前把实例停掉；额度重置后再把它拉起来。
+ * 用量，在烧穿额度之前把实例停掉。
+ *
+ * **它只停机，永远不启动实例。** 停机之后实例会一直停着，直到操作者自己去启动 —— 跨月、
+ * 额度重置都不会让它自动回来。这是刻意的：让看门狗有启动实例的能力，等于给「读数谎报为
+ * 零」这一类故障配上一个会烧钱的动作。而 0 字节恰恰是这套系统里最容易被伪造出来的读数
+ * （读不懂的响应、传错的 unit、超限的查询都会落在它上面），换来的只是省一次手动点击。
+ * 对应地，它需要的 IAM 权限里**没有** `lightsail:StartInstance` —— 即便这里的判断写错，
+ * AWS 那一侧也会拒绝。
  *
  * 两道叠加的防线：
  *   静态线   —— 月初至今的总量越过 `QUOTA_GIB × THRESHOLD` 就停。
@@ -10,7 +17,7 @@
  *
  * 贯穿全篇的一条原则，读这个文件时请一直带着它：
  *
- *   **停机路径上的每一个不确定性都向「停」倾斜，重启路径上的都向「什么都不做」倾斜。**
+ *   **每一个不确定性都向「停」倾斜。**
  *
  * 两个方向的代价不对称：漏停是真金白银的账单，多停只是站点短暂下线。由此派生出一条
  * 反复出现的判据 —— **0 字节是唯一会让看门狗什么都不做的读数**，所以任何可能把读数
@@ -119,7 +126,6 @@ function warnIfHalfBlind(config, inMetric, outMetric, instanceState, wording) {
  * @property {string} label
  * @property {number} quotaGib
  * @property {number} threshold
- * @property {boolean} manualHold
  */
 
 /**
@@ -175,11 +181,6 @@ export function readConfig(env) {
     label: `${env.INSTANCE_NAME}@${env.AWS_REGION}`,
     quotaGib,
     threshold,
-    // 计划内停机的逃生阀，只抑制启动，不影响停机。
-    //
-    // 与字符串精确比较："yes" / "1" / "True" / 前后带空格都视为**未设置**。这个方向是
-    // 刻意的：打错字时重启逻辑仍然有效，而不是不声不响地把实例摁住一整个月。
-    manualHold: env.MANUAL_HOLD === "true",
   };
 }
 
@@ -572,9 +573,9 @@ export async function sumMetric(client, config, metricName, range, period) {
  */
 async function stopOverLimit(client, config, usedGib, reason, state) {
   if (state !== null && state !== "running") {
-    // `DOWN` 而不是 `NOOP`：这是「看门狗把实例停下了、它现在还停着」的稳态。它会每个
-    // cron 周期重复，可能连刷数周 —— 但那正是它需要一个**专属且可 grep 的词**的理由。
-    // 混进 `NOOP`（或者更糟，写成 `OK`）会让「站点已经下线」在日志过滤器里完全消失。
+    // 写 `DOWN`，**不要写 `OK`**：这是「看门狗把实例停下了、它现在还停着」的稳态。它会
+    // 每个 cron 周期重复，可能连刷数周 —— 但那正是它需要一个专属且可 grep 的词的理由。
+    // 写成 `OK` 会让「站点已经下线」在日志过滤器里完全消失。
     console.log(
       `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,
     );
@@ -916,7 +917,7 @@ export default {
 
     // ── 突发闸门 ────────────────────────────────────────────────────────────
     //
-    // 总量恰为零时不可能存在突发，跳过这两次调用。这也让重启路径的调用次数保持不变。
+    // 总量恰为零时不可能存在突发，跳过这两次调用 —— 长期停机的实例每轮只花 3 次调用。
     let burst = null;
     if (usedBytes > 0) {
       burst = await burstCheck(client, config, range, usedBytes, instanceState);
@@ -928,8 +929,8 @@ export default {
 
     // ── 这一轮的那一行日志 ──────────────────────────────────────────────────
     //
-    // 每次触发只写一行，行首是可 grep 的状态标记（OK / STOPPED / STARTED / NOOP / HOLD /
-    // DOWN / BLIND / DEGRADED）。`wrangler tail | grep -v " OK | "` 就只剩下值得看的事件。
+    // 每次触发只写一行，行首是可 grep 的状态标记（OK / DOWN / STOPPED / BLIND /
+    // DEGRADED）。`wrangler tail | grep -v " OK | "` 就只剩下值得看的事件。
     //
     // 字段各回答一个问题，而且全部是这一轮**已经算出来**的东西，没有额外调用。每个字段
     // 的含义见 README 的「读日志」一节。
@@ -971,44 +972,22 @@ export default {
       common.push(`meter ${(burst.lagSeconds / 60).toFixed(1)} min behind`);
     }
 
-    // ── 出口一：本月用过流量 ────────────────────────────────────────────────
-
-    if (usedBytes > 0) {
-      // 突发闸门可以在用量还没到静态线时就跳闸。停机之后用量不再增长，于是此后每一次
-      // 触发都满足 `used < limit`，走的正是这一支 —— 无脑写 OK 会造成「站点已经下线，
-      // 而 `grep -v " OK | "` 里什么都没有」。
-      //
-      // 判据是这一轮**实际问到的**状态，不是「突发闸门恰好查过没有」。
-      const down = typeof instanceState === "string" && instanceState !== "running";
-      const token = down ? "DOWN" : "OK";
-      const tail = down ? [...common, `instance is "${instanceState}"`] : common;
-      console.log([`${config.label} ${token}`, ...tail].join(" | "));
-      return;
-    }
-
-    // ── 出口二：月初至今恰为零，考虑重启 ────────────────────────────────────
+    // ── 零读数的兜底告警 ────────────────────────────────────────────────────
     //
-    // 「总量恰为零」是走重启分支的闸门。运行中的实例几分钟内必然产生*某些*流量（DNS、
-    // NTP、后台扫描），所以月初至今为零就意味着它没起来。
-    //
-    // **重启由用量驱动，而不是由日历驱动。** 停机只会发生在用量达到或超过阈值时，所以
-    // 那个月剩下的时间里用量会一直卡在阈值之上：「重新回到阈值以下」与「每月 1 号」捕捉
-    // 的是同一个事件，但前者没有那个仅 24 小时的窗口。按日期驱动的写法有一个安静的失效
-    // 模式：1 号那天恰好凭据过期或 AWS 抽风，重启就错过了，实例一直停到下个月。
-    //
-    // 下面三个出口各写一行，都带着上面那组共同字段 —— 长期停机的实例每次触发只留一行。
-
-    // 「恰为零」有两种成因，光看指标分不开：
-    //   实例没在跑 —— 这正是重启路径要的信号。
+    // 「月初至今恰为零」有两种成因，光看指标分不开：
+    //   实例没在跑 —— 正常，没什么可说的。
     //   量的那一侧坏了 —— 例如请求的 unit 传错。实测传成 Bits / Count / Percent /
     //     Seconds / Megabytes 中任意一个，AWS 都回 HTTP 200、metricName 正确回显、
     //     metricData 空数组，与「没有流量」完全同形，`sumMetric` 的双信号校验对它无感。
     //
-    // 有了每轮实测的实例状态就不用猜：跑着的实例读数为零在物理上不成立，只可能是管道坏了。
-    //
-    // 位置在 MANUAL_HOLD **之前**：维护期设了 hold 又忘记撤销时，这条兜底不能跟着被吞掉。
+    // 有了每轮实测的实例状态就不用猜：跑着的实例读数为零在物理上不成立，只可能是管道
+    // 坏了 —— 而 0 字节正是唯一会让看门狗什么都不做的读数，所以这条兜底不能少。
     const monthAgeSeconds = range.endTime - range.startTime;
-    if (monthAgeSeconds > ZERO_READING_GRACE_SECONDS && meterShouldSeeTraffic(instanceState)) {
+    if (
+      usedBytes === 0 &&
+      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)
+    ) {
       console.error(
         `${config.label} BLIND | ${(monthAgeSeconds / 3600).toFixed(1)} h into the month, month-to-date reads exactly zero` +
           ` while the instance is ${describeState(instanceState)}` +
@@ -1017,28 +996,19 @@ export default {
       );
     }
 
-    if (config.manualHold) {
-      console.log([`${config.label} HOLD`, ...common, "MANUAL_HOLD is set, leaving the instance alone"].join(" | "));
-      return;
-    }
-
-    // 重启路径上的不确定性向「什么都不做」倾斜（与停机路径相反）：少启动一次只是站点晚
-    // 几分钟回来，而误启动一台被刻意停下的实例会开始烧流量。
-    if (instanceState === null) {
-      console.log([`${config.label} NOOP`, ...common, "instance state unreadable, not starting"].join(" | "));
-      return;
-    }
-    if (instanceState !== "stopped") {
-      // 通常是新月份的头几分钟：实例一直没下线，只是还没有任何指标数据点落库。
-      console.log([`${config.label} NOOP`, ...common, `instance is "${instanceState}", nothing to do`].join(" | "));
-      return;
-    }
-
-    await lightsail(client, config, "StartInstance", { instanceName: config.instanceName });
-    // 只陈述观察到的事实：handler 知道的是「月初至今为零且实例是 stopped」，它并没有
-    // 独立核实过额度重置这件事。
-    console.log(
-      [`${config.label} STARTED`, ...common, "allowance reads empty and the instance was stopped"].join(" | "),
-    );
+    // ── 出口：这一轮的终态 ──────────────────────────────────────────────────
+    //
+    // 只有两个词，因为一轮只可能是两种结果之一：实例还在跑（OK），或者它没在跑（DOWN）。
+    //
+    // `DOWN` 必须是一个**专属且可 grep 的词**。突发闸门可以在用量还没到静态线时就跳闸，
+    // 停机之后用量不再增长，于是此后每一次触发都满足 `used < limit` —— 无脑写 OK 会造成
+    // 「站点已经下线，而 `grep -v " OK | "` 里什么都没有」。
+    //
+    // 判据是这一轮**实际问到的**状态。状态读不出来时写 OK，那一轮另有一行 DEGRADED 说明
+    // 情况 —— 不把「不知道」伪装成「已下线」，也不反过来。
+    const down = typeof instanceState === "string" && instanceState !== "running";
+    const token = down ? "DOWN" : "OK";
+    const tail = down ? [...common, `instance is "${instanceState}"`] : common;
+    console.log([`${config.label} ${token}`, ...tail].join(" | "));
   },
 };

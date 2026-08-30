@@ -35,6 +35,33 @@ function cronIntervalSeconds() {
   return Number(every[1]) * 60;
 }
 
+test("wrangler.jsonc is syntactically valid, and vars are the four we read", () => {
+  // 这条守的是一个真实发生过的缺口：`wrangler.jsonc` 少一个逗号变成非法 JSON 时，整套
+  // 测试仍然全绿 —— 因为下面那个 cron 检查只用正则抓字符串，从不解析。那次是
+  // `wrangler deploy` 自己报的错（响亮，不危险），但它意味着「部署前的测试闸门」不覆盖
+  // 配置文件本身的合法性。既然 CI 是靠 `npm test` 挡下坏部署的，这一层就得补上。
+  //
+  // JSONC 允许注释和尾逗号，JSON.parse 不允许，所以先剥掉再解析。剥法很朴素，够用即可：
+  // 这个文件里没有内含 `//` 的字符串字面量（URL 都在注释里）。
+  const raw = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
+  const stripped = raw.replace(/^\s*\/\/[^\n]*$/gm, "").replace(/,(\s*[}\]])/g, "$1");
+  let config;
+  assert.doesNotThrow(() => {
+    config = JSON.parse(stripped);
+  }, "wrangler.jsonc 不是合法 JSON —— 这样的配置会让 wrangler deploy 直接失败");
+
+  // 部署侧变量必须与 readConfig 真正读取的那几项一一对应。多出来的键是死配置：设了不会
+  // 有任何作用，却会让人以为自己打开了某个开关（例如已经删掉的「抑制启动」）。
+  assert.deepEqual(
+    Object.keys(config.vars).sort(),
+    ["AWS_REGION", "INSTANCE_NAME", "QUOTA_GIB", "THRESHOLD"],
+  );
+
+  // 这个 Worker 只停机、不启动，公开路由也全部关掉。
+  assert.equal(config.workers_dev, false);
+  assert.equal(config.preview_urls, false);
+});
+
 test("the declared cron interval matches wrangler.jsonc", () => {
   // CRON_INTERVAL_SECONDS 住在 src/tuning.js 里，只是一份**声明** —— 真身是
   // wrangler.jsonc 的 triggers.crons。所有视野和门槛都从那份声明推导，所以两边一旦

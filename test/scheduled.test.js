@@ -834,7 +834,7 @@ test("the same zero reading in the first minutes of a month is normal", async ()
   const lines = await capturingLogs(() => run("2026-09-01T00:20:00Z", baseEnv, mock));
 
   assert.ok(!lines.join("\n").includes("into the month"), "月初头几分钟不该告警");
-  assert.match(lines.at(-1), /NOOP \|.*instance is "running"/);
+  assert.match(lines.at(-1), /^\S+ OK \|/);
 });
 
 test("a stopped instance is reported as DOWN from the very first trigger", async () => {
@@ -880,21 +880,6 @@ test("the static-line stop also says DOWN", async () => {
   assert.match(lines.at(-1), /^\S+ DOWN \|.*over the 819\.200 GiB stop threshold.*instance is "stopped"$/);
 });
 
-test("MANUAL_HOLD does not swallow the zero-reading alarm", async () => {
-  // HOLD 的定义是「抑制所有 StartInstance」，仅此而已。它在 handler 里必须排在
-  // 「月份已过数小时、读数仍恰为零」那条告警**之后**：排在前面会把那条一起吞掉 —— 维护期设了 hold 又忘记撤销，
-  // 就同时失去了静默失明的唯一兜底，而 HOLD 那行字面上还在说一切按计划。
-  //
-  // hold 与实例状态是两件事：hold 只挡启动，它自己并不停机。所以「设了 hold 而实例还在
-  // 跑」是常见的维护姿态，也正是这条兜底必须活着的场景。
-  const held = stubAws({ state: "running", networkIn: 0, networkOut: 0 });
-  const heldLines = await capturingLogs(() =>
-    run("2026-09-01T09:00:00Z", { ...baseEnv, MANUAL_HOLD: "true" }, held),
-  );
-  assert.match(heldLines.join("\n"), /BLIND \| 9\.0 h into the month, month-to-date reads exactly zero/);
-  assert.match(heldLines.at(-1), /^\S+ HOLD \|/);
-});
-
 test("a legitimately stopped instance reading zero is not alarmed about", async () => {
   // 对照：实例被合法停着（看门狗停的，或操作者自己停的）时，
   // 月度读数当然是零 —— 那正是零字节闸门要的前提，不是故障。判据只看「月份已过几小时」而不看状态的话，
@@ -903,7 +888,7 @@ test("a legitimately stopped instance reading zero is not alarmed about", async 
   const lines = await capturingLogs(() => run("2026-09-01T09:00:00Z", baseEnv, mock));
 
   assert.ok(!lines.join("\n").includes("BLIND"), "合法停机的零读数不该告警");
-  assert.match(lines.at(-1), /^\S+ STARTED \|/);
+  assert.match(lines.at(-1), /^\S+ DOWN \|.*instance is "stopped"$/);
 });
 
 test("a month reading with no usable timestamp is reported", async () => {
@@ -1062,32 +1047,41 @@ test("zero month-to-date usage skips the burst check entirely", async () => {
 
 // --- 重启 ---------------------------------------------------------------------
 
-test("a reset allowance starts a stopped instance", async () => {
-  // 新的计费月：月初至今归零，而实例还停在上个月那次停机的状态里。
+test("a reset allowance does not start the instance", async () => {
+  // **这个看门狗只停机，永远不启动。** 新的计费月：月初至今归零，实例还停在上个月那次
+  // 停机的状态里 —— 这正是「自动重启」最有理由发生的时刻，而它不发生。
+  //
+  // 取消自动启动是刻意的：让看门狗有启动实例的能力，等于给「读数谎报为零」这一类故障
+  // 配上一个会烧钱的动作，而 0 字节恰恰是这套系统里最容易被伪造出来的读数。
   const mock = stubAws({ state: "stopped", networkIn: 0, networkOut: 0 });
-  await run("2026-09-01T00:00:00Z", baseEnv, mock);
+  const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
   assert.deepEqual(opsOf(mock.calls).sort(), [
-    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState", "StartInstance",
+    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState",
   ]);
-  assert.deepEqual(mock.calls.at(-1).body, { instanceName: "example-instance" });
-  // 窗口取的是新月份，而不是那个用量导致停机的月份。
-  //
-  // 按操作名挑，不按下标取：三次查询是并发发出的（两次指标 + 一次状态），谁先落进
-  // calls 由微任务调度决定。写死 calls[0] 会得到一个**偶发**失败的测试 —— 上一次改动
-  // 把状态查询并进 Promise.all 之后，这里就有大约五分之一的概率读到状态查询的 body、
-  // 拿到 undefined 的 startTime，而它整整绿了一轮。
+  assert.match(lines.at(-1), /^\S+ DOWN \|.*instance is "stopped"$/);
+  // 窗口取的是新月份，而不是那个用量导致停机的月份。按操作名挑、不按下标取：三次查询
+  // 并发发出，谁先落进 calls 由微任务调度决定，写死 calls[0] 会得到偶发失败的测试。
   assert.equal(metricCalls(mock.calls)[0].body.startTime, Date.parse("2026-09-01T00:00:00Z") / 1000);
 });
 
-test("the restart is retried on every later run, not just at the rollover", async () => {
-  // 这条替换掉的那个缺陷：旧的按日期测试里，只要 1 号那天每一次触发都失败，实例就会
-  // 一直停一个月，而测试照样是绿的。这里的触发条件是用量数字，它会一直成立到启动成功
-  // 为止。
-  for (const at of ["2026-09-01T00:10:00Z", "2026-09-02T13:20:00Z", "2026-09-27T08:00:00Z"]) {
-    const mock = stubAws({ state: "stopped" });
-    await run(at, baseEnv, mock);
-    assert.ok(opsOf(mock.calls).includes("StartInstance"), `expected a start at ${at}`);
+test("StartInstance is never issued, under any state or usage", async () => {
+  // 硬安全性质，不是某一条路径的用例：扫遍状态 × 用量 × 时刻的组合，StartInstance 一次
+  // 都不许出现。它同时守着「以后别把这个功能加回来」—— 真要加回来，得先删掉这条。
+  const states = ["running", "stopped", "stopping", "pending", "shutting-down", "terminated"];
+  const usages = [0, 1 * GIB, 900 * GIB];
+  const moments = ["2026-09-01T00:00:00Z", "2026-09-01T09:00:00Z", "2026-08-15T12:00:00Z", "2026-08-31T23:50:00Z"];
+  for (const state of states) {
+    for (const networkIn of usages) {
+      for (const at of moments) {
+        const mock = stubAws({ state, networkIn, networkOut: 0, recentIn: networkIn ? GIB : 0 });
+        await run(at, baseEnv, mock);
+        assert.ok(
+          !opsOf(mock.calls).includes("StartInstance"),
+          `state=${state} used=${networkIn / GIB}GiB at=${at}：发出了 StartInstance`,
+        );
+      }
+    }
   }
 });
 
@@ -1119,30 +1113,6 @@ test("zero usage on a running instance costs one state check and nothing else", 
     "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState",
   ]);
 });
-
-test("MANUAL_HOLD suppresses the start without suppressing the stop", async () => {
-  const held = { ...baseEnv, MANUAL_HOLD: "true" };
-
-  // 额度已重置、实例处于停机：正常情况下应该启动。加了 hold 之后，它连状态都不去问。
-  const start = stubAws({ state: "stopped" });
-  await run("2026-09-01T00:00:00Z", held, start);
-  // 状态查询现在是每轮无条件的，所以 HOLD 路径也有它 —— 但仍然不发出任何动作。
-  assert.deepEqual(opsOf(start.calls).sort(), [
-    "GetInstanceMetricData", "GetInstanceMetricData", "GetInstanceState",
-  ]);
-
-  // 账单护栏照常生效 —— hold 的含义是「不要把我拉起来」，不是「允许我超额跑着」。
-  const stop = stubAws({ state: "running", networkIn: 900 * GIB });
-  await run("2026-08-15T12:00:00Z", held, stop);
-  assert.ok(opsOf(stop.calls).includes("StopInstance"));
-
-  // 突发闸门同样不受 hold 影响。
-  const burst = stubAws({ state: "running", networkIn: 700 * GIB, recentIn: 690 * GIB });
-  await run("2026-08-15T12:00:00Z", held, burst);
-  assert.ok(opsOf(burst.calls).includes("StopInstance"));
-});
-
-// --- 失败方向 -----------------------------------------------------------------
 
 test("an AWS failure throws, with the access key id scrubbed", async () => {
   const mock = stubAws({ fail: "GetInstanceMetricData" });
@@ -1179,15 +1149,16 @@ test("an omitted metricData field is a legitimate zero, not an error", async () 
   const mock = stubAws({ state: "stopped", metricShape: "omitted" });
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
-  assert.ok(opsOf(mock.calls).includes("StartInstance"), "省掉 metricData 必须读作零，而不是抛错");
-  assert.match(lines.at(-1), /^\S+ STARTED \| used 0\.000 GiB \(0\.0% of 1024\) \| stop at 819\.200 GiB \|.*\| allowance reads empty and the instance was stopped$/);
+  // 观测信号是「这一轮正常走完，并把读数当成零」—— 抛错的话终态那一行根本不会出现。
+  assert.match(lines.at(-1), /^\S+ DOWN \| used 0\.000 GiB \(0\.0% of 1024\) \| stop at 819\.200 GiB \|/);
+  assert.ok(!lines.join("\n").includes("GetInstanceMetricData returned"), "合法的空响应不该被当成畸形");
 });
 
 test("an empty metricData array is also a legitimate zero", async () => {
   const mock = stubAws({ state: "stopped", metricShape: "wrongMetric" });
   // wrongMetric 回显的是 CPUUtilization，但 metricData 确实是个数组 —— 数据可用，放行。
-  await run("2026-09-01T00:00:00Z", baseEnv, mock);
-  assert.ok(opsOf(mock.calls).includes("StartInstance"));
+  const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
+  assert.match(lines.at(-1), /^\S+ DOWN \| used 0\.000 GiB \(0\.0% of 1024\) \|/);
 });
 
 test("a response with neither a metricData array nor a matching metricName throws", async () => {
@@ -1429,19 +1400,18 @@ test("a failing state check still stops an over-limit instance", async () => {
   assert.ok(opsOf(mock.calls).includes("StopInstance"));
 });
 
-test("an unreadable instance state on the restart path does not start the instance", async () => {
-  // 与停机路径相反：少启动一次只是站点晚几分钟回来，误启动一台操作者刻意停下的实例
-  // 则会开始烧流量。所以状态读不出来时绝不启动。
+test("an unreadable instance state does not abort the round", async () => {
+  // 状态查询的失败**不能**让整轮抛出：那样会连**停机**路径一起掐掉，而停机路径本来是
+  // fail-closed 的（状态读不到也要照停）。改为开头写一行 DEGRADED，各处按自己的方向
+  // 处理 null。
   //
-  // 状态查询上移到每轮开头之后，它的失败不再让整轮抛出 —— 那样会连**停机**路径一起
-  // 掐掉，而停机路径本来是 fail-closed 的。改为：开头写一行 DEGRADED，两条路径各自按
-  // 自己的方向处理 null。
+  // 终态写 OK 而不是 DOWN：不知道它在不在跑，就不要伪装成「已下线」—— 同一轮里那行
+  // DEGRADED 已经把「不知道」说清楚了。
   const mock = stubAws({ networkIn: 0, networkOut: 0, unreadableState: true });
   const lines = await capturingLogs(() => run("2026-09-01T00:00:00Z", baseEnv, mock));
 
-  assert.ok(!opsOf(mock.calls).includes("StartInstance"), "状态读不出来时绝不启动");
   assert.match(lines.join("\n"), /DEGRADED \| instance state unreadable/);
-  assert.match(lines.at(-1), /NOOP \|.*instance state unreadable, not starting$/);
+  assert.match(lines.at(-1), /^\S+ OK \|/);
 });
 
 test("at the exact month rollover the burst window reaches back into the previous month", async () => {

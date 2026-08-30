@@ -134,7 +134,9 @@ test("readConfig parses the plain vars into numbers", () => {
   assert.equal(config.instanceName, "example-instance");
   assert.equal(config.quotaGib, 1024);
   assert.equal(config.threshold, 0.8);
-  assert.equal(config.manualHold, false);
+  // 配置面就这五项。多出来的键说明有人加了配置却没在这里对账 —— 而没被读过的配置项
+  // 会让部署者以为自己设了什么，实际什么都没发生。
+  assert.deepEqual(Object.keys(config).sort(), ["instanceName", "label", "quotaGib", "region", "threshold"]);
 });
 
 test("readConfig derives the log identity from the name and the region", () => {
@@ -147,16 +149,12 @@ test("readConfig derives the log identity from the name and the region", () => {
   );
 });
 
-test("readConfig only honours MANUAL_HOLD spelled exactly \"true\"", () => {
-  assert.equal(readConfig({ ...validEnv, MANUAL_HOLD: "true" }).manualHold, true);
-
-  // 一个「失效时默认放行」的锁是可以补救的；而一个因为打错字就生效的锁，会把实例
-  // 摁在那里，直到有人发现博客不见了。
-  for (const MANUAL_HOLD of ["True", "TRUE", "yes", "1", "", " true", undefined]) {
-    assert.equal(readConfig({ ...validEnv, MANUAL_HOLD }).manualHold, false, JSON.stringify(MANUAL_HOLD));
-  }
+test("unknown vars are ignored, not silently honoured", () => {
+  // 这个看门狗只停机、不启动，所以没有「抑制启动」这类开关。设了也不会有任何作用 ——
+  // 断言这一点，免得以后有人照着旧文档设一个开关然后以为它生效了。
+  const config = readConfig({ ...validEnv, MANUAL_HOLD: "true", SOMETHING_ELSE: "1" });
+  assert.deepEqual(Object.keys(config).sort(), ["instanceName", "label", "quotaGib", "region", "threshold"]);
 });
-
 test("readConfig rejects a QUOTA_GIB that would compare as NaN", () => {
   // `usedGib < NaN` 恒为 false，这会被读作「已超额」并停掉实例。所以必须在这里大声
   // 报错。缺失（`undefined`）也在其中：旧部署里残留的 QUOTA_GB 不会被读取，此时

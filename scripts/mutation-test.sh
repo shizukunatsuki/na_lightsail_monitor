@@ -87,7 +87,12 @@ mutate "      burst = await burstCheck(client, config, range, usedBytes, instanc
        "      burst = { reason: null, lagSeconds: null, bytesPerSecond: null, secondsToQuota: null, stale: false };" \
        "整个跳过突发闸门"
 mutate 'if (state !== null && state !== "running") {' 'if (state !== null && state === "running") {' "反转停机的状态判断"
-mutate "if (config.manualHold) {" "if (false && config.manualHold) {" "去掉 MANUAL_HOLD 对启动的抑制"
+# 把「自动启动」加回来。这个看门狗只停机、永远不启动实例（IAM 策略里也没有这个权限），
+# 而「多做一个动作」这类缺陷变异测试通常抓不到 —— 必须显式注入一次，确认会红。
+mutate "    const down = typeof instanceState === \"string\" && instanceState !== \"running\";" \
+       "    if (usedBytes === 0 && instanceState === \"stopped\") await lightsail(client, config, \"StartInstance\", { instanceName: config.instanceName });
+    const down = typeof instanceState === \"string\" && instanceState !== \"running\";" \
+       "把自动启动加回来（额度归零就把实例拉起来）"
 mutate "      getInstanceState(client, config).catch((err) => {" \
        '      Promise.resolve("stopped").then((v) => v).catch((err) => {' \
        "状态查询被换成写死的 stopped（重启路径会误启动）"
@@ -156,12 +161,20 @@ mutate 'const down = typeof instanceState === "string" && instanceState !== "run
 mutate '      `${config.label} DOWN | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
        '      `${config.label} NOOP | ${formatUsage(config, usedGib)} | ${reason} | instance is "${state}"`,' \
        "静态线停机的稳态退回 NOOP（两条路径不再收敛）"
-mutate "    if (monthAgeSeconds > ZERO_READING_GRACE_SECONDS && meterShouldSeeTraffic(instanceState)) {" \
-       "    if (false) {" \
+mutate "    if (
+      usedBytes === 0 &&
+      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)
+    ) {" "    if (false) {" \
        "去掉「月中读数恒为零」告警"
-mutate "monthAgeSeconds > ZERO_READING_GRACE_SECONDS && meterShouldSeeTraffic(instanceState)" \
-       "monthAgeSeconds > ZERO_READING_GRACE_SECONDS" \
+mutate "      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)" \
+       "      monthAgeSeconds > ZERO_READING_GRACE_SECONDS" \
        "零读数告警丢掉状态条件（合法停机期每轮误报一次）"
+mutate "      usedBytes === 0 &&
+      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&" \
+       "      monthAgeSeconds > ZERO_READING_GRACE_SECONDS &&" \
+       "零读数告警丢掉「读数为零」这个前提（正常轮次也误报）"
 mutate "    if (monthWithPoints.length > 0 && !Number.isFinite(monthNewest)) {" "    if (false) {" \
        "去掉月度读数「没有可用时间戳」告警"
 mutate "  if (lagSeconds === null) {" "  if (false) {" \
@@ -196,13 +209,14 @@ mutate "export function monthStartMs(now) {" \
 
 # 「同一条防线在一处修好、另一处的同类没跟着修」这一族。判据必须只有一个来源
 # （meterShouldSeeTraffic），下面几个变异各自把其中一处改回去。
-mutate "      meterShouldSeeTraffic(instanceState)
-    ) {" "      true
-    ) {" \
+mutate "      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)" \
+       "      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS" \
        "月度落后告警丢掉状态条件（合法停机期每轮误报，一天约 142 条）"
-mutate "      meterShouldSeeTraffic(instanceState)
-    ) {" '      instanceState === "running"
-    ) {' \
+mutate "      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
+      meterShouldSeeTraffic(instanceState)" \
+       '      behindSeconds > MONTH_BEHIND_TOLERANCE_SECONDS &&
+      instanceState === "running"' \
        "月度落后告警把「状态读不出来」这一档吞掉（该宁可多喊一声）"
 mutate "  if (dark === null) return;" "  return;" \
        "去掉「一个方向零数据点」的失明检测（只看得见一半流量）"

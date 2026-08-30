@@ -21,16 +21,16 @@ function rng(seed) {
 /** Lightsail 实例可能出现的全部状态，不只是 running/stopped。 */
 const STATES = ["pending", "running", "shutting-down", "terminated", "stopping", "stopped"];
 
-// 分层轮转，而不是纯随机。纯随机下「manualHold 且用量为零且实例 stopped 且没注入故障」
-// 这种组合的概率约 0.2%，250 个样本期望命中 0.5 次 —— 变异测试正是在这里漏掉了
-// 「去掉 MANUAL_HOLD」。罕见组合要靠分层保证，不能靠加大样本量去赌。
-const STRATA = ["restart", "boundary", "burst", "failure", "random"];
+// 分层轮转，而不是纯随机。纯随机下「用量恰为零 + 实例 stopped + 没注入故障」这种组合的
+// 概率只有约 1%，靠加大样本量去赌不可靠 —— 而那恰恰是「零字节读数」相关判断的全部战场。
+// 罕见组合要靠分层保证。
+const STRATA = ["zeroUsage", "boundary", "burst", "failure", "random"];
 
 function scenario(r, stratum) {
   const quotaGib = [1024, 2048, 3072, 512][Math.floor(r() * 4)];
   const threshold = [0.5, 0.8, 0.95, 1][Math.floor(r() * 4)];
   // 三档用量：恰为零、阈值附近、全域随机。零那一档要足够常见，重启路径才会被走到。
-  const pick = stratum === "restart" ? 0 : stratum === "boundary" ? 0.25 : r();
+  const pick = stratum === "zeroUsage" ? 0 : stratum === "boundary" ? 0.25 : r();
   const usedGib =
     pick < 0.2
       ? 0
@@ -41,7 +41,7 @@ function scenario(r, stratum) {
         : pick < 0.6
           ? quotaGib * threshold * (0.98 + r() * 0.04)
           : r() * quotaGib * 1.1;
-  const OPS = ["GetInstanceMetricData", "GetInstanceState", "StopInstance", "StartInstance"];
+  const OPS = ["GetInstanceMetricData", "GetInstanceState", "StopInstance"];
   return {
     // 注入 AWS 侧失败与畸形响应。不生成这些，整个错误处理路径就从未被探索过 ——
     // 变异测试正是在这里漏掉了「去掉脱敏」和「去掉畸形 metricData 检查」两个缺陷。
@@ -70,7 +70,6 @@ function scenario(r, stratum) {
     inPoints: stratum === "burst" ? 6 : Math.floor(r() * 7),
     outPoints: stratum === "burst" ? 1 + Math.floor(r() * 2) : Math.floor(r() * 7),
     state: STATES[Math.floor(r() * STATES.length)],
-    manualHold: r() < 0.15,
     lagSeconds: Math.floor(r() * 2400),
   };
 }
@@ -147,7 +146,6 @@ async function runScenario(sc, at) {
         INSTANCE_NAME: "example-instance",
         QUOTA_GIB: sc.absurdQuota ? "1e308" : String(sc.quotaGib),
         THRESHOLD: String(sc.threshold),
-        ...(sc.manualHold ? { MANUAL_HOLD: "true" } : {}),
       },
     );
   } catch (err) {
@@ -182,7 +180,6 @@ async function decide(overrides) {
     inPoints: 6,
     outPoints: 6,
     state: "running",
-    manualHold: false,
     lagSeconds: 300,
     failOp: null,
     failStatus: 400,
@@ -377,7 +374,7 @@ test("invariants hold across randomised scenarios", async () => {
     // 3. 调用次数有上界，而且要把「逻辑操作」和「HTTP 请求」分开数 —— 5xx 会被
     //    aws4fetch 重试两次，一个逻辑调用最多变成三次请求。直接给 HTTP 总数定一个
     //    魔数只会写出一个自己都说不清的上界。
-    //    逻辑操作最多 6 个：2 月度 + 2 突发 + 1 状态 + 1 动作。
+    //    逻辑操作最多 6 个：2 月度 + 2 突发 + 1 状态 + 1 个动作（只可能是 StopInstance）。
     const key = (c) => (c.body.period ? `${c.op}:${c.body.period}:${c.body.metricName}` : c.op);
     const attempts = new Map();
     for (const c of calls) attempts.set(key(c), (attempts.get(key(c)) ?? 0) + 1);
@@ -386,23 +383,16 @@ test("invariants hold across randomised scenarios", async () => {
       assert.ok(n <= 3, `${where}: ${k} attempted ${n} times (retries cap at 3)`);
     }
 
-    // 4. 一次触发只能做一件事，绝不同时停机和启动。判断的是**逻辑动作**而不是 HTTP
-    //    尝试次数 —— 一次 5xx 重试会让同一个动作出现三次请求，那不是「停了三次」。
+    // 4. **绝不启动实例，任何情形下都不。** 这个看门狗只有停机一个动作；启动实例的权限
+    //    连 IAM 策略里都没有。这是硬安全性质，不是某条路径的断言：让看门狗有启动能力，
+    //    等于给「读数谎报为零」那一类故障配上一个会烧钱的动作。
     const stopped = attempts.has("StopInstance");
-    const started = attempts.has("StartInstance");
-    assert.ok(!(stopped && started), `${where}: stopped and started in the same run`);
+    assert.ok(!attempts.has("StartInstance"), `${where}: issued StartInstance`);
 
     // 5. 正常跑完必须恰好留下一行终态。BLIND / DEGRADED 是附加告警，不算终态。
     const terminal = lines.filter((l) => TOKENS.some((t) => l.includes(` ${t} | `)));
     if (!threw) {
       assert.equal(terminal.length, 1, `${where}: ${terminal.length} terminal lines: ${lines.join(" /// ")}`);
-    }
-
-    // 6. 启动只允许发生在「月初至今恰为零 + 实例 stopped + 没有 hold」这一种情形。
-    if (started) {
-      assert.equal(sc.usedGib, 0, `${where}: started with non-zero usage`);
-      assert.equal(sc.state, "stopped", `${where}: started from state ${sc.state}`);
-      assert.equal(sc.manualHold, false, `${where}: started while held`);
     }
 
     // 7. 停机只允许发生在实例 running 时，且必须有越线或突发的理由。
@@ -415,7 +405,6 @@ test("invariants hold across randomised scenarios", async () => {
     }
 
     // 8. 越过静态线且实例在跑 —— 这是账单护栏的核心承诺，任何情况下都不能漏。
-    //    注意 MANUAL_HOLD 不豁免停机，它只抑制启动。
     // 指标读不出来就谈不上判断，所以这条只在指标可用时成立；但 GetInstanceState 失败
     // **不**豁免它 —— 停机路径是 fail-closed 的，状态读不到也要照停。
     const metricsUsable = sc.failOp !== "GetInstanceMetricData" && !sc.badShape;
