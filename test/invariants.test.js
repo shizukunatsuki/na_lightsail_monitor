@@ -338,7 +338,16 @@ test("the watchdog's self-assessment is monotone in metric lag", async () => {
 
 test("invariants hold across randomised scenarios", async () => {
   const r = rng(20260821);
-  const moments = ["2026-08-15T12:00:00Z", "2026-09-01T00:00:00Z", "2026-09-01T04:00:00Z", "2026-02-28T23:00:00Z"];
+  // 时刻**刻意不落在整分钟上**：生产的 `controller.scheduledTime` 带 11–55 秒 cron 抖动
+  // （实测 98 个样本 `mod 600` 取 11 / 14 / 30 / 47 / 55，无一为 0）。用整分钟跑随机场景，
+  // 等于让全部 1500 个用例都活在一个生产从不出现的条件下 —— 桶相位、覆盖秒数分母、
+  // 月度窗口右端都会恰好对齐，而真实情况一次都不会这样。
+  const moments = [
+    "2026-08-15T12:00:11Z",
+    "2026-09-01T00:00:47Z",
+    "2026-09-01T04:00:14Z",
+    "2026-02-28T23:00:55Z",
+  ];
 
   // 变异测试要把整个套件跑很多遍，那时用小样本换速度；CI 与本地默认跑满。
   const CASES = Number(process.env.INVARIANT_CASES ?? 1500);
