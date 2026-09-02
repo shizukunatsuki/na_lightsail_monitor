@@ -599,7 +599,7 @@ aws lightsail get-instance-metric-data --instance-name YOUR_INSTANCE --metric-na
 ### 计费与限流
 
 - **Lightsail API 调用不计费。** 计费 FAQ 逐项列举了全部收费项——实例套餐、数据库、块存储、负载均衡器、证书、静态 IP、域名、DNS 查询、快照——**没有 API 请求这一项**，指标与监控也完全没有作为收费项出现。唯一按请求计费的是 DNS 查询（每月 300 万免费，之后 $0.40/百万），与本项目无关。
-- **不会带来 CloudWatch 账单。** CloudWatch 确实按 $0.01/1000 次收 `GetMetricStatistics` 这类请求的钱，但那是 CloudWatch 自己的 API；本项目调的是 `lightsail:GetInstanceMetricData`，走 Lightsail 的计费口径。（这一条只有「文档没列」这个否定证据，**建议下个账单周期按服务看一眼有没有意外的 CloudWatch 条目**——那是唯一的正面确认方式。）
+- **不会带来 CloudWatch 账单。** CloudWatch 确实按 $0.01/1000 次收 `GetMetricStatistics` 这类请求的钱，但那是 CloudWatch 自己的 API；本项目调的是 `lightsail:GetInstanceMetricData`，走 Lightsail 的计费口径。**账单能正面确认这一点，但判据是条目在不在、不是金额是不是零**：CloudWatch 的免费额度本身就含每月 100 万次 API 请求，而本项目一个月只发出约 7500 次调用，所以「金额为零」两种解释都成立；而按服务展开的明细里，零费用的服务同样会以 $0.00 列出来——于是「整个条目缺席」才是「没有产生 CloudWatch 用量」的证据。实测（2026 年 8 月账单，看门狗当月运行约 10 天、约 7500 次调用）：明细里只有 Secrets Manager、S3、Glue、Lightsail 四项，**没有 CloudWatch**。同一份账单里也没有任何数据传输超额条目。
 - **没有任何 API 速率配额。** Lightsail 的服务配额表里 19 项全是资源数量（实例、磁盘、分发、DNS 区域……），没有「每秒请求数」之类的条目。本项目的速率是 **0.0083 次/秒**（144 次触发 × 5 次调用 ÷ 86400 秒；按每次触发 6 次调用的上限算也只有 0.010）。
 - **状态码有两份说法，都要认。** 按操作的错误列表把 `AccessDeniedException` 记为 **400**，Common Errors 那份记为 **403**；`NotFound`/`InvalidInput`/`OperationFailure` 是 400，`ServiceException`/`InternalFailure` 是 500，`ServiceUnavailable` 是 503。「只重试 5xx 和 429」在这三档上都是对的：400 与 403 都是终局失败。
 - **两个瞬时错误落在重试之外**：`ThrottlingException` 是 **HTTP 400**（AWS 自己都注明「SDK 会自动重试这个异常」），`RequestTimeoutException` 是 **408**。**这是刻意接受的**：本项目的速率离任何限流阈值有三个数量级，代价只是丢掉一个 cron 周期（10 分钟）——handler 无状态、下次触发会独立重新得出结论，静态线还有 204.8 GiB 余量兜着。真发生了日志里会写明 `HTTP 400 {"__type":"ThrottlingException"...}`，一眼可辨。
